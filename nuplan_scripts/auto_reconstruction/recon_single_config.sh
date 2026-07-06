@@ -74,6 +74,13 @@ echo "Running with:
     WORKERS=$NUM_WORKERS
     GPUS=$NUM_GPUS"
 
+# Automated stand-in for the manual preview step: discover all in-block
+# traversals (db-only) and cap selected_videos at the official 6 before the
+# heavy preprocessing. No-op if the config already has a selection.
+# Set MTGS_GROUPS_JSON to prioritise the location's navtest logs.
+python -m nuplan_scripts.auto_reconstruction.auto_select_traversals \
+    --config "$CONFIG" --num_workers "$NUM_WORKERS"
+
 bash nuplan_scripts/preprocess.sh "$CONFIG" "$NUM_WORKERS" "$NUM_GPUS"
 python -m nuplan_scripts.auto_reconstruction.background_reconstruction --config "$CONFIG"
 python -m nuplan_scripts.auto_reconstruction.render_reconstruction --config "$CONFIG"

@@ -170,6 +170,8 @@ class CustomInputDataset(InputDataset):
 
         depth_filename = self._dataparser_outputs.depth_filenames[image_idx]
         depth = read_depth_image(depth_filename)
+        if depth is None:
+            return None
         return depth[:, :, None]
 
     def _get_depth_from_lidar(self, image_idx: int, camera: Cameras, points: Optional[Float[np.ndarray, "n_pts 3"]] = None):
@@ -381,9 +383,10 @@ class CustomInputDataset(InputDataset):
             else:
                 data["mask"] = valid_mask
 
-        if self._dataparser_outputs.depth_filenames is not None and self.load_pseudo_depth:
-            # depth image is already undistorted
-            data["depth"] = self._get_depth_from_image(image_idx) * self._dataparser_outputs.scene_scale_factor
+        if self._dataparser_outputs.depth_filenames is not None:
+            depth = self._get_depth_from_image(image_idx)
+            if depth is not None:
+                data["depth"] = depth * self._dataparser_outputs.scene_scale_factor
 
         if scale_factor != 1.0:
             self._resize_data(data, camera, scale_factor)

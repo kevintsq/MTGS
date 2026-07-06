@@ -27,7 +27,6 @@ def run_bundle_adjustment(
     ]
     if os.path.exists(f"{colmap_path}/masks"):
         colmap_feature_extractor_args += ["--ImageReader.mask_path", f"{colmap_path}/masks"]
-    colmap_feature_extractor_args += ["--SiftExtraction.num_threads", f"{num_workers}"]
 
     try:
         subprocess.run(colmap_feature_extractor_args, check=True)
@@ -40,8 +39,7 @@ def run_bundle_adjustment(
     colmap_matches_importer_args = [
         colmap_exe, "matches_importer",
         "--database_path", f"{colmap_path}/database.db",
-        "--match_list_path", f"{colmap_path}/image_pairs.txt",
-        "--SiftMatching.num_threads", f"{num_workers}"
+        "--match_list_path", f"{colmap_path}/image_pairs.txt"
     ]
 
     try:

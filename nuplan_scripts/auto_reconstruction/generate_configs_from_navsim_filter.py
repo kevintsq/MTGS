@@ -173,7 +173,7 @@ if __name__ == '__main__':
     )
     parser.add_argument('--data_root', type=str, required=True, help='Path to the DigitalTwin data root')
     parser.add_argument('--output_dir', type=str, required=True, help='Output directory to save the generated configs')
-    parser.add_argument('--split', type=str, default='trainval', choices=['trainval', 'test', 'private_test', 'all'])
+    parser.add_argument('--split', type=str, default='trainval', choices=['trainval', 'test', 'private_test', 'all', 'mini'])
     parser.add_argument('--num_workers', type=int, default=0)
     args = parser.parse_args()
 

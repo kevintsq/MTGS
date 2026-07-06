@@ -27,7 +27,6 @@ def run_point_triangulator(
     ]
     if os.path.exists(f"{colmap_path}/masks"):
         colmap_feature_extractor_args += ["--ImageReader.mask_path", f"{colmap_path}/masks"]
-    colmap_feature_extractor_args += ["--SiftExtraction.num_threads", f"{num_workers}"]
 
     try:
         subprocess.run(colmap_feature_extractor_args, check=True)
@@ -40,8 +39,7 @@ def run_point_triangulator(
     colmap_matches_importer_args = [
         colmap_exe, "matches_importer",
         "--database_path", f"{colmap_path}/database.db",
-        "--match_list_path", f"{colmap_path}/image_pairs.txt",
-        "--SiftMatching.num_threads", f"{num_workers}"
+        "--match_list_path", f"{colmap_path}/image_pairs.txt"
     ]
 
     try:
@@ -55,6 +53,18 @@ def run_point_triangulator(
 
     os.makedirs(os.path.join(colmap_path, output_model, "0"), exist_ok=True)
 
+    print("dropping rigs from database to prevent crash...")
+    try:
+        import sqlite3
+        conn = sqlite3.connect(f"{colmap_path}/database.db")
+        cursor = conn.cursor()
+        cursor.execute("DROP TABLE IF EXISTS rigs;")
+        cursor.execute("DROP TABLE IF EXISTS rig_sensors;")
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print(f"Failed to drop rigs: {e}")
+
     colmap_point_triangulator_args = [
         colmap_exe, "point_triangulator",
         "--refine_intrinsics", "1",
@@ -62,6 +72,7 @@ def run_point_triangulator(
         "--Mapper.ba_global_function_tolerance", "0.000001",
         "--Mapper.ba_global_max_num_iterations", "30",
         "--Mapper.ba_global_max_refinements", "3",
+        "--Mapper.ba_refine_sensor_from_rig", "0",
     ]
 
     # point triangulation

@@ -589,7 +589,14 @@ class MTGSSceneModel(Model):
         get_gaussians_kwargs["return_features"] = self.config.use_wild_gaussians
         get_gaussians_kwargs["return_v"] = False
 
+        import os
+        if os.environ.get("RENDER_STATIC_ONLY", "0") == "1":
+            visible_tokens = ["background", "skybox"]
+        else:
+            visible_tokens = None
+
         collected_gaussians = self.get_gaussians(
+            visible_tokens=visible_tokens,
             camera_to_worlds=optimized_camera_to_world, **get_gaussians_kwargs
         )
         if collected_gaussians['means'].shape[0] == 0:

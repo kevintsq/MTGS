@@ -25,7 +25,7 @@ from nuplan_scripts.utils.nuplan_utils_custom import load_lidar
 from unidepth.models import UniDepthV2
 
 
-model_path = 'ckpts/huggingface/lpiccinelli/unidepth-v2-vitl14'
+model_path = 'lpiccinelli/unidepth-v2-vitl14'
 
 class MetricDepthError:
 
@@ -238,6 +238,15 @@ if __name__ == '__main__':
             # filter out out of range depth
             depth[depth > args.max_range] = 0
             depth[depth < 0.1] = 0
+
+            # Guard against degenerate model outputs (e.g. a frame whose
+            # undistorted ROI produces a 1-D / mismatched depth map). Skip the
+            # frame instead of crashing the whole stage.
+            if depth.ndim != 2 or depth.shape[0] != h or depth.shape[1] != w:
+                print(f"[generate_dense_depth] skip {cam_info['data_path']}: "
+                      f"depth shape {depth.shape} != roi ({h},{w})")
+                pbar.update(distributed_state.num_processes)
+                continue
 
             depth_image = np.zeros((raw_height, raw_width, 3), dtype=np.uint8)
             depth_image[y:y+h, x:x+w, 0] = ((depth * 100) % 256).astype(np.uint8)

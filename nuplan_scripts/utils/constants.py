@@ -11,15 +11,17 @@ from rich.console import Console
 CONSOLE = Console(width=120)
 os.environ['TQDM_NCOLS'] = '120'
 
-# load nuplan config
+# load nuplan config; environment variables override the yaml so per-job
+# node-local staging (SLURM stage-in) can redirect paths without touching
+# the shared repo checkout.
 nuplan_config_path = os.path.join(os.path.dirname(__file__), '..', 'configs', 'common', 'nuplan_path.yml')
 with open(nuplan_config_path, 'r') as f:
     nuplan_config = yaml.safe_load(f)
-NUPLAN_DATA_ROOT = nuplan_config['NUPLAN_DATA_ROOT']
-NUPLAN_DB_FILES = nuplan_config['NUPLAN_DB_FILES']
-NUPLAN_SENSOR_ROOT = nuplan_config['NUPLAN_SENSOR_ROOT']
-NUPLAN_MAP_VERSION = nuplan_config['NUPLAN_MAP_VERSION']
-NUPLAN_MAPS_ROOT = nuplan_config['NUPLAN_MAPS_ROOT']
+NUPLAN_DATA_ROOT = os.environ.get('NUPLAN_DATA_ROOT', nuplan_config['NUPLAN_DATA_ROOT'])
+NUPLAN_DB_FILES = os.environ.get('NUPLAN_DB_FILES', nuplan_config['NUPLAN_DB_FILES'])
+NUPLAN_SENSOR_ROOT = os.environ.get('NUPLAN_SENSOR_ROOT', nuplan_config['NUPLAN_SENSOR_ROOT'])
+NUPLAN_MAP_VERSION = os.environ.get('NUPLAN_MAP_VERSION', nuplan_config['NUPLAN_MAP_VERSION'])
+NUPLAN_MAPS_ROOT = os.environ.get('NUPLAN_MAPS_ROOT', nuplan_config['NUPLAN_MAPS_ROOT'])
 
 cityscape_label = {
     'road': 0,

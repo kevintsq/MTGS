@@ -890,7 +890,9 @@ class MTGSSceneModel(Model):
                             raise NotImplementedError(f"Lidar depth loss type {self.config.depth_loss_type} not implemented")
                         loss_dict["Depth Loss"] = self.config.depth_lambda * loss_depth
 
-            if self.config.ncc_loss_lambda > 0:
+            # "depth" (UniDepth pseudo depth) may be absent for the few frames
+            # whose depth map was skipped as degenerate -- skip aux losses then.
+            if self.config.ncc_loss_lambda > 0 and "depth" in batch:
                 patch_size = self.config.ncc_patch_size
                 stride = self.config.ncc_stride
                 pred_depth = outputs["depth"].to(self.device)
@@ -903,13 +905,14 @@ class MTGSSceneModel(Model):
         # Normal Loss
         if self.config.use_normal_loss:
             normal_loss = 0.0
+            gt_normal = None
             pred_normal = outputs["normal"].to(self.device)
 
             if "normal" in batch and self.config.normal_supervision == "mono":
                 gt_normal = batch["normal"].to(self.device)
                 normal_loss_mask = combined_mask.squeeze(-1)
 
-            elif self.config.normal_supervision == "depth":
+            elif self.config.normal_supervision == "depth" and "depth" in batch:
                 gt_depth = batch["depth"].to(self.device)
                 normal_loss_mask = (gt_depth > 0.1) & (gt_depth < 50)
                 normal_loss_mask = normal_loss_mask & combined_mask

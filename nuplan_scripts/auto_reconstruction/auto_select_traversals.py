@@ -18,29 +18,46 @@
 #-------------------------------------------------------------------------------#
 import os
 import json
-import pickle
 import argparse
-import subprocess
-import sys
+
+import numpy as np
+import jsonlines
 
 from nuplan_scripts.utils.config import load_config
-from nuplan_scripts.utils.video_scene_dict_tools import VideoScene
 
-MIN_FRAMES = 10  # drop degenerate clips that barely touch the block
+MIN_FRAMES = 50  # 10Hz lidar_pcs (~5s in block); drops clips that barely touch it
 
 
-def video_stats(vsd):
-    stats = []
-    for token, v in vsd.items():
-        idx = int(token.rsplit("-", 1)[1])
-        frames = v.get("frame_infos") or v.get("lidar_pcs") or []
-        ts = None
-        if v.get("frame_infos"):
-            ts = int(v["frame_infos"][0]["timestamp"])
-        elif "start_ts" in v:
-            ts = int(v["start_ts"])
-        stats.append({"idx": idx, "log": v.get("log_name", ""), "n": len(frames), "ts": ts or 0})
-    return sorted(stats, key=lambda s: s["idx"])
+def discover_video_stats(config, num_workers):
+    """All in-block traversal segments, db-only (no per-frame sensor-file work).
+
+    This is the cheap half of nuplan_video_processing: split each log's
+    lidar_pc stream into in-block videos. The expensive ProduceVideoSceneDict
+    (per-frame camera association + NFS file stats) is deferred to the real
+    preprocessing, which then only sees the <=K selected traversals.
+    """
+    from nuplan_scripts.nuplan_video_processing import SplitVideoFromNuPlanDB, sort_video_infos
+    from nuplan_scripts.utils.constants import NUPLAN_DB_FILES
+
+    road_block = np.asarray(config.road_block)
+    with jsonlines.open(os.path.join(config.data_root, "nuplan_log_infos.jsonl")) as reader:
+        log_infos = {item["log_name"]: item for item in reader}
+
+    db_files = []
+    for log_name, item in log_infos.items():
+        if config.split != "all" and item["split"] != config.split:
+            continue
+        traj = np.asarray(item["trajectory"])
+        in_region = np.all(traj > road_block[:2], axis=1) & np.all(traj < road_block[2:], axis=1)
+        if in_region.any():
+            db_files.append(os.path.join(NUPLAN_DB_FILES, f"{log_name}.db"))
+
+    _, video_infos = SplitVideoFromNuPlanDB.run(
+        config=config, db_filenames=db_files, num_workers=num_workers)
+    video_infos = sort_video_infos(config, video_infos)
+    return [{"idx": v["video_idx"], "log": v["log_name"],
+             "n": len(v["lidar_pcs"]), "ts": int(v["start_ts"])}
+            for v in video_infos]
 
 
 def select(stats, test_logs, k):
@@ -72,23 +89,26 @@ def main():
     p.add_argument("--num_workers", type=int, default=8)
     p.add_argument("--force", action="store_true",
                    help="re-select even if the config already has selected_videos")
+    p.add_argument("--manifest_out", default=None,
+                   help="write the selected traversals' log names here (one per "
+                        "line), for per-job sensor-blob stage-in on tar-based storage")
     args = p.parse_args()
 
     config = load_config(args.config)
     if config.selected_videos and not args.force:
         print(f"[auto_select] {config.road_block_name}: selected_videos already set "
               f"({list(config.selected_videos)}), skipping. Use --force to redo.")
+        if args.manifest_out and not os.path.exists(args.manifest_out):
+            stats = discover_video_stats(config, args.num_workers)
+            logs = sorted({s["log"] for s in stats if s["idx"] in set(config.selected_videos)})
+            os.makedirs(os.path.dirname(os.path.abspath(args.manifest_out)), exist_ok=True)
+            with open(args.manifest_out, "w") as f:
+                f.write("\n".join(logs) + "\n")
+            print(f"[auto_select] manifest -> {args.manifest_out} ({len(logs)} logs)")
         return
 
     # 1. discovery pass: all in-block traversals, db-only
-    subprocess.run([sys.executable, "-m", "nuplan_scripts.nuplan_video_processing",
-                    "--config", args.config, "--num_workers", str(args.num_workers)],
-                   check=True)
-
-    video_scene = VideoScene(config)
-    with open(video_scene.pickle_path_raw, "rb") as f:
-        vsd = pickle.load(f)
-    stats = video_stats(vsd)
+    stats = discover_video_stats(config, args.num_workers)
     print(f"[auto_select] {config.road_block_name}: {len(stats)} traversals discovered")
 
     test_logs = set()
@@ -105,6 +125,13 @@ def main():
     picked = select(stats, test_logs, args.max_traversals)
     n_test = sum(1 for s in stats if s["idx"] in picked and s["log"] in test_logs)
     print(f"[auto_select] picked {picked} ({n_test} from navtest logs)")
+
+    if args.manifest_out:
+        logs = sorted({s["log"] for s in stats if s["idx"] in set(picked)})
+        os.makedirs(os.path.dirname(os.path.abspath(args.manifest_out)), exist_ok=True)
+        with open(args.manifest_out, "w") as f:
+            f.write("\n".join(logs) + "\n")
+        print(f"[auto_select] manifest -> {args.manifest_out} ({len(logs)} logs)")
 
     # 2. write the selection back into the config yaml
     config.selected_videos = tuple(picked)

@@ -27,6 +27,11 @@ def run_bundle_adjustment(
     ]
     if os.path.exists(f"{colmap_path}/masks"):
         colmap_feature_extractor_args += ["--ImageReader.mask_path", f"{colmap_path}/masks"]
+    # COLMAP 4.x renamed SiftExtraction.num_threads -> FeatureExtraction.num_threads
+    colmap_feature_extractor_args += ["--FeatureExtraction.num_threads", f"{num_workers}"]
+    # CUDA-built colmap SIGABRTs in GetNumCudaDevices() on GPU-less nodes; force CPU there
+    use_gpu = os.environ.get('COLMAP_USE_GPU', '1' if os.path.exists('/dev/nvidiactl') else '0')
+    colmap_feature_extractor_args += ["--FeatureExtraction.use_gpu", use_gpu]
 
     try:
         subprocess.run(colmap_feature_extractor_args, check=True)
@@ -39,7 +44,9 @@ def run_bundle_adjustment(
     colmap_matches_importer_args = [
         colmap_exe, "matches_importer",
         "--database_path", f"{colmap_path}/database.db",
-        "--match_list_path", f"{colmap_path}/image_pairs.txt"
+        "--match_list_path", f"{colmap_path}/image_pairs.txt",
+        "--FeatureMatching.num_threads", f"{num_workers}",
+        "--FeatureMatching.use_gpu", use_gpu,
     ]
 
     try:

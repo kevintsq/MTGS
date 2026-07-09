@@ -56,12 +56,11 @@ if [ -z "$CONFIG" ] || [ -z "$EXPORT_DIR" ] || [ -z "$OUTPUT_DIR" ]; then
     exit 1
 fi
 
-# Cleanup function to remove output directory on failure
+# On failure keep the output directory in place: the preprocessing steps are
+# resumable (masks/depth skip existing files), so a retry after a transient
+# error continues instead of starting over. (Upstream moved it to *_failed.)
 cleanup_on_failure() {
-    if [ -n "$OUTPUT_DIR" ] && [ -d "$OUTPUT_DIR" ]; then
-        echo "[ERROR] Command failed - cleaning up output directory: $OUTPUT_DIR"
-        mv "$OUTPUT_DIR" "${OUTPUT_DIR}_failed"
-    fi
+    echo "[ERROR] Command failed - keeping $OUTPUT_DIR for resume"
 }
 
 # Set trap to run cleanup on script failure

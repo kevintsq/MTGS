@@ -3,6 +3,7 @@
 # Source code: https://github.com/OpenDriveLab/MTGS                             #
 # Copyright (c) OpenDriveLab. All rights reserved.                              #
 #-------------------------------------------------------------------------------#
+import os
 from nerfstudio.configs.base_config import ViewerConfig, MachineConfig, LoggingConfig, LocalWriterConfig
 from nerfstudio.engine.optimizers import AdamOptimizerConfig
 from nerfstudio.engine.schedulers import ExponentialDecaySchedulerConfig
@@ -21,7 +22,8 @@ from mtgs.scene_model.gaussian_model.multi_color_gaussian_splatting import Multi
 from mtgs.scene_model.gaussian_model.rigid_node import RigidSubModelConfig
 from mtgs.utils.geometric_loss import DepthLossType
 
-iteration_factor = 1
+# scales max iterations plus the densify/lr schedules proportionally
+iteration_factor = int(os.environ.get('MTGS_ITERATION_FACTOR', '1'))
 config = CustomTrainerConfig(
     method_name="mtgs",
     project_name="MTGS",

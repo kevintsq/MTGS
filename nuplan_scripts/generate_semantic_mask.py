@@ -23,9 +23,44 @@ from nuplan_scripts.utils.constants import NUPLAN_SENSOR_ROOT
 
 model_path = "facebook/mask2former-swin-large-cityscapes-semantic"
 
+class _CamMaskDataset(torch.utils.data.Dataset):
+    """Loads + preprocesses images in DataLoader workers so the GPU never
+    waits on (NFS) I/O. Items already having a mask on disk are filtered out
+    up-front, which also makes the step resumable."""
+
+    def __init__(self, cams, processor, mask_root):
+        self.processor = processor
+        self.items = []
+        seen = set()
+        for cam_info in cams:
+            dp = cam_info['data_path']
+            if dp in seen:
+                continue
+            seen.add(dp)
+            mask_path = os.path.join(mask_root, dp).replace('.jpg', '.png')
+            if not os.path.exists(mask_path):
+                self.items.append((dp, mask_path))
+
+    def __len__(self):
+        return len(self.items)
+
+    def __getitem__(self, idx):
+        dp, mask_path = self.items[idx]
+        image = Image.open(os.path.join(NUPLAN_SENSOR_ROOT, dp))
+        pixel = self.processor(images=image, return_tensors="pt").pixel_values[0]
+        return pixel, mask_path, (image.height, image.width)
+
+
+def _collate(batch):
+    pixels = torch.stack([b[0] for b in batch])
+    return pixels, [b[1] for b in batch], [b[2] for b in batch]
+
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--config', type=str, required=True)
+    parser.add_argument('--batch_size', type=int, default=int(os.environ.get('SEM_MASK_BATCH', 4)))
+    parser.add_argument('--num_workers', type=int, default=int(os.environ.get('SEM_MASK_WORKERS', 8)))
     args = parser.parse_args()
 
     config: RoadBlockConfig = load_config(args.config)
@@ -47,26 +82,30 @@ if __name__ == '__main__':
 
     distributed_state.prepare_model(model, evaluation_mode=True)
     model.eval()
-    # model.to(distributed_state.device).eval()
 
-    pbar = tqdm(total=len(total_cams), ncols=120, desc="Generating semantic masks")
+    mask_root = os.path.join(video_scene.raw_mask_path, video_scene.mask_suffix_cityscape)
+
+    from concurrent.futures import ThreadPoolExecutor
+    writer = ThreadPoolExecutor(max_workers=4)
+
+    def _write_mask(seg_map, mask_path):
+        os.makedirs(os.path.dirname(mask_path), exist_ok=True)
+        cv2.imwrite(mask_path, seg_map)
 
     with distributed_state.split_between_processes(total_cams) as partial_frames:
-        for cam_info in partial_frames:
-            image_path = os.path.join(NUPLAN_SENSOR_ROOT, cam_info['data_path'])
-            mask_path = os.path.join(
-                video_scene.raw_mask_path,
-                video_scene.mask_suffix_cityscape,
-                cam_info['data_path']).replace('.jpg', '.png')
+        dataset = _CamMaskDataset(partial_frames, processor, mask_root)
+        loader = torch.utils.data.DataLoader(
+            dataset, batch_size=args.batch_size, num_workers=args.num_workers,
+            collate_fn=_collate, pin_memory=True)
+        pbar = tqdm(total=len(dataset), ncols=120,
+                    desc=f"Generating semantic masks (bs={args.batch_size}, fp16)")
+        for pixels, mask_paths, sizes in loader:
+            pixels = pixels.to(distributed_state.device, non_blocking=True)
+            with torch.no_grad(), torch.autocast("cuda", dtype=torch.float16):
+                outputs = model(pixels)
+            seg_maps = processor.post_process_semantic_segmentation(outputs, target_sizes=sizes)
+            for seg, mask_path in zip(seg_maps, mask_paths):
+                writer.submit(_write_mask, seg.cpu().numpy().astype(np.uint8), mask_path)
+            pbar.update(len(mask_paths) * distributed_state.num_processes)
 
-            image = Image.open(image_path)
-            input = processor(images=image, return_tensors="pt").pixel_values.to(distributed_state.device)
-            with torch.no_grad():
-                outputs = model(input)
-            predicted_segmentation_map = processor.post_process_semantic_segmentation(outputs, target_sizes=[image.size[::-1]])[0]
-            predicted_segmentation_map = predicted_segmentation_map.cpu().numpy().astype(np.uint8)
-
-            os.makedirs(os.path.dirname(mask_path), exist_ok=True)
-            cv2.imwrite(mask_path, predicted_segmentation_map)
-
-            pbar.update(distributed_state.num_processes)
+    writer.shutdown(wait=True)

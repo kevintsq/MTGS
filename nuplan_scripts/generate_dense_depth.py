@@ -182,55 +182,75 @@ if __name__ == '__main__':
     distributed_state.prepare_model(model, evaluation_mode=True)
     model.eval()
 
-    pbar = accelerate_tqdm(total=len(total_cams), ncols=120, desc="Generating dense depths")
-    with distributed_state.split_between_processes(total_cams) as partial_frames:
-        for cam_info in partial_frames:
-            image_path = os.path.join(
-                video_scene.raw_image_path,
-                cam_info['data_path']
-            )
-            image = Image.open(image_path)
+    class _DepthDataset(torch.utils.data.Dataset):
+        """Image load + undistortion (the expensive cv2 remap) in DataLoader
+        workers; skips items whose depth png already exists (resumable)."""
+
+        def __init__(self, cams):
+            self.items = []
+            seen = set()
+            for cam_info in cams:
+                dp = cam_info['data_path']
+                if dp in seen:
+                    continue
+                seen.add(dp)
+                if args.undistort_mode == 'optimal':
+                    output_path = os.path.join(
+                        video_scene.optimal_undistorted_depth_path, dp.replace('.jpg', '.png'))
+                else:
+                    output_path = os.path.join(
+                        video_scene.undistorted_depth_path, dp.replace('.jpg', '.png'))
+                if not os.path.exists(output_path):
+                    self.items.append((cam_info, output_path))
+
+        def __len__(self):
+            return len(self.items)
+
+        def __getitem__(self, idx):
+            cam_info, output_path = self.items[idx]
+            image = Image.open(os.path.join(video_scene.raw_image_path, cam_info['data_path']))
             rgb = np.array(image)
             raw_height, raw_width = rgb.shape[:2]
 
             if args.undistort_mode == 'optimal':
-
                 rgb, intrinsic, roi = undistort_image_with_cam_info(
-                    rgb, cam_info, 
-                    return_mask=False, interpolation='cubic', mode='optimal'
-                )
+                    rgb, cam_info,
+                    return_mask=False, interpolation='cubic', mode='optimal')
                 x, y, w, h = roi
                 rgb = rgb[y:y+h, x:x+w]
+                intrinsic = intrinsic.copy()
                 intrinsic[0, 2] = intrinsic[0, 2] - x
                 intrinsic[1, 2] = intrinsic[1, 2] - y
-
-                inputs = torch.from_numpy(rgb).permute(2, 0, 1)
-                inputs.to(distributed_state.device)
-                intrinsic = torch.from_numpy(intrinsic).to(device=distributed_state.device, dtype=torch.float32)
-
-                output_path = os.path.join(
-                    video_scene.optimal_undistorted_depth_path,
-                    cam_info['data_path'].replace('.jpg', '.png')
-                )
-
-            elif args.undistort_mode == 'keep_focal_length':
+            else:  # keep_focal_length
                 rgb = undistort_image_with_cam_info(
-                    rgb, cam_info, 
-                    return_mask=False, interpolation='cubic', mode='keep_focal_length'
-                )
-                intrinsic = cam_info['cam_intrinsic']
+                    rgb, cam_info,
+                    return_mask=False, interpolation='cubic', mode='keep_focal_length')
+                intrinsic = np.asarray(cam_info['cam_intrinsic'])
                 x, y, w, h = 0, 0, raw_width, raw_height
 
-                inputs = torch.from_numpy(rgb).permute(2, 0, 1)
-                inputs.to(distributed_state.device)
-                intrinsic = torch.from_numpy(intrinsic).to(device=distributed_state.device, dtype=torch.float32)
+            inputs = torch.from_numpy(np.ascontiguousarray(rgb)).permute(2, 0, 1)
+            intrinsic = torch.from_numpy(np.asarray(intrinsic)).float()
+            return inputs, intrinsic, output_path, (raw_height, raw_width), (x, y, w, h)
 
-                output_path = os.path.join(
-                    video_scene.undistorted_depth_path,
-                    cam_info['data_path'].replace('.jpg', '.png')
-                )
+    from concurrent.futures import ThreadPoolExecutor
+    writer = ThreadPoolExecutor(max_workers=4)
 
-            with torch.no_grad():
+    def _write_depth(depth_image, output_path):
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
+        cv2.imwrite(output_path, depth_image)
+
+    with distributed_state.split_between_processes(total_cams) as partial_frames:
+        dataset = _DepthDataset(partial_frames)
+        loader = torch.utils.data.DataLoader(
+            dataset, batch_size=1, num_workers=max(args.num_workers, 6),
+            collate_fn=lambda b: b[0], prefetch_factor=4)
+        pbar = accelerate_tqdm(total=len(dataset), ncols=120,
+                               desc="Generating dense depths (prefetch+fp16)")
+        for inputs, intrinsic, output_path, (raw_height, raw_width), (x, y, w, h) in loader:
+            inputs = inputs.to(distributed_state.device, non_blocking=True)
+            intrinsic = intrinsic.to(distributed_state.device)
+
+            with torch.no_grad(), torch.autocast("cuda", dtype=torch.float16):
                 outputs = model.infer(inputs, intrinsic)
 
             depth = outputs['depth'].squeeze()
@@ -243,7 +263,7 @@ if __name__ == '__main__':
             # undistorted ROI produces a 1-D / mismatched depth map). Skip the
             # frame instead of crashing the whole stage.
             if depth.ndim != 2 or depth.shape[0] != h or depth.shape[1] != w:
-                print(f"[generate_dense_depth] skip {cam_info['data_path']}: "
+                print(f"[generate_dense_depth] skip {output_path}: "
                       f"depth shape {depth.shape} != roi ({h},{w})")
                 pbar.update(distributed_state.num_processes)
                 continue
@@ -252,11 +272,11 @@ if __name__ == '__main__':
             depth_image[y:y+h, x:x+w, 0] = ((depth * 100) % 256).astype(np.uint8)
             depth_image[y:y+h, x:x+w, 1] = ((depth * 100) // 256).astype(np.uint8)
 
-            os.makedirs(os.path.dirname(output_path), exist_ok=True)
-            cv2.imwrite(output_path, depth_image)
+            writer.submit(_write_depth, depth_image, output_path)
 
             pbar.update(distributed_state.num_processes)
 
+    writer.shutdown(wait=True)
     distributed_state.wait_for_everyone()
     pbar.close()
 

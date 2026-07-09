@@ -196,6 +196,23 @@ if __name__ == '__main__':
     error_dict = calculate_errors(video_scene_dict, result_poses_dict)
     visualize_lidar_registration(video_scene, result_poses_dict)
 
+    # Robust pre-alignment rejection: align_poses is one global Kabsch fit over
+    # ALL traversals, so a single badly-registered video (raw ATE > 1 m) skews
+    # the alignment and inflates every video's post-alignment error -- the QA
+    # gate then removes ALL of them. Drop gross raw outliers first; they could
+    # never pass the final (1.0 / 0.5) thresholds anyway.
+    PRE_EPE, PRE_MEAN = 2.0, 1.0
+    keep_first = list(video_scene_dict.keys())[:1] if isinstance(config, FrameCentralConfig) else []
+    outliers = [vt for vt in list(video_scene_dict.keys())
+                if vt not in keep_first
+                and (error_dict[vt]['max_end_point_error'] > PRE_EPE
+                     or error_dict[vt]['mean_error'] > PRE_MEAN)]
+    if outliers and len(outliers) < len(video_scene_dict):
+        for vt in outliers:
+            CONSOLE.log(f"Drop video {vt.split('-')[-1]} before alignment (raw ICP outlier).",
+                        style="yellow")
+            video_scene_dict.pop(vt)
+
     CONSOLE.log("ICP errors after alignment", style="bold green")
     result_poses_dict_aligned = align_poses(video_scene_dict, result_poses_dict)
     error_dict_aligned = calculate_errors(video_scene_dict, result_poses_dict_aligned)

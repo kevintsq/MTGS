@@ -472,9 +472,11 @@ if __name__ == "__main__":
     # 3. run colmap for each video scene
     if not skip_colmap_ba:
         num_tasks = len(colmap_paths)
-        total_threads = multiprocessing.cpu_count()
-        num_workers = max(total_threads // num_tasks, 8)
-        pool_size = num_tasks
+        # Respect the SLURM allocation: cpu_count() reports the NODE's cores,
+        # oversubscribing the cgroup by an order of magnitude on shared nodes.
+        total_threads = int(os.environ.get('SLURM_CPUS_PER_TASK', 0)) or multiprocessing.cpu_count()
+        pool_size = min(num_tasks, max(1, total_threads // 4))
+        num_workers = max(total_threads // pool_size, 4)
 
         CONSOLE.log(f'Using {num_workers} workers with pool size {pool_size} for colmap')
 

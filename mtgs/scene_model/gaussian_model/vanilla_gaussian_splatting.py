@@ -138,13 +138,15 @@ class VanillaGaussianSplattingModel(torch.nn.Module):
             CONSOLE.log("use color only optimization with sigmoid activation")
             shs[:, 0, :3] = torch.logit(points_3d['rgb'] / 255, eps=1e-10)
         
+        # .contiguous(): these are views into shs; the fused Adam kernel
+        # rejects non-contiguous params (multi-tensor Adam tolerated them)
         if features_dc_dim is None:
-            features_dc = torch.nn.Parameter(shs[:, 0, :])
+            features_dc = torch.nn.Parameter(shs[:, 0, :].contiguous())
         else:
             features_dc = torch.zeros(num_points, features_dc_dim, 3)
             features_dc[:, 0, :] = shs[:, 0, :]
             features_dc = torch.nn.Parameter(features_dc)
-        features_rest = torch.nn.Parameter(shs[:, 1:, :])
+        features_rest = torch.nn.Parameter(shs[:, 1:, :].contiguous())
 
         distances, _ = self.k_nearest_sklearn(means.data, 3)
         distances = torch.from_numpy(distances)

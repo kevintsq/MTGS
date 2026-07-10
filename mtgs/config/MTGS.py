@@ -5,7 +5,17 @@
 #-------------------------------------------------------------------------------#
 import os
 from nerfstudio.configs.base_config import ViewerConfig, MachineConfig, LoggingConfig, LocalWriterConfig
+from dataclasses import dataclass
 from nerfstudio.engine.optimizers import AdamOptimizerConfig
+
+
+@dataclass
+class FusedAdamOptimizerConfig(AdamOptimizerConfig):
+    """Adam with the fused CUDA kernel: one kernel per param group instead of
+    python-side multi-tensor loops (~27% of train-loop self time with the
+    dozen-plus param groups MTGS uses). Numerics differ only at float-noise
+    level. Disable via MTGS_NO_FUSED_ADAM=1."""
+    fused: bool = os.environ.get('MTGS_NO_FUSED_ADAM', '0') != '1'
 from nerfstudio.engine.schedulers import ExponentialDecaySchedulerConfig
 from nerfstudio.plugins.types import MethodSpecification
 from nerfstudio.cameras.camera_optimizers import CameraOptimizerConfig
@@ -122,65 +132,65 @@ config = CustomTrainerConfig(
     ),
     optimizers={
         "means": {
-            "optimizer": AdamOptimizerConfig(lr=8e-4, eps=1e-15),
+            "optimizer": FusedAdamOptimizerConfig(lr=8e-4, eps=1e-15),
             "scheduler": ExponentialDecaySchedulerConfig(
                 lr_final=8e-6,
                 max_steps=30001 * iteration_factor,
             ),
         },
         "features_dc": {
-            "optimizer": AdamOptimizerConfig(lr=0.0025, eps=1e-15),
+            "optimizer": FusedAdamOptimizerConfig(lr=0.0025, eps=1e-15),
             "scheduler": None,
         },
         "features_rest": {
-            "optimizer": AdamOptimizerConfig(lr=0.0025 / 20, eps=1e-15),
+            "optimizer": FusedAdamOptimizerConfig(lr=0.0025 / 20, eps=1e-15),
             "scheduler": None,
         },
         "opacities": {
-            "optimizer": AdamOptimizerConfig(lr=0.05, eps=1e-15),
+            "optimizer": FusedAdamOptimizerConfig(lr=0.05, eps=1e-15),
             "scheduler": None,
         },
         "scales": {
-            "optimizer": AdamOptimizerConfig(lr=0.005, eps=1e-15),
+            "optimizer": FusedAdamOptimizerConfig(lr=0.005, eps=1e-15),
             "scheduler": None,
         },
         "quats": {
-            "optimizer": AdamOptimizerConfig(lr=0.001, eps=1e-15), 
+            "optimizer": FusedAdamOptimizerConfig(lr=0.001, eps=1e-15), 
             "scheduler": None
         },
         "multicolor.features_dc": {
-            "optimizer": AdamOptimizerConfig(lr=0.0025 / 20, eps=1e-15),
+            "optimizer": FusedAdamOptimizerConfig(lr=0.0025 / 20, eps=1e-15),
             "scheduler": None,
         },
         "multicolor.features_adapters": {
-            "optimizer": AdamOptimizerConfig(lr=0.0, eps=1e-15),
+            "optimizer": FusedAdamOptimizerConfig(lr=0.0, eps=1e-15),
             "scheduler": None,
         },
         "multicolor.features_rest": {
-            "optimizer": AdamOptimizerConfig(lr=0.0025 / 20, eps=1e-15),
+            "optimizer": FusedAdamOptimizerConfig(lr=0.0025 / 20, eps=1e-15),
             "scheduler": None,
         },
         "camera_opt": {
-            "optimizer": AdamOptimizerConfig(lr=1e-4, eps=1e-15),
+            "optimizer": FusedAdamOptimizerConfig(lr=1e-4, eps=1e-15),
             "scheduler": ExponentialDecaySchedulerConfig(
                 lr_final=5e-7, max_steps=30001 * iteration_factor, warmup_steps=1500 * iteration_factor, lr_pre_warmup=0
             ),
         },
         "appearance": {
-            "optimizer": AdamOptimizerConfig(lr=0.001),
+            "optimizer": FusedAdamOptimizerConfig(lr=0.001),
             "scheduler": ExponentialDecaySchedulerConfig(
                 lr_final=0.0001, max_steps=30001 * iteration_factor, warmup_steps=5000 * iteration_factor, lr_pre_warmup=0.00001
             ),
         },
         "ins_rotation": {
-            "optimizer": AdamOptimizerConfig(lr=0.00001, eps=1e-15),
+            "optimizer": FusedAdamOptimizerConfig(lr=0.00001, eps=1e-15),
             "scheduler": ExponentialDecaySchedulerConfig(
                 lr_final=0.000005, 
                 max_steps=30001 * iteration_factor
             ),
         },
         "ins_translation": {
-            "optimizer": AdamOptimizerConfig(lr=0.0005, eps=1e-15),
+            "optimizer": FusedAdamOptimizerConfig(lr=0.0005, eps=1e-15),
             "scheduler": ExponentialDecaySchedulerConfig(
                 lr_final=0.0001, 
                 max_steps=30001 * iteration_factor

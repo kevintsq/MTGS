@@ -407,6 +407,7 @@ class MTGSSceneModel(Model):
 
     def get_gaussians(self, visible_tokens=None, **kwargs):
         collected_gaussians = {}
+        model_slices = {}
         gs_dict = {
             "means": [],
             "scales": [],
@@ -450,13 +451,24 @@ class MTGSSceneModel(Model):
             gs_dict["model_id"].append(
                 torch.full((gs["means"].shape[0],), model_id, device=self.device)
             )
+            model_slices[model_name] = gs["means"].shape[0]
 
         for key, value in gs_dict.items():
             collected_gaussians[key] = torch.cat(value, dim=0)
 
+        # Contiguous [start, end) of each submodel inside the concatenated
+        # tensors; lets the train loop slice instead of building boolean masks
+        # (each mask + .sum() forces a GPU sync per submodel per step).
+        offset = 0
+        for _name, _count in model_slices.items():
+            model_slices[_name] = (offset, offset + _count)
+            offset += _count
+        self._model_slices = model_slices
+
         if self.crop_box is not None and not self.training:
             crop_ids = self.crop_box.within(collected_gaussians['means']).squeeze()
             collected_gaussians = {k: v[crop_ids] for k, v in collected_gaussians.items()}
+            self._model_slices = None  # slices invalid after cropping
 
         return collected_gaussians
 
@@ -962,16 +974,38 @@ class MTGSSceneModel(Model):
             visible_mask = (outputs['radii'] > 0).flatten()
             for model_name, model in self.gaussian_models.items():
                 if isinstance(model, RigidSubModel):
-                    model_mask = self.collected_gaussians['model_id'] == self.model_ids[model_name]
-                    if visible_mask[model_mask].sum() == 0:
-                        continue
+                    # Visibility gate. With contiguous submodel slices all
+                    # rigid models are checked with ONE host sync instead of a
+                    # mask + .sum() sync per model per step.
+                    slices = getattr(self, "_model_slices", None)
+                    if slices is not None:
+                        if not hasattr(self, "_rigid_vis_flags"):
+                            names = [n for n, m in self.gaussian_models.items()
+                                     if isinstance(m, RigidSubModel) and n in slices]
+                            if names:
+                                flags = torch.stack([visible_mask[slices[n][0]:slices[n][1]].any()
+                                                     for n in names]).tolist()
+                                self._rigid_vis_flags = dict(zip(names, flags))
+                            else:
+                                self._rigid_vis_flags = {}
+                        if not self._rigid_vis_flags.get(model_name, False):
+                            continue
+                    else:
+                        model_mask = self.collected_gaussians['model_id'] == self.model_ids[model_name]
+                        if visible_mask[model_mask].sum() == 0:
+                            continue
                     means = model.means
                     instance_size = means.new_tensor(model.instance_size)
                     oob_mask = means.abs() > (instance_size / 2 + self.config.oob_tolerance)[None]
                     oob_mask = oob_mask.any(-1).detach()
-                    if oob_mask.sum() != 0:
-                        oob_loss += -torch.log(1 - model.opacities[oob_mask].sigmoid() + 1e-6).sum()
-                        overall_gaussians += oob_mask.sum()
+                    # unconditional tensor accumulation: empty selections sum
+                    # to 0 and cost no host sync (the old .sum()!=0 gate did)
+                    oob_loss = oob_loss + (-torch.log(1 - model.opacities[oob_mask].sigmoid() + 1e-6)).sum()
+                    overall_gaussians = overall_gaussians + oob_mask.sum()
+            if hasattr(self, "_rigid_vis_flags"):
+                del self._rigid_vis_flags
+            if torch.is_tensor(overall_gaussians):
+                overall_gaussians = int(overall_gaussians)  # single sync per step
             if overall_gaussians != 0:
                 oob_loss = oob_loss / overall_gaussians
                 loss_dict["OOB Loss"] = self.config.oob_lambda * oob_loss
@@ -1165,27 +1199,40 @@ class MTGSSceneModel(Model):
         self.bg_color = background_color.to(self.device)
 
     def update_submodel_statistics(self, step):
+        # Submodels occupy contiguous ranges of the concatenated tensors
+        # (see get_gaussians); slicing avoids one boolean mask + .sum() GPU
+        # sync per submodel per step.
+        slices = getattr(self, "_model_slices", None)
         for model_name, gaussian_model in self.gaussian_models.items():
-            model_id = self.model_ids[model_name]
-            submodel_mask = self.collected_gaussians["model_id"] == model_id
+            if slices is not None:
+                span = slices.get(model_name)
+            else:
+                model_id = self.model_ids[model_name]
+                submodel_mask = self.collected_gaussians["model_id"] == model_id
+                span = None if submodel_mask.sum() == 0 else submodel_mask
 
-            if submodel_mask.sum() == 0:
+            if span is None:
                 gaussian_model.update_statistics(
                     xys_grad=None,
                     radii=None
                 )
                 continue
 
+            if isinstance(span, tuple):
+                index = slice(*span)
+            else:
+                index = span
+
             with torch.no_grad():
                 assert self.xys.grad is not None
                 if gaussian_model.config.control.use_abs_grad:
-                    grads = self.xys.absgrad[0, submodel_mask].detach()
+                    grads = self.xys.absgrad[0, index].detach()
                 else:
-                    grads = self.xys.grad[0, submodel_mask].detach()
+                    grads = self.xys.grad[0, index].detach()
 
                 image_size = grads.new_tensor([self.last_size[1], self.last_size[0]]).unsqueeze(0)
                 grads = (grads * image_size * 0.5).norm(dim=-1)
-                radii = self.radii[0, submodel_mask]
+                radii = self.radii[0, index]
 
             gaussian_model.update_statistics(
                 xys_grad=grads,

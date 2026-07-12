@@ -501,18 +501,18 @@ class VanillaGaussianSplattingModel(torch.nn.Module):
                 if self.config.verbose:
                     CONSOLE.log(f"avg_grad_norm: {avg_grad_norm.mean().item()}")
 
-                high_grads = (avg_grad_norm > self.ctrl_config.densify_grad_thresh).squeeze()
+                high_grads = (avg_grad_norm > self.ctrl_config.densify_grad_thresh).reshape(-1)
 
-                splits = (self.scales.exp().max(dim=-1).values > self.ctrl_config.densify_size_thresh).squeeze()
+                splits = (self.scales.exp().max(dim=-1).values > self.ctrl_config.densify_size_thresh).reshape(-1)
                 splits &= high_grads
 
                 if self.step < self.ctrl_config.stop_screen_size_at:
-                    splits |= (self.max_2Dsize > self.ctrl_config.split_screen_size).squeeze()
+                    splits |= (self.max_2Dsize > self.ctrl_config.split_screen_size).reshape(-1)
 
                 nsamps = self.ctrl_config.n_split_samples
                 split_params = self.split_gaussians(splits, nsamps)
 
-                dups = (self.scales.exp().max(dim=-1).values <= self.ctrl_config.densify_size_thresh).squeeze()
+                dups = (self.scales.exp().max(dim=-1).values <= self.ctrl_config.densify_size_thresh).reshape(-1)
                 dups &= high_grads
                 dup_params = self.dup_gaussians(dups)
                 for name, param in self.gauss_params.items():
@@ -589,7 +589,7 @@ class VanillaGaussianSplattingModel(torch.nn.Module):
         """
         n_bef = self.num_points
         # cull transparent ones
-        culls = (torch.sigmoid(self.opacities) < self.ctrl_config.cull_alpha_thresh).squeeze()
+        culls = (torch.sigmoid(self.opacities) < self.ctrl_config.cull_alpha_thresh).reshape(-1)
         below_alpha_count = torch.sum(culls).item()
         toobigs_count = 0
         toobigs_ws_count = 0
@@ -613,12 +613,12 @@ class VanillaGaussianSplattingModel(torch.nn.Module):
             )
 
             # cull huge ones
-            toobigs = (torch.exp(self.scales).max(dim=-1).values > cull_scale_thresh).squeeze()
+            toobigs = (torch.exp(self.scales).max(dim=-1).values > cull_scale_thresh).reshape(-1)
             toobigs_ws_count = torch.sum(toobigs).item()
             if self.step < self.ctrl_config.stop_screen_size_at:
                 # cull big screen space
                 assert self.max_2Dsize is not None
-                toobigs_vs = (self.max_2Dsize > self.ctrl_config.cull_screen_size).squeeze()
+                toobigs_vs = (self.max_2Dsize > self.ctrl_config.cull_screen_size).reshape(-1)
                 toobigs_vs_count = torch.sum(toobigs_vs).item()
                 toobigs = toobigs | toobigs_vs
 
@@ -658,7 +658,7 @@ class VanillaGaussianSplattingModel(torch.nn.Module):
         )  # how these scales are rotated
         quats = self.quats[split_mask] / self.quats[split_mask].norm(dim=-1, keepdim=True)  # normalize them first
         rots = quat_to_rotmat(quats.repeat(samps, 1))  # how these scales are rotated
-        rotated_samples = torch.bmm(rots, scaled_samples[..., None]).squeeze()
+        rotated_samples = torch.bmm(rots, scaled_samples[..., None]).squeeze(-1)
         new_means = rotated_samples + self.means[split_mask].repeat(samps, 1)
         # step 2 & 3, sample new colors, new opacities, and other properties
         new_properties = self.split_properties(split_mask, samps)
@@ -703,7 +703,7 @@ class VanillaGaussianSplattingModel(torch.nn.Module):
                 )  # how these scales are rotated
                 quats = self.quats[dup_mask] / self.quats[dup_mask].norm(dim=-1, keepdim=True)  # normalize them first
                 rots = quat_to_rotmat(quats)  # how these scales are rotated
-                rotated_samples = torch.bmm(rots, scaled_samples[..., None]).squeeze()
+                rotated_samples = torch.bmm(rots, scaled_samples[..., None]).squeeze(-1)
                 new_means = rotated_samples + self.means[dup_mask]
                 new_dups[name] = new_means
                 continue

@@ -201,7 +201,8 @@ if __name__ == '__main__':
     # the alignment and inflates every video's post-alignment error -- the QA
     # gate then removes ALL of them. Drop gross raw outliers first; they could
     # never pass the final (1.0 / 0.5) thresholds anyway.
-    PRE_EPE, PRE_MEAN = 2.0, 1.0
+    PRE_EPE = float(os.environ.get('MTGS_REG_PRE_EPE', 2.0))
+    PRE_MEAN = float(os.environ.get('MTGS_REG_PRE_MEAN', 1.0))
     keep_first = list(video_scene_dict.keys())[:1] if isinstance(config, FrameCentralConfig) else []
     outliers = [vt for vt in list(video_scene_dict.keys())
                 if vt not in keep_first
@@ -223,7 +224,8 @@ if __name__ == '__main__':
     for video_token in list(video_scene_dict.keys()):
         max_end_point_error = error_dict_aligned[video_token]['max_end_point_error']
         mean_error = error_dict_aligned[video_token]['mean_error']
-        if max_end_point_error > 1.0 or mean_error > 0.5:
+        if (max_end_point_error > float(os.environ.get('MTGS_REG_QA_EPE', 1.0))
+                or mean_error > float(os.environ.get('MTGS_REG_QA_MEAN', 0.5))):
             bad_videos.append(video_token)
 
     if isinstance(config, FrameCentralConfig) and list(video_scene_dict.keys())[0] in bad_videos:

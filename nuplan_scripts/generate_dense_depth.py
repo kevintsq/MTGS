@@ -302,7 +302,16 @@ if __name__ == '__main__':
             intrinsics = intrinsics.to(distributed_state.device)
 
             with torch.no_grad(), torch.autocast("cuda", dtype=torch.float16):
-                outputs = model.infer(inputs, intrinsics)
+                # UniDepth's camera path assumes batch=1: get_rays() builds a
+                # batch-1 uv grid, so B>1 intrinsics (K [B,3,3]) broadcast against
+                # it and unproject's reshape(1,3,h,w) blows up with an input B times
+                # too large -- the whole stage died at 0% for every bs>1 block.
+                # Frames in a batch share calibration (grouped by _calib_key), so a
+                # per-sample forward is identical in result; the DataLoader still
+                # batches undistort + image IO, only the GPU forward is per-frame.
+                outputs = {'depth': torch.cat(
+                    [model.infer(inputs[b:b + 1], intrinsics[b:b + 1])['depth']
+                     for b in range(inputs.shape[0])], dim=0)}
 
             # Quantize depth (cm as uint16) ON THE GPU. Doing this in numpy cost
             # 22.8 ms/frame in the main loop — serialized with the 23.6 ms of

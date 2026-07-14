@@ -233,9 +233,18 @@ if __name__ == '__main__':
             return inputs, intrinsic, output_path, (raw_height, raw_width), (x, y, w, h)
 
     from concurrent.futures import ThreadPoolExecutor
-    writer = ThreadPoolExecutor(max_workers=4)
+    writer = ThreadPoolExecutor(max_workers=8)  # png encode is ~39 ms and drops the GIL
 
     def _write_depth(depth_image, output_path):
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
+        cv2.imwrite(output_path, depth_image)
+
+    def _write_depth_packed(packed, raw_size, roi, output_path):
+        """packed: [h,w,2] uint8 straight off the GPU -> paste into the full frame."""
+        raw_height, raw_width = raw_size
+        x, y, w, h = roi
+        depth_image = np.zeros((raw_height, raw_width, 3), dtype=np.uint8)
+        depth_image[y:y+h, x:x+w, :2] = packed
         os.makedirs(os.path.dirname(output_path), exist_ok=True)
         cv2.imwrite(output_path, depth_image)
 
@@ -290,31 +299,35 @@ if __name__ == '__main__':
             with torch.no_grad(), torch.autocast("cuda", dtype=torch.float16):
                 outputs = model.infer(inputs, intrinsics)
 
-            depths = outputs['depth'].squeeze(1).float().cpu().numpy()  # [B,h,w]
-            if depths.ndim == 2:                 # a batch of one squeezes away
-                depths = depths[None]
+            # Pack depth into the two PNG channels ON THE GPU. Doing this in numpy
+            # cost 22.8 ms/frame in the main loop — serialized with the 23.6 ms of
+            # inference, it halved throughput. It is pure elementwise math, and the
+            # uint8 result is also 4x smaller to copy back than the float map.
+            depth_t = outputs['depth'].squeeze(1).float()          # [B,h,w]
+            if depth_t.ndim == 2:                                  # a batch of one
+                depth_t = depth_t[None]
+            depth_t = torch.where(
+                (depth_t > args.max_range) | (depth_t < 0.1),
+                torch.zeros((), device=depth_t.device), depth_t)
+            scaled = depth_t * 100
+            packed = torch.stack([(scaled % 256), (scaled // 256)], dim=-1)  # [B,h,w,2]
+            packed = packed.to(torch.uint8).cpu().numpy()
 
-            for depth, output_path, (raw_height, raw_width), (x, y, w, h) in zip(
-                    depths, output_paths, raw_sizes, rois):
-                # filter out out of range depth
-                depth = depth.copy()
-                depth[depth > args.max_range] = 0
-                depth[depth < 0.1] = 0
-
+            for pk, output_path, (raw_height, raw_width), (x, y, w, h) in zip(
+                    packed, output_paths, raw_sizes, rois):
                 # Guard against degenerate model outputs (e.g. a frame whose
                 # undistorted ROI produces a 1-D / mismatched depth map). Skip the
                 # frame instead of crashing the whole stage.
-                if depth.ndim != 2 or depth.shape[0] != h or depth.shape[1] != w:
+                if pk.shape[0] != h or pk.shape[1] != w:
                     print(f"[generate_dense_depth] skip {output_path}: "
-                          f"depth shape {depth.shape} != roi ({h},{w})")
+                          f"depth shape {pk.shape[:2]} != roi ({h},{w})")
                     pbar.update(distributed_state.num_processes)
                     continue
 
-                depth_image = np.zeros((raw_height, raw_width, 3), dtype=np.uint8)
-                depth_image[y:y+h, x:x+w, 0] = ((depth * 100) % 256).astype(np.uint8)
-                depth_image[y:y+h, x:x+w, 1] = ((depth * 100) // 256).astype(np.uint8)
-
-                writer.submit(_write_depth, depth_image, output_path)
+                # the paste + png encode run in the writer threads (imwrite drops
+                # the GIL), so they no longer stall the main loop
+                writer.submit(_write_depth_packed, pk, (raw_height, raw_width),
+                              (x, y, w, h), output_path)
                 pbar.update(distributed_state.num_processes)
 
     writer.shutdown(wait=True)

@@ -295,23 +295,41 @@ if __name__ == '__main__':
         loader = torch.utils.data.DataLoader(
             dataset, batch_sampler=batches, num_workers=max(args.num_workers, 6),
             collate_fn=_collate, prefetch_factor=4)
+        batched_infer = None   # probed on the first multi-frame batch
         pbar = accelerate_tqdm(total=len(dataset), ncols=120,
                                desc=f"Generating dense depths (bs={batch_size}, prefetch+fp16)")
         for inputs, intrinsics, output_paths, raw_sizes, rois in loader:
             inputs = inputs.to(distributed_state.device, non_blocking=True)
             intrinsics = intrinsics.to(distributed_state.device)
 
-            with torch.no_grad(), torch.autocast("cuda", dtype=torch.float16):
-                # UniDepth's camera path assumes batch=1: get_rays() builds a
-                # batch-1 uv grid, so B>1 intrinsics (K [B,3,3]) broadcast against
-                # it and unproject's reshape(1,3,h,w) blows up with an input B times
-                # too large -- the whole stage died at 0% for every bs>1 block.
-                # Frames in a batch share calibration (grouped by _calib_key), so a
-                # per-sample forward is identical in result; the DataLoader still
-                # batches undistort + image IO, only the GPU forward is per-frame.
-                outputs = {'depth': torch.cat(
+            def _infer_per_sample():
+                return {'depth': torch.cat(
                     [model.infer(inputs[b:b + 1], intrinsics[b:b + 1])['depth']
                      for b in range(inputs.shape[0])], dim=0)}
+
+            with torch.no_grad(), torch.autocast("cuda", dtype=torch.float16):
+                # Stock UniDepth's camera path assumes batch=1 (get_rays builds a
+                # batch-1 uv grid; B>1 intrinsics broadcast against it and
+                # unproject's reshape blows up). A patched camera.py fixes that
+                # (reshape(-1,...)) and true batching is ~8% faster e2e — probe it
+                # once on the first real batch, per-sample where unsupported.
+                # Frames in a batch share calibration (_calib_key), so both paths
+                # are result-identical.
+                if inputs.shape[0] == 1:
+                    outputs = model.infer(inputs, intrinsics)
+                elif batched_infer is None:
+                    try:
+                        outputs = model.infer(inputs, intrinsics)
+                        batched_infer = True
+                        print('[generate_dense_depth] batched UniDepth inference OK')
+                    except RuntimeError:
+                        batched_infer = False
+                        print('[generate_dense_depth] stock UniDepth: per-sample forward')
+                        outputs = _infer_per_sample()
+                elif batched_infer:
+                    outputs = model.infer(inputs, intrinsics)
+                else:
+                    outputs = _infer_per_sample()
 
             # Quantize depth (cm as uint16) ON THE GPU. Doing this in numpy cost
             # 22.8 ms/frame in the main loop — serialized with the 23.6 ms of

@@ -241,40 +241,81 @@ if __name__ == '__main__':
 
     with distributed_state.split_between_processes(total_cams) as partial_frames:
         dataset = _DepthDataset(partial_frames)
+
+        # UniDepth one frame at a time leaves the GPU ~half idle. Frames only
+        # stack if they share a shape, and the undistorted ROI is fixed per
+        # camera (same intrinsics + distortion), so batch within a camera.
+        # DEPTH_BATCH pins it; otherwise size from the memory actually free right
+        # now (this GPU may be shared with trainers / other users).
+        batch_size = int(os.environ.get('DEPTH_BATCH', 0))
+        if batch_size <= 0:
+            try:
+                free_gb = torch.cuda.mem_get_info()[0] / 2**30
+            except Exception:
+                free_gb = 0
+            # measured on a Pro6000: bs=4 @ 24 workers is the knee (21.2 it/s vs
+            # 15.2 at bs=1/6w); bs=8 is slightly worse, so 4 is the cap.
+            batch_size = 4 if free_gb >= 34 else 2 if free_gb >= 18 else 1
+            print(f'[generate_dense_depth] GPU free {free_gb:.0f} GiB -> DEPTH_BATCH={batch_size}')
+        # The ROI follows from the calibration that undistort_image_with_cam_info
+        # actually uses — which is the BA-refined colmap_param when present, and it
+        # differs per camera. Key on exactly that, or the stack hits mismatched shapes.
+        def _calib_key(cam_info):
+            src = cam_info.get('colmap_param', cam_info)
+            return (np.asarray(src['cam_intrinsic']).tobytes(),
+                    np.asarray(src['distortion']).tobytes())
+
+        by_calib = {}
+        for i, (cam_info, _) in enumerate(dataset.items):
+            by_calib.setdefault(_calib_key(cam_info), []).append(i)
+        batches = [idxs[i:i + batch_size]
+                   for idxs in by_calib.values()
+                   for i in range(0, len(idxs), batch_size)]
+
+        def _collate(items):
+            inputs = torch.stack([it[0] for it in items])
+            intrinsics = torch.stack([it[1] for it in items])
+            return inputs, intrinsics, [it[2] for it in items], \
+                   [it[3] for it in items], [it[4] for it in items]
+
         loader = torch.utils.data.DataLoader(
-            dataset, batch_size=1, num_workers=max(args.num_workers, 6),
-            collate_fn=lambda b: b[0], prefetch_factor=4)
+            dataset, batch_sampler=batches, num_workers=max(args.num_workers, 6),
+            collate_fn=_collate, prefetch_factor=4)
         pbar = accelerate_tqdm(total=len(dataset), ncols=120,
-                               desc="Generating dense depths (prefetch+fp16)")
-        for inputs, intrinsic, output_path, (raw_height, raw_width), (x, y, w, h) in loader:
+                               desc=f"Generating dense depths (bs={batch_size}, prefetch+fp16)")
+        for inputs, intrinsics, output_paths, raw_sizes, rois in loader:
             inputs = inputs.to(distributed_state.device, non_blocking=True)
-            intrinsic = intrinsic.to(distributed_state.device)
+            intrinsics = intrinsics.to(distributed_state.device)
 
             with torch.no_grad(), torch.autocast("cuda", dtype=torch.float16):
-                outputs = model.infer(inputs, intrinsic)
+                outputs = model.infer(inputs, intrinsics)
 
-            depth = outputs['depth'].squeeze()
-            depth = depth.cpu().numpy()
-            # filter out out of range depth
-            depth[depth > args.max_range] = 0
-            depth[depth < 0.1] = 0
+            depths = outputs['depth'].squeeze(1).float().cpu().numpy()  # [B,h,w]
+            if depths.ndim == 2:                 # a batch of one squeezes away
+                depths = depths[None]
 
-            # Guard against degenerate model outputs (e.g. a frame whose
-            # undistorted ROI produces a 1-D / mismatched depth map). Skip the
-            # frame instead of crashing the whole stage.
-            if depth.ndim != 2 or depth.shape[0] != h or depth.shape[1] != w:
-                print(f"[generate_dense_depth] skip {output_path}: "
-                      f"depth shape {depth.shape} != roi ({h},{w})")
+            for depth, output_path, (raw_height, raw_width), (x, y, w, h) in zip(
+                    depths, output_paths, raw_sizes, rois):
+                # filter out out of range depth
+                depth = depth.copy()
+                depth[depth > args.max_range] = 0
+                depth[depth < 0.1] = 0
+
+                # Guard against degenerate model outputs (e.g. a frame whose
+                # undistorted ROI produces a 1-D / mismatched depth map). Skip the
+                # frame instead of crashing the whole stage.
+                if depth.ndim != 2 or depth.shape[0] != h or depth.shape[1] != w:
+                    print(f"[generate_dense_depth] skip {output_path}: "
+                          f"depth shape {depth.shape} != roi ({h},{w})")
+                    pbar.update(distributed_state.num_processes)
+                    continue
+
+                depth_image = np.zeros((raw_height, raw_width, 3), dtype=np.uint8)
+                depth_image[y:y+h, x:x+w, 0] = ((depth * 100) % 256).astype(np.uint8)
+                depth_image[y:y+h, x:x+w, 1] = ((depth * 100) // 256).astype(np.uint8)
+
+                writer.submit(_write_depth, depth_image, output_path)
                 pbar.update(distributed_state.num_processes)
-                continue
-
-            depth_image = np.zeros((raw_height, raw_width, 3), dtype=np.uint8)
-            depth_image[y:y+h, x:x+w, 0] = ((depth * 100) % 256).astype(np.uint8)
-            depth_image[y:y+h, x:x+w, 1] = ((depth * 100) // 256).astype(np.uint8)
-
-            writer.submit(_write_depth, depth_image, output_path)
-
-            pbar.update(distributed_state.num_processes)
 
     writer.shutdown(wait=True)
     distributed_state.wait_for_everyone()

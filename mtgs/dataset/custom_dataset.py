@@ -439,3 +439,4 @@ class CustomInputDataset(InputDataset):
         camera.metadata["linear_velocity"] = dataparser_outputs.camera_linear_velocities[idx]
         camera.metadata["angular_velocity"] = dataparser_outputs.camera_angular_velocities[idx]
         return camera
+

@@ -401,6 +401,30 @@ def align_model(video_scene: VideoScene, video_scene_dict, colmap_path, thresh=1
     CONSOLE.log(f'[Align Colmap] error = {np.mean(errors):.3f}')
     return video_scene_dict
 
+def split_threads(weights, total_threads, min_threads=2):
+    """Apportion total_threads across concurrently-running tasks, in proportion to weights.
+
+    Every task keeps at least min_threads; the remainder is handed out by largest
+    remainder, so the counts sum to exactly total_threads -- no core is left idle
+    and none is oversubscribed.
+    """
+    n = len(weights)
+    total_threads = max(total_threads, n)  # a concurrent task is useless with 0 threads
+    total_w = sum(weights)
+    if total_w <= 0:  # no size information -- fall back to an even split
+        weights = [1] * n
+        total_w = n
+    # min_threads is what each task holds back before the rest is shared out; drop
+    # it if the allocation is too small to give everyone that much.
+    min_threads = min(min_threads, total_threads // n)
+    spare = total_threads - n * min_threads
+    exact = [w / total_w * spare for w in weights]
+    counts = [min_threads + int(e) for e in exact]
+    fractions = sorted(range(n), key=lambda i: exact[i] - int(exact[i]), reverse=True)
+    for i in fractions[:total_threads - sum(counts)]:
+        counts[i] += 1
+    return counts
+
 def run_colmap_ba(colmap_path, num_workers=8):
     CONSOLE.log(f'Colmap BA for {os.path.basename(colmap_path)} started')
     log_file = f'{colmap_path}/colmap_ba.log'
@@ -483,29 +507,48 @@ if __name__ == "__main__":
                          or int(os.environ.get('SLURM_CPUS_PER_TASK', 0))
                          or multiprocessing.cpu_count())
         pool_size = min(num_tasks, max(1, total_threads // 4))
-        # Give every allocated core to some colmap. An even split silently drops
-        # total_threads % pool_size of them -- 6 videos on 32 CPUs used to run
-        # 6x5=30 threads and leave 2 cores idle for the whole stage -- so the
-        # first `remainder` tasks each take one extra thread. pool_size tasks run
-        # concurrently and their thread counts sum to exactly total_threads: the
-        # allocation is fully used and never oversubscribed. pool_size <=
-        # total_threads // 4 guarantees base >= 4, so no task is starved.
-        base, remainder = divmod(total_threads, pool_size)
-        thread_counts = [max(base + (1 if i < remainder else 0), 4) for i in range(pool_size)]
 
-        CONSOLE.log(f'Using threads {thread_counts} with pool size {pool_size} for colmap '
-                    f'({sum(thread_counts)}/{total_threads} cores in use)')
+        # Traversals within one block differ in length by up to 7x, and colmap cost
+        # is close to linear in image count. Splitting the cores evenly therefore
+        # makes the LONGEST traversal the straggler: it gets 1/n of the allocation
+        # to do most of the work, and every core freed by a short traversal then
+        # sits idle until it finishes. That is how loc_0059 (6 videos, 216..1488
+        # images) TIMEOUTed at 2h: 5 of 6 were done by 82 min, the 1488-image one
+        # was still going at 120 with 26 of its 32 cores idle. Weighting each
+        # traversal's threads by its image count instead makes concurrent
+        # traversals land together, which is what actually bounds the stage.
+        # Frame count is the weight (images = frames x cams, cams is per-rig
+        # constant within a block), and it is available whether or not the colmap
+        # models were just built.
+        weights = [VideoScene.count_total_frames(vsd) for vsd in single_video_scene_dicts]
+        # Longest-processing-time first: when there are more traversals than pool
+        # slots, starting the big ones first keeps the tail short.
+        order = sorted(range(num_tasks), key=lambda i: -weights[i])
+        ordered_paths = [colmap_paths[i] for i in order]
+
+        if num_tasks <= pool_size:
+            # Every traversal runs concurrently, so give each a share of the cores
+            # proportional to its work.
+            thread_counts = split_threads([weights[i] for i in order], total_threads)
+        else:
+            # Slots get reused, so each slot takes an equal, fully-used share --
+            # an even split would silently drop total_threads % pool_size cores.
+            base, remainder = divmod(total_threads, pool_size)
+            slots = [base + (1 if i < remainder else 0) for i in range(pool_size)]
+            thread_counts = [slots[i % pool_size] for i in range(num_tasks)]
+
+        CONSOLE.log(f'Using threads {thread_counts} for videos '
+                    f'{[os.path.basename(p) for p in ordered_paths]} with pool size {pool_size} '
+                    f'(weights {[weights[i] for i in order]}, '
+                    f'{sum(thread_counts[:pool_size])}/{total_threads} cores in use)')
 
         run_colmap = run_colmap_ba if config.use_colmap_ba else run_colmap_triangulation
 
         with multiprocessing.Pool(processes=pool_size) as pool:
-            return_codes = pool.starmap(
-                run_colmap,
-                [(path, thread_counts[i % pool_size]) for i, path in enumerate(colmap_paths)],
-            )
+            return_codes = pool.starmap(run_colmap, list(zip(ordered_paths, thread_counts)))
 
         if not all(return_codes):
-            for colmap_path, return_code in zip(colmap_paths, return_codes):
+            for colmap_path, return_code in zip(ordered_paths, return_codes):
                 if not return_code:
                     CONSOLE.log(f'[ERROR] Colmap failed for {os.path.basename(colmap_path)}')
             exit(1)

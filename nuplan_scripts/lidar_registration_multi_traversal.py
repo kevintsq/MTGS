@@ -100,7 +100,14 @@ def align_poses(video_scene_dict:dict, result_poses_dict: dict):
     if np.linalg.det(R) < 0:
         Vh[-1, :] *= -1
         R = Vh.T @ U.T
-    t = np.mean(original_poses, axis=0) - np.mean(icp_poses, axis=0)
+    # Kabsch translation must be taken AFTER the rotation: t = mu_o - R @ mu_i.
+    # Writing `mu_o - mu_i` rotates about the global ORIGIN rather than about the
+    # centroid, which leaves a constant offset of (R - I) @ mu_i on every pose.
+    # ego2global is UTM-scale (Boston northing ~4.69e6), so even a sub-arcsecond
+    # residual rotation turns into a METRE-scale bias -- enough to push otherwise
+    # good traversals past the QA gate (loc_0158's one clean traversal went from
+    # 1.41/0.70 raw to 2.97/2.91 "aligned", and was then rejected as bad).
+    t = np.mean(original_poses, axis=0) - R @ np.mean(icp_poses, axis=0)
 
     aligned_transform = np.eye(4)
     aligned_transform[:2, :2] = R[:2, :2]
@@ -148,6 +155,13 @@ def visualize_lidar_registration(video_scene: VideoScene, result_poses_dict: dic
     # visualize ego trajectory
     for video_token in video_scene_dict.keys():
         frame_infos = video_scene_dict[video_token]["frame_infos"]
+        # A degenerate traversal (no frames survived the prefilter) has no
+        # trajectory to draw; np.array([]) + centre[None] would raise a (0,)
+        # vs (1,2) broadcast error and kill the whole stage BEFORE the QA pass
+        # gets a chance to drop it. calculate_errors already tolerates this
+        # case (flags it inf); the plot must skip it to match.
+        if not frame_infos:
+            continue
         raw_trajectory = np.array([info['ego2global'][:2, 3] for info in frame_infos]) + video_scene.road_block_center[:2][None]
         icp_trajectory = np.array([result_poses_dict[info['token']][:2, 3] for info in frame_infos]) + video_scene.road_block_center[:2][None]
 

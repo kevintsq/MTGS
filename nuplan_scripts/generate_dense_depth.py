@@ -368,3 +368,4 @@ if __name__ == '__main__':
         table.add_row([key, f"{np.mean(value):.4f}"])
 
     print(table)
+

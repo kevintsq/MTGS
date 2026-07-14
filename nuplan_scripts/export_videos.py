@@ -71,9 +71,12 @@ class ExportVideos:
             whole_image = batch[0]
             video_frames.append(whole_image)
 
+        if not video_frames:
+            return
+
         media.write_video(
-            output_path, 
-            video_frames, 
+            output_path,
+            video_frames,
             fps=10
         )
 
@@ -118,6 +121,8 @@ if __name__ == '__main__':
     for video_token in video_scene_dict:
         video_idx = int(video_token.split('-')[-1])
         trajectory = np.array(video_scene_dict[video_token]['trajectory'])
+        if trajectory.ndim < 2 or len(trajectory) < 2:
+            continue
         trajectory = trajectory[:, :2] + road_block_center[None]
         trajectory = trajectory[::5]
         if len(trajectory) < 2:

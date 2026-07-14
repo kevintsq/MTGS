@@ -58,6 +58,7 @@ def _render_trajectory_video(
     depth_far_plane: Optional[float] = None,
     colormap_options: colormaps.ColormapOptions = colormaps.ColormapOptions(),
     filenames: Optional[List[str]] = None,
+    keep_images: bool = False,
 ) -> None:
     """Helper function to create a video of the spiral trajectory.
 
@@ -73,6 +74,9 @@ def _render_trajectory_video(
         depth_near_plane: Closest depth to consider when using the colormap for depth. If None, use min value.
         depth_far_plane: Furthest depth to consider when using the colormap for depth. If None, use max value.
         colormap_options: Options for colormap.
+        keep_images: Also return every rendered frame. Each frame is a float32 array, so a full
+            camera pass costs len(cameras) * H * W * 12 bytes of RAM; leave this off unless the
+            caller genuinely needs the frames in memory rather than in the written video.
     """
     CONSOLE.print("[bold green]Creating trajectory " + output_format)
     cameras.rescale_output_resolution(rendered_resolution_scaling_factor)
@@ -163,7 +167,8 @@ def _render_trajectory_video(
                     render_image.append(output_image)
 
                 render_image = np.concatenate(render_image, axis=1)
-                render_images.append(render_image)
+                if keep_images:
+                    render_images.append(render_image)
                 if "images" in output_format:
                     img_filename = filenames[camera_idx] if filenames is not None else f"{camera_idx:05d}"
                     if image_format == "png":
@@ -198,6 +203,27 @@ def _render_trajectory_video(
     CONSOLE.print(Panel(table, title="[bold][green]:tada: Render Complete :tada:[/bold]", expand=False))
 
     return render_images
+
+def _hstack_videos(input_filenames: List[Path], output_filename: Path, fps: float) -> None:
+    """Stack already-rendered videos side by side, streaming a frame at a time.
+
+    Decoding the inputs frame-by-frame keeps peak memory at one output row of frames. Holding
+    whole clips instead is what used to OOM this step: a road block with 8 cameras x 745 frames
+    of 960x540 float32 is ~37GB of frames before np.concatenate doubles it.
+    """
+    with ExitStack() as stack:
+        readers = [stack.enter_context(media.VideoReader(str(f))) for f in input_filenames]
+        num_frames = min(r.num_images for r in readers)
+        height = readers[0].shape[0]
+        width = sum(r.shape[1] for r in readers)
+
+        writer = stack.enter_context(
+            media.VideoWriter(path=output_filename, shape=(height, width), fps=fps)
+        )
+        for frames in zip(*readers):
+            writer.add_image(np.concatenate(frames, axis=-2))
+
+    CONSOLE.print(f"[bold green]Wrote {output_filename} ({num_frames} frames, {width}x{height})")
 
 def find_ckpt_path(config: TrainerConfig) -> Tuple[Path, int]:
     assert config.load_dir is not None
@@ -499,7 +525,7 @@ class RenderInterpolated(BaseRender):
                 assert self.output_format == "video"
                 output_filename = output_path / f"{cam_name}.mp4"
 
-                images = _render_trajectory_video(
+                _render_trajectory_video(
                     pipeline,
                     camera_path,
                     output_filename=Path(output_filename),
@@ -512,22 +538,20 @@ class RenderInterpolated(BaseRender):
                     depth_far_plane=self.depth_far_plane,
                     colormap_options=self.colormap_options
                 )
-                rendered[cam_name] = images
+                rendered[cam_name] = Path(output_filename)
 
-            # concat and save videos
-            videos = []
-            for cam in ('CAM_L0', 'CAM_F0', 'CAM_R0'):
-                video = rendered[cam]
-                videos.append(video)
-            videos = np.concatenate(videos, axis=-2)
-            media.write_video(output_path / "concat_front.mp4", videos, fps=self.frame_rate)
-
-            videos = []
-            for cam in ('CAM_R2', 'CAM_B0', 'CAM_L2'):
-                video = rendered[cam]
-                videos.append(video)
-            videos = np.concatenate(videos, axis=-2)
-            media.write_video(output_path / "concat_back.mp4", videos, fps=self.frame_rate)
+            # concat and save videos, re-reading the per-camera clips off disk rather than
+            # keeping every frame of every camera in memory
+            _hstack_videos(
+                [rendered[cam] for cam in ('CAM_L0', 'CAM_F0', 'CAM_R0')],
+                output_path / "concat_front.mp4",
+                fps=self.frame_rate,
+            )
+            _hstack_videos(
+                [rendered[cam] for cam in ('CAM_R2', 'CAM_B0', 'CAM_L2')],
+                output_path / "concat_back.mp4",
+                fps=self.frame_rate,
+            )
 
         base_output_path = Path()
         if self.output_path is not None:

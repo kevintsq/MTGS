@@ -134,6 +134,10 @@ def create_colmap_model(video_scene: VideoScene, video_scene_dict, colmap_path):
                     f'{cam_name}.png'
                 )
                 sem_mask = cv2.imread(sem_mask_path, cv2.IMREAD_GRAYSCALE)
+                if sem_mask is None:
+                    raise FileNotFoundError(
+                        f'semantic mask missing/unreadable: {sem_mask_path} '
+                        '(mask stage output incomplete — regenerate masks for this block)')
                 ego_mask = cv2.imread(ego_mask_path, cv2.IMREAD_GRAYSCALE) != 0
                 foreground_mask_sem = (sem_mask >= 10)  # sky, person, ...
                 invalid_mask = ego_mask | foreground_mask_sem

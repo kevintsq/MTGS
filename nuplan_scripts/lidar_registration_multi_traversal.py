@@ -47,6 +47,15 @@ def calculate_errors(video_scene_dict: dict, result_poses_dict: dict):
 
         total_errors.extend(errors)
         total_heading_errors.extend(heading_errors)
+        if not errors:
+            # degenerate video (no frames survived prefilter): flag as
+            # unregistrable so the QA pass drops it instead of crashing
+            error_dict[video_token] = {
+                'max_end_point_error': float('inf'),
+                'mean_error': float('inf'),
+                'mean_heading_error': float('inf'),
+            }
+            continue
         max_end_point_error = max(errors[0], errors[-1])
         error_dict[video_token] = {
             'max_end_point_error': max_end_point_error,
@@ -261,3 +270,4 @@ if __name__ == '__main__':
 
     video_scene.dump_pickle(video_scene.pickle_path_registered)
     video_scene.update_pickle_link(video_scene.pickle_path_registered)
+

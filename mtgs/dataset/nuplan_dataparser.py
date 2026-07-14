@@ -522,7 +522,14 @@ class NuplanDataParser(DataParser):
                 gt_names = frame_info['gt_names']
                 track_tokens = frame_info['track_tokens']
                 for box, name, track_token in zip(gt_boxes, gt_names, track_tokens):
-                    if track_token not in instances_info:
+                    # track_token is unique per *log*, not per video. A road block can draw two
+                    # videos from one log (ego drove through it twice), and then the same object
+                    # carries the same token in both — keying on the token alone merges them into
+                    # one entry whose quats/trans span both traversals while in_frame_mask is
+                    # sized to the first, which blows up below. An instance node is per-traversal
+                    # anyway (travel_id / num_frames_cur_travel / in_frame_mask), so key on both.
+                    instance_key = f"{travel_id}_{track_token}"
+                    if instance_key not in instances_info:
                         pcd_path = os.path.join(video_scene.instance_point_cloud_path, video_token, f"{track_token}.pcd")
                         if os.path.exists(pcd_path):
                             pcd = o3d.io.read_point_cloud(pcd_path)
@@ -533,7 +540,7 @@ class NuplanDataParser(DataParser):
                             points3D = torch.zeros((0, 3))
                             points3D_rgb = torch.zeros((0, 3))
 
-                        instances_info[track_token] = {
+                        instances_info[instance_key] = {
                             "class_name": name,
                             "token": track_token,
                             "pts": points3D,
@@ -550,9 +557,9 @@ class NuplanDataParser(DataParser):
                     quat = Quaternion(axis=[0, 0, 1], angle=yaw).q
                     trans = box[:3] @ e2g_r_mat.T + e2g_trans
                     # in global coordinates
-                    instances_info[track_token]["quats"].append(quat)
-                    instances_info[track_token]["trans"].append(trans)
-                    instances_info[track_token]["in_frame_indices"].append(frame_idx)
+                    instances_info[instance_key]["quats"].append(quat)
+                    instances_info[instance_key]["trans"].append(trans)
+                    instances_info[instance_key]["in_frame_indices"].append(frame_idx)
 
         new_instances_info = {}
         for k, v in instances_info.items():

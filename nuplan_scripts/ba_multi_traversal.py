@@ -10,7 +10,6 @@ import argparse
 
 import multiprocessing
 import subprocess
-from functools import partial
 
 from tqdm import tqdm
 
@@ -478,19 +477,32 @@ if __name__ == "__main__":
         num_tasks = len(colmap_paths)
         # Respect the SLURM allocation: cpu_count() reports the NODE's cores,
         # oversubscribing the cgroup by an order of magnitude on shared nodes.
-        total_threads = int(os.environ.get('SLURM_CPUS_PER_TASK', 0)) or multiprocessing.cpu_count()
+        # MTGS_CPU_BUDGET caps the budget on shared boxes (e.g. manco, where trainers
+        # may run alongside and their loop is CPU-bound); unset = take every core.
+        total_threads = (int(os.environ.get('MTGS_CPU_BUDGET', 0))
+                         or int(os.environ.get('SLURM_CPUS_PER_TASK', 0))
+                         or multiprocessing.cpu_count())
         pool_size = min(num_tasks, max(1, total_threads // 4))
-        num_workers = max(total_threads // pool_size, 4)
+        # Give every allocated core to some colmap. An even split silently drops
+        # total_threads % pool_size of them -- 6 videos on 32 CPUs used to run
+        # 6x5=30 threads and leave 2 cores idle for the whole stage -- so the
+        # first `remainder` tasks each take one extra thread. pool_size tasks run
+        # concurrently and their thread counts sum to exactly total_threads: the
+        # allocation is fully used and never oversubscribed. pool_size <=
+        # total_threads // 4 guarantees base >= 4, so no task is starved.
+        base, remainder = divmod(total_threads, pool_size)
+        thread_counts = [max(base + (1 if i < remainder else 0), 4) for i in range(pool_size)]
 
-        CONSOLE.log(f'Using {num_workers} workers with pool size {pool_size} for colmap')
+        CONSOLE.log(f'Using threads {thread_counts} with pool size {pool_size} for colmap '
+                    f'({sum(thread_counts)}/{total_threads} cores in use)')
 
-        if config.use_colmap_ba:
-            run_colmap_partial = partial(run_colmap_ba, num_workers=num_workers)
-        else:
-            run_colmap_partial = partial(run_colmap_triangulation, num_workers=num_workers)
+        run_colmap = run_colmap_ba if config.use_colmap_ba else run_colmap_triangulation
 
         with multiprocessing.Pool(processes=pool_size) as pool:
-            return_codes = pool.map(run_colmap_partial, colmap_paths)
+            return_codes = pool.starmap(
+                run_colmap,
+                [(path, thread_counts[i % pool_size]) for i, path in enumerate(colmap_paths)],
+            )
 
         if not all(return_codes):
             for colmap_path, return_code in zip(colmap_paths, return_codes):

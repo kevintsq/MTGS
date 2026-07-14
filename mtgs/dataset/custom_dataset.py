@@ -163,8 +163,14 @@ class CustomInputDataset(InputDataset):
         def read_depth_image(path):
             if not os.path.exists(path):
                 return None
-            depth_img = cv2.imread(path, cv2.IMREAD_UNCHANGED).astype(np.float32)
-            depth = depth_img[:,:,0] + (depth_img[:,:,1] * 256.0)
+            depth_img = cv2.imread(path, cv2.IMREAD_UNCHANGED)
+            if depth_img.ndim == 2:
+                # single-channel uint16, depth in cm (current writer)
+                depth = depth_img.astype(np.float32)
+            else:
+                # legacy 3-channel (lo, hi, 0) uint8 encoding
+                depth_img = depth_img.astype(np.float32)
+                depth = depth_img[:,:,0] + (depth_img[:,:,1] * 256.0)
             depth = depth * 0.01
             return depth
 

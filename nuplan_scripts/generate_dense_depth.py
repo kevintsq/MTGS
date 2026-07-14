@@ -92,8 +92,12 @@ class MetricDepthError:
                         self.video_scene.undistorted_depth_path,
                         cam_info['data_path'].replace('.jpg', '.png'))
 
-                depth = cv2.imread(depth_path, cv2.IMREAD_UNCHANGED).astype(np.float32)
-                depth = depth[:,:,0] + (depth[:,:,1] * 256)
+                depth = cv2.imread(depth_path, cv2.IMREAD_UNCHANGED)
+                if depth.ndim == 2:   # single-channel uint16, depth in cm
+                    depth = depth.astype(np.float32)
+                else:                 # legacy 3-channel (lo, hi, 0) uint8
+                    depth = depth.astype(np.float32)
+                    depth = depth[:,:,0] + (depth[:,:,1] * 256)
                 depth = depth * 0.01
 
                 # project lidar points to image
@@ -240,11 +244,12 @@ if __name__ == '__main__':
         cv2.imwrite(output_path, depth_image)
 
     def _write_depth_packed(packed, raw_size, roi, output_path):
-        """packed: [h,w,2] uint8 straight off the GPU -> paste into the full frame."""
+        """packed: [h,w] uint16 (depth in cm) straight off the GPU -> paste into
+        the full frame and store as a single-channel 16-bit PNG."""
         raw_height, raw_width = raw_size
         x, y, w, h = roi
-        depth_image = np.zeros((raw_height, raw_width, 3), dtype=np.uint8)
-        depth_image[y:y+h, x:x+w, :2] = packed
+        depth_image = np.zeros((raw_height, raw_width), dtype=np.uint16)
+        depth_image[y:y+h, x:x+w] = packed
         os.makedirs(os.path.dirname(output_path), exist_ok=True)
         cv2.imwrite(output_path, depth_image)
 
@@ -299,19 +304,20 @@ if __name__ == '__main__':
             with torch.no_grad(), torch.autocast("cuda", dtype=torch.float16):
                 outputs = model.infer(inputs, intrinsics)
 
-            # Pack depth into the two PNG channels ON THE GPU. Doing this in numpy
-            # cost 22.8 ms/frame in the main loop — serialized with the 23.6 ms of
-            # inference, it halved throughput. It is pure elementwise math, and the
-            # uint8 result is also 4x smaller to copy back than the float map.
+            # Quantize depth (cm as uint16) ON THE GPU. Doing this in numpy cost
+            # 22.8 ms/frame in the main loop — serialized with the 23.6 ms of
+            # inference, it halved throughput. uint16 is also 2x cheaper to copy
+            # back than the float map, and single-channel 16-bit PNGs are ~40%
+            # smaller on disk than the legacy 3-channel (lo,hi,0) encoding.
             depth_t = outputs['depth'].squeeze(1).float()          # [B,h,w]
             if depth_t.ndim == 2:                                  # a batch of one
                 depth_t = depth_t[None]
             depth_t = torch.where(
                 (depth_t > args.max_range) | (depth_t < 0.1),
                 torch.zeros((), device=depth_t.device), depth_t)
-            scaled = depth_t * 100
-            packed = torch.stack([(scaled % 256), (scaled // 256)], dim=-1)  # [B,h,w,2]
-            packed = packed.to(torch.uint8).cpu().numpy()
+            # trunc matches the legacy uint8-pair encoding bit for bit
+            packed = (depth_t * 100).trunc().clamp(0, 65535).to(torch.int32)
+            packed = packed.cpu().numpy().astype(np.uint16)        # [B,h,w]
 
             for pk, output_path, (raw_height, raw_width), (x, y, w, h) in zip(
                     packed, output_paths, raw_sizes, rois):

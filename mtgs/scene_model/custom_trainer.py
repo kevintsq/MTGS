@@ -145,7 +145,15 @@ class CustomTrainer(Trainer):
     # <step> .. <step>+2 (each one drains the GPU queue while Python catches up).
     _sync_debug = int(os.environ["MTGS_SYNC_DEBUG"]) if os.environ.get("MTGS_SYNC_DEBUG") else None
 
+    # MTGS_PROFILE_STEPS=a:b brackets steps [a, b) with cudaProfilerStart/Stop, for
+    # `nsys profile --capture-range=cudaProfilerApi`.
+    _prof = tuple(int(x) for x in os.environ["MTGS_PROFILE_STEPS"].split(":")) if os.environ.get("MTGS_PROFILE_STEPS") else None
+
     def train_iteration(self, step: int):
+        if self._prof is not None and step == self._prof[0]:
+            torch.cuda.synchronize(); torch.cuda.profiler.start()
+        if self._prof is not None and step == self._prof[1]:
+            torch.cuda.synchronize(); torch.cuda.profiler.stop()
         if self._sync_debug is not None and step == self._sync_debug:
             import warnings
             warnings.simplefilter("always")

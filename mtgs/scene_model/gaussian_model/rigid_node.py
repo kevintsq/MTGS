@@ -452,12 +452,14 @@ def batched_rigid_gaussians(items, camera_to_worlds, sh_n):
 
     local_means = torch.cat([nd.gauss_params['means'] for nd in nodes])
     rot = quat_to_rotmat(q_obj)                                   # [K, 3, 3]
+    # index_select, not rot[idx]: same values, but its backward is an index_add
+    # instead of advanced indexing's sort-based accumulate (1.8 ms each per step)
     # local @ R^T + t, per row
-    global_means = torch.einsum('nj,nij->ni', local_means, rot[idx]) + t_obj[idx]
+    global_means = torch.einsum('nj,nij->ni', local_means, rot.index_select(0, idx)) + t_obj.index_select(0, idx)
 
     local_quats = torch.cat([nd.quats for nd in nodes])
     local_quats = local_quats / local_quats.norm(dim=-1, keepdim=True)
-    global_quats = quat_mult(q_obj[idx], local_quats)
+    global_quats = quat_mult(q_obj.index_select(0, idx), local_quats)
 
     scales = torch.exp(torch.cat([nd.scales for nd in nodes]))
     opacities = torch.sigmoid(torch.cat([nd.gauss_params['opacities'] for nd in nodes])).squeeze(-1)

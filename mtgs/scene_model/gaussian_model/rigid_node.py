@@ -419,3 +419,57 @@ class RigidSubModel(VanillaGaussianSplattingModel):
         self.means.data = new_means
         self.quats.data = new_quats
         self.instance_quats.data = new_instance_quats
+
+
+def rigid_batch_key(node, frame_idx, timestamp, return_features, return_v, training):
+    """Grouping key under which `node` can join a batched rigid evaluation, or None
+    when it must take its own get_gaussians (eval caching, Fourier colours, features,
+    velocities, timestamp interpolation, subclasses)."""
+    if (type(node) is not RigidSubModel or not training or return_features or return_v
+            or frame_idx is None or node.config.fourier_features_dim is not None):
+        return None
+    sh = node.sh_degree
+    n = min(node.step // node.ctrl_config.sh_degree_interval, sh) if sh > 0 else -1
+    return (sh, n, tuple(node.features_rest.shape[1:]))
+
+
+def batched_rigid_gaussians(items, camera_to_worlds, sh_n):
+    """RigidSubModel.get_gaussians for several objects at once.
+
+    items: [(node, quat_cur_frame, trans_cur_frame)] from node.get_object_pose; all
+    nodes share rigid_batch_key. Each object's rows come out contiguous, in item order,
+    with the same values as calling get_gaussians on each node in turn: one set of
+    kernels for the whole batch instead of ~90 per object, which made the trainer
+    CPU-bound (one Python thread launching tiny kernels, GPU at 30%)."""
+    nodes = [it[0] for it in items]
+    counts = [nd.gauss_params['means'].shape[0] for nd in nodes]
+    dev = nodes[0].gauss_params['means'].device
+    K = len(items)
+    q_obj = torch.stack([it[1] for it in items])                 # [K, 4]
+    t_obj = torch.stack([it[2] for it in items])                 # [K, 3]
+    ar = torch.arange(K, device=dev)
+    idx = torch.cat([ar[i:i + 1].expand(c) for i, c in enumerate(counts)])   # [N] object of each row
+
+    local_means = torch.cat([nd.gauss_params['means'] for nd in nodes])
+    rot = quat_to_rotmat(q_obj)                                   # [K, 3, 3]
+    # local @ R^T + t, per row
+    global_means = torch.einsum('nj,nij->ni', local_means, rot[idx]) + t_obj[idx]
+
+    local_quats = torch.cat([nd.quats for nd in nodes])
+    local_quats = local_quats / local_quats.norm(dim=-1, keepdim=True)
+    global_quats = quat_mult(q_obj[idx], local_quats)
+
+    scales = torch.exp(torch.cat([nd.scales for nd in nodes]))
+    opacities = torch.sigmoid(torch.cat([nd.gauss_params['opacities'] for nd in nodes])).squeeze(-1)
+
+    features_dc = torch.cat([nd.features_dc for nd in nodes])
+    features_rest = torch.cat([nd.features_rest for nd in nodes])
+    colors = torch.cat((features_dc[:, None, :], features_rest), dim=1)
+    if sh_n >= 0:
+        viewdirs = global_means.detach() - camera_to_worlds[..., :3, 3]
+        viewdirs = viewdirs / viewdirs.norm(dim=-1, keepdim=True)
+        rgbs = torch.clamp(spherical_harmonics(sh_n, viewdirs, colors) + 0.5, 0.0, 1.0)
+    else:
+        rgbs = torch.sigmoid(colors[:, 0, :])
+    return {"means": global_means, "scales": scales, "quats": global_quats,
+            "opacities": opacities, "rgbs": rgbs}, counts

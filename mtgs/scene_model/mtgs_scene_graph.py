@@ -37,8 +37,11 @@ from mtgs.utils.ssim import MaskedSSIM
 from mtgs.utils.pnsr import MaskedPSNR, color_correct
 
 from .gaussian_model.vanilla_gaussian_splatting import VanillaGaussianSplattingModelConfig, GaussianSplattingControlConfig
-from .gaussian_model.rigid_node import RigidSubModel
+from .gaussian_model.rigid_node import RigidSubModel, rigid_batch_key, batched_rigid_gaussians
 from .gaussian_model.utils import quat_to_rotmat, SH2RGB
+
+import os as _os
+_BATCHED_RIGID = _os.environ.get("MTGS_BATCHED_RIGID", "1") != "0"
 from .module.appearance import GSAppearanceModelConfig, GSAppearanceModel
 
 @dataclass
@@ -426,6 +429,26 @@ class MTGSSceneModel(Model):
 
         if visible_tokens is None:
             visible_tokens = self.gaussian_models.keys()
+
+        # Consecutive rigid objects are evaluated as one batch (see
+        # batched_rigid_gaussians); MTGS_BATCHED_RIGID=0 restores the per-object calls.
+        batch_rigid = _BATCHED_RIGID and self.training
+        run, run_key = [], None
+
+        def flush_run():
+            nonlocal run, run_key
+            if not run:
+                return
+            gs, counts = batched_rigid_gaussians(run, kwargs["camera_to_worlds"], run_key[1])
+            for k, v in gs.items():
+                gs_dict[k].append(v)
+            ids = self._model_id_table()
+            gs_dict["model_id"].append(torch.cat(
+                [ids[mid:mid + 1].expand(c) for (_, _, _, mid, _), c in zip(run, counts)]))
+            for (_, _, _, _, name), c in zip(run, counts):
+                model_slices[name] = c
+            run, run_key = [], None
+
         for model_name in visible_tokens:
             if model_name not in self.gaussian_models:
                 gaussian_model = self.gaussian_models[self.get_submodel_name(model_name)]
@@ -433,6 +456,27 @@ class MTGSSceneModel(Model):
             else:
                 gaussian_model = self.gaussian_models[model_name]
                 model_id = self.model_ids[model_name]
+            key = rigid_batch_key(gaussian_model, kwargs.get("frame_idx"), kwargs.get("timestamp"),
+                                  kwargs.get("return_features", False), kwargs.get("return_v", False),
+                                  self.training) if batch_rigid else None
+            if key is not None:
+                # the gating at the top of RigidSubModel.get_gaussians
+                frame_idx = kwargs["frame_idx"]
+                if kwargs.get("travel_id") != gaussian_model.travel_id:
+                    gaussian_model.frame_idx = None
+                    continue
+                gaussian_model.frame_idx = frame_idx
+                assert frame_idx < gaussian_model.num_frames
+                quat, trans = gaussian_model.get_object_pose(frame_idx, kwargs.get("timestamp"))
+                if quat is None or trans is None:
+                    gaussian_model.frame_idx = None
+                    continue
+                if run and key != run_key:
+                    flush_run()
+                run_key = key
+                run.append((gaussian_model, quat, trans, model_id, model_name))
+                continue
+            flush_run()
             if gaussian_model.model_type == "multicolor" and "multicolor_travel_id" in kwargs:
                 multicolor_kwargs = kwargs.copy()
                 multicolor_kwargs["travel_id"] = kwargs["multicolor_travel_id"]
@@ -452,6 +496,7 @@ class MTGSSceneModel(Model):
                 torch.full((gs["means"].shape[0],), model_id, device=self.device)
             )
             model_slices[model_name] = gs["means"].shape[0]
+        flush_run()
 
         for key, value in gs_dict.items():
             collected_gaussians[key] = torch.cat(value, dim=0)
@@ -471,6 +516,13 @@ class MTGSSceneModel(Model):
             self._model_slices = None  # slices invalid after cropping
 
         return collected_gaussians
+
+    def _model_id_table(self):
+        """model ids as a device tensor, so a run of ids is a view (no host copy)."""
+        t = getattr(self, "_model_id_dev", None)
+        if t is None or t.device != torch.device(self.device):
+            t = self._model_id_dev = torch.arange(max(self.model_ids.values()) + 1, device=self.device)
+        return t
 
     def get_gaussian_params(self, travel_id, frame_idx):
         collected_gaussians = {}
@@ -995,12 +1047,18 @@ class MTGSSceneModel(Model):
                         if visible_mask[model_mask].sum() == 0:
                             continue
                     means = model.means
-                    instance_size = means.new_tensor(model.instance_size)
+                    # cached on the device: new_tensor from a list is a blocking copy
+                    instance_size = getattr(model, "_instance_size_t", None)
+                    if instance_size is None or instance_size.device != means.device:
+                        instance_size = model._instance_size_t = means.new_tensor(model.instance_size)
                     oob_mask = means.abs() > (instance_size / 2 + self.config.oob_tolerance)[None]
                     oob_mask = oob_mask.any(-1).detach()
                     # unconditional tensor accumulation: empty selections sum
-                    # to 0 and cost no host sync (the old .sum()!=0 gate did)
-                    oob_loss = oob_loss + (-torch.log(1 - model.opacities[oob_mask].sigmoid() + 1e-6)).sum()
+                    # to 0 and cost no host sync (the old .sum()!=0 gate did);
+                    # torch.where instead of a boolean index for the same reason
+                    oob_terms = -torch.log(1 - model.opacities.sigmoid() + 1e-6)
+                    oob_loss = oob_loss + torch.where(oob_mask.view(-1, *([1] * (oob_terms.dim() - 1))),
+                                                      oob_terms, 0.0).sum()
                     overall_gaussians = overall_gaussians + oob_mask.sum()
             if hasattr(self, "_rigid_vis_flags"):
                 del self._rigid_vis_flags
@@ -1230,7 +1288,12 @@ class MTGSSceneModel(Model):
                 else:
                     grads = self.xys.grad[0, index].detach()
 
-                image_size = grads.new_tensor([self.last_size[1], self.last_size[0]]).unsqueeze(0)
+                # one device tensor per image size (new_tensor from a list is a blocking copy)
+                key = (self.last_size, grads.device, grads.dtype)
+                if getattr(self, "_image_size_key", None) != key:
+                    self._image_size_key = key
+                    self._image_size_t = grads.new_tensor([self.last_size[1], self.last_size[0]]).unsqueeze(0)
+                image_size = self._image_size_t
                 grads = (grads * image_size * 0.5).norm(dim=-1)
                 radii = self.radii[0, index]
 

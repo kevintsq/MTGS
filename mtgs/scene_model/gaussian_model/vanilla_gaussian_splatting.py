@@ -460,24 +460,23 @@ class VanillaGaussianSplattingModel(torch.nn.Module):
             return
         with torch.no_grad():
             # keep track of a moving average of grad norms
+            # Same updates as indexing with the boolean mask, written with torch.where:
+            # a boolean index needs the number of hits on the host, i.e. a GPU sync,
+            # and this runs for every submodel every step (~5 syncs x ~50 models).
             visible_mask = (self.radii > 0).flatten()
-            grads = self.xys_grad[visible_mask]
 
             if self.xys_grad_norm is None:
                 self.xys_grad_norm = torch.zeros(self.num_points, device=self.device, dtype=torch.float32)
                 self.vis_counts = torch.ones(self.num_points, device=self.device, dtype=torch.float32)
             assert self.vis_counts is not None
-            self.vis_counts[visible_mask] += + 1
-            self.xys_grad_norm[visible_mask] += grads
+            self.vis_counts += visible_mask
+            self.xys_grad_norm += torch.where(visible_mask, self.xys_grad, 0.0)
 
             # update the max screen size, as number of pixels
             if self.max_2Dsize is None:
                 self.max_2Dsize = torch.zeros_like(self.radii, dtype=torch.float32)
-            newradii = self.radii.detach()[visible_mask]
-            self.max_2Dsize[visible_mask] = torch.maximum(
-                self.max_2Dsize[visible_mask],
-                newradii,
-            )
+            self.max_2Dsize = torch.where(
+                visible_mask, torch.maximum(self.max_2Dsize, self.radii.detach()), self.max_2Dsize)
 
     def refinement_after(self, optimizers: Optimizers, step):
         assert step == self.step

@@ -24,10 +24,16 @@ if __name__ == '__main__':
     output_dir = os.path.join(config.data_root, recon_subdir, config.road_block_name)
     os.makedirs(output_dir, exist_ok=True)
 
-    if isinstance(config, FrameCentralConfig):
+    if isinstance(config, FrameCentralConfig) or os.environ.get('MTGS_FORCE_ST') == '1':
         # official navsim auto flow: single (central) traversal
         from mtgs.config.MTGS_ST import config as ns_config
-        travels = (0,)
+        if os.environ.get('MTGS_FORCE_ST') == '1' and not isinstance(config, FrameCentralConfig):
+            from nuplan_scripts.utils.video_scene_dict_tools import VideoScene
+            _vs = VideoScene(config)
+            _vsd = _vs.load_pickle(_vs.pickle_path)
+            travels = tuple(sorted(int(k.rsplit('-', 1)[1]) for k in _vsd))
+        else:
+            travels = (0,)
         ns_config.pipeline.datamanager.dataparser.only_moving = True
     else:
         # RoadBlockConfig: full multi-traversal training on every traversal
@@ -41,6 +47,20 @@ if __name__ == '__main__':
     ns_config.experiment_name = config.road_block_name
     ns_config.pipeline.datamanager.cache_strategy = 'prefetch'
     ns_config.pipeline.datamanager.dataparser.road_block_config = args.config
+    # COLMAP re-estimates intrinsics + a 4-param OPENCV distortion per *video*, so one
+    # physical camera gets a different focal (±1%) and k1/k2 in every traversal, and the
+    # calibrated k3 (-0.052) is unrepresentable. Undistorting each traversal with its own
+    # fit breaks multi-view consistency on thin structures (bent poles). 0 = calibrated 5-param.
+    # BA-refined per-camera poses were never consumed by training (use_colmap_pose
+    # defaults False); joint BA only pays off if they are.
+    if os.environ.get('MTGS_USE_COLMAP_POSE') == '1':
+        ns_config.pipeline.datamanager.dataparser.use_colmap_pose = True
+    if os.environ.get('MTGS_USE_COLMAP_INTRINSICS', '1') == '0':
+        ns_config.pipeline.datamanager.dataparser.use_colmap_intrinsics = False
+    # MTGS trains at half resolution by default (camera_res_scale_factor=0.5); renders
+    # come out ~4x less sharp than the photos. 1.0 = full 1920x1080.
+    if os.environ.get('MTGS_CAM_RES_SCALE'):
+        ns_config.pipeline.datamanager.camera_res_scale_factor = float(os.environ['MTGS_CAM_RES_SCALE'])
     ns_config.pipeline.datamanager.dataparser.train_scene_travels = travels
     ns_config.pipeline.datamanager.dataparser.eval_scene_travels = travels
     ns_config.pipeline.model.color_corrected_metrics = False

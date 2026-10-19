@@ -10,6 +10,94 @@ import platform
 import subprocess
 import argparse
 
+
+def _match_threads(num_workers):
+    """Threads for matching, capped well below the core count.
+
+    Matching is two phases with opposite appetites: geometric verification scales
+    with cores, but importing the results goes through one SQLite writer. Handing
+    the stage every core on a 152-core node put 85 threads in futex_wait and drove
+    the process to 83% system time -- the lock convoy costs more than the extra
+    parallelism buys. COLMAP_MATCH_THREADS overrides.
+    """
+    import os
+    override = os.environ.get("COLMAP_MATCH_THREADS")
+    if override:
+        return max(1, int(override))
+    return max(1, min(int(num_workers), 32))   # measured peak on EPYC 9634
+
+
+def _gpu_flags(command):
+    """Tell colmap to stay off the GPU when this job was not granted one.
+
+    The CUDA build calls GetNumCudaDevices() while constructing the feature
+    extractor / matcher, and aborts with SIGABRT rather than degrading when no
+    device is usable. A scheduler that co-schedules CPU stages onto GPU boxes
+    leaves /dev/nvidiactl present with no allocation, so gate on the actual grant
+    (CUDA_VISIBLE_DEVICES); COLMAP_USE_GPU overrides either way.
+    """
+    import os
+    use = os.environ.get("COLMAP_USE_GPU")
+    if use is None:
+        use = "1" if os.environ.get("CUDA_VISIBLE_DEVICES") else "0"
+    if use == "1":
+        return []
+    return {
+        "feature_extractor": ["--FeatureExtraction.use_gpu", "0"],
+        "exhaustive_matcher": ["--FeatureMatching.use_gpu", "0"],
+        "sequential_matcher": ["--FeatureMatching.use_gpu", "0"],
+        "matches_importer": ["--FeatureMatching.use_gpu", "0"],
+    }.get(command, [])
+
+
+def _run_colmap(args, colmap_path, **kwargs):
+    r = _run_colmap_raw(args, colmap_path, **kwargs)
+    out = None
+    if "--output_path" in args:
+        out = args[args.index("--output_path") + 1]
+    listing = sorted(os.listdir(out)) if out and os.path.isdir(out) else None
+    print(f"[colmap] {args[1] if len(args) > 1 else '?'} rc={r.returncode} "
+          f"output={os.path.basename(out) if out else '-'} files={listing}", flush=True)
+    return r
+
+
+def _run_colmap_raw(args, colmap_path, **kwargs):
+    """Run a colmap command from inside its own model directory.
+
+    /proc/<pid>/cmdline is world-readable and colmap is a C++ binary that cannot
+    rename its own process, so every path on its command line is visible to every
+    account on the machine -- including the block name. Setting the working directory
+    to the model folder and passing the paths relative to it keeps the listing down to
+    bare filenames without changing what colmap is told to do.
+    """
+    prefix = colmap_path.rstrip("/") + "/"
+    rel = [a[len(prefix):] if isinstance(a, str) and a.startswith(prefix) else a
+           for a in args]
+    if len(rel) > 1:
+        rel = rel + _gpu_flags(rel[1])
+    return subprocess.run(rel, cwd=colmap_path, **kwargs)
+
+
+def _normalize_rigs(database_path):
+    """COLMAP 4.x feature_extractor auto-creates one rig per camera folder with
+    arbitrary ref sensors. Loading a rig-less prior model then synthesizes rigs as
+    rig_id == ref_sensor_id == camera_id, and Reconstruction::Load dies on
+    'existing_rig.RefSensorId() == rig.RefSensorId()'. Rewrite the table to the
+    trivial mapping so both sides agree (frames table is empty at this point)."""
+    import sqlite3
+    db = sqlite3.connect(database_path)
+    c = db.cursor()
+    try:
+        c.execute("DELETE FROM rigs")
+        c.execute("DELETE FROM rig_sensors")
+        for (cid,) in c.execute("SELECT camera_id FROM cameras").fetchall():
+            c.execute("INSERT INTO rigs(rig_id, ref_sensor_id, ref_sensor_type) VALUES (?,?,0)", (cid, cid))
+        db.commit()
+    except sqlite3.OperationalError:
+        pass  # colmap 3.x database: no rigs table, nothing to fix
+    db.close()
+
+
 def run_bundle_adjustment(
     colmap_path, 
     input_model='sparse_model', 
@@ -29,12 +117,10 @@ def run_bundle_adjustment(
         colmap_feature_extractor_args += ["--ImageReader.mask_path", f"{colmap_path}/masks"]
     # COLMAP 4.x renamed SiftExtraction.num_threads -> FeatureExtraction.num_threads
     colmap_feature_extractor_args += ["--FeatureExtraction.num_threads", f"{num_workers}"]
-    # CUDA-built colmap SIGABRTs in GetNumCudaDevices() on GPU-less nodes; force CPU there
-    use_gpu = os.environ.get('COLMAP_USE_GPU', '1' if os.path.exists('/dev/nvidiactl') else '0')
-    colmap_feature_extractor_args += ["--FeatureExtraction.use_gpu", use_gpu]
 
     try:
-        subprocess.run(colmap_feature_extractor_args, check=True)
+        _run_colmap(colmap_feature_extractor_args, colmap_path, check=True)
+        _normalize_rigs(f"{colmap_path}/database.db")
     except subprocess.CalledProcessError as e:
         print(f"Error executing colmap feature_extractor: {e}")
         sys.exit(1)
@@ -45,12 +131,11 @@ def run_bundle_adjustment(
         colmap_exe, "matches_importer",
         "--database_path", f"{colmap_path}/database.db",
         "--match_list_path", f"{colmap_path}/image_pairs.txt",
-        "--FeatureMatching.num_threads", f"{num_workers}",
-        "--FeatureMatching.use_gpu", use_gpu,
+        "--FeatureMatching.num_threads", f"{_match_threads(num_workers)}"
     ]
 
     try:
-        subprocess.run(colmap_matches_importer_args, check=True)
+        _run_colmap(colmap_matches_importer_args, colmap_path, check=True)
     except subprocess.CalledProcessError as e:
         print(f"Error executing colmap matches_importer: {e}")
         sys.exit(1)
@@ -65,59 +150,81 @@ def run_bundle_adjustment(
 
     colmap_point_triangulator_args = [
         colmap_exe, "point_triangulator",
-        "--refine_intrinsics", "1",
+        "--refine_intrinsics", os.environ.get("COLMAP_REFINE_INTRINSICS", "1"),
         "--Mapper.num_threads", f"{num_workers}",
         "--Mapper.ba_global_function_tolerance", "0.000001",
         "--Mapper.ba_global_max_num_iterations", "30",
         "--Mapper.ba_global_max_refinements", "3",
     ]
 
-    colmap_bundle_adjuster_args = [
-        colmap_exe, "bundle_adjuster",
-        "--BundleAdjustment.function_tolerance", "0.000001",
-        "--BundleAdjustment.max_linear_solver_iterations", "200",
-        "--BundleAdjustment.max_num_iterations", "100",
-        "--BundleAdjustment.refine_focal_length", "1",
-        "--BundleAdjustment.refine_principal_point", "0",
-        "--BundleAdjustment.refine_extra_params", "1"
-    ]
+    # COLMAP_BA_MODE picks how the standalone bundle_adjuster is driven:
+    #   full    -- current options (colmap 4.x spelling, free focal + distortion)
+    #   legacy  -- the exact July argv (colmap 3.x spelling), to reproduce what the
+    #              adopted reconstructions were actually built with
+    #   nointr  -- poses only; intrinsics are left to the triangulator's refinement
+    _ba_mode = os.environ.get("COLMAP_BA_MODE", "full")
+    if _ba_mode == "legacy":
+        colmap_bundle_adjuster_args = [
+            colmap_exe, "bundle_adjuster",
+            "--BundleAdjustment.function_tolerance", "0.000001",
+            "--BundleAdjustment.max_linear_solver_iterations", "200",
+            "--BundleAdjustment.max_num_iterations", "100",
+            "--BundleAdjustment.refine_focal_length", "1",
+            "--BundleAdjustment.refine_principal_point", "0",
+            "--BundleAdjustment.refine_extra_params", "1"
+        ]
+    else:
+        colmap_bundle_adjuster_args = [
+            colmap_exe, "bundle_adjuster",
+            "--BundleAdjustmentCeres.function_tolerance", "0.000001",
+            "--BundleAdjustmentCeres.max_linear_solver_iterations", "200",
+            "--BundleAdjustmentCeres.max_num_iterations", "100",
+            "--BundleAdjustment.refine_focal_length", os.environ.get("COLMAP_REFINE_INTRINSICS", "1"),
+            "--BundleAdjustment.refine_principal_point", "0",
+            "--BundleAdjustment.refine_extra_params", os.environ.get("COLMAP_REFINE_INTRINSICS", "1")
+        ]
+        if _ba_mode == "nointr":
+            for flag in ("--BundleAdjustment.refine_focal_length",
+                         "--BundleAdjustment.refine_extra_params"):
+                colmap_bundle_adjuster_args[colmap_bundle_adjuster_args.index(flag) + 1] = "0"
+    print(f"[ba] COLMAP_BA_MODE={_ba_mode}: {' '.join(colmap_bundle_adjuster_args[1:])}", flush=True)
     # 2 rounds of triangulation + bundle adjustment
     try:
-        subprocess.run(colmap_point_triangulator_args + [
+        _run_colmap(colmap_point_triangulator_args + [
             "--database_path", f"{colmap_path}/database.db",
             "--image_path", f"{colmap_path}/images",
             "--input_path", f"{colmap_path}/{input_model}",
             "--output_path", f"{colmap_path}/{output_model}/t",
-            ], check=True)
+            ], colmap_path, check=True)
     except subprocess.CalledProcessError as e:
         print(f"Error executing colmap_point_triangulator_args: {e}")
         sys.exit(1)
 
     try:
-        subprocess.run(colmap_bundle_adjuster_args + [
+        _run_colmap(colmap_bundle_adjuster_args + [
             "--input_path", f"{colmap_path}/{output_model}/t",
             "--output_path", f"{colmap_path}/{output_model}/b",
-        ], check=True)
+        ], colmap_path, check=True)
     except subprocess.CalledProcessError as e:
         print(f"Error executing colmap_bundle_adjuster_args: {e}")
         sys.exit(1)
 
     try:
-        subprocess.run(colmap_point_triangulator_args + [
+        _run_colmap(colmap_point_triangulator_args + [
             "--database_path", f"{colmap_path}/database.db",
             "--image_path", f"{colmap_path}/images",
             "--input_path", f"{colmap_path}/{output_model}/b",
             "--output_path", f"{colmap_path}/{output_model}/t2",
-            ], check=True)
+            ], colmap_path, check=True)
     except subprocess.CalledProcessError as e:
         print(f"Error executing colmap_point_triangulator_args: {e}")
         sys.exit(1)
 
     try:
-        subprocess.run(colmap_bundle_adjuster_args + [
+        _run_colmap(colmap_bundle_adjuster_args + [
             "--input_path", f"{colmap_path}/{output_model}/t2",
             "--output_path", f"{colmap_path}/{output_model}/0",
-        ], check=True)
+        ], colmap_path, check=True)
     except subprocess.CalledProcessError as e:
         print(f"Error executing colmap_bundle_adjuster_args: {e}")
         sys.exit(1)

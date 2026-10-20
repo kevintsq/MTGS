@@ -453,10 +453,25 @@ if __name__ == '__main__':
     PRE_EPE = float(os.environ.get('MTGS_REG_PRE_EPE', 2.0))
     PRE_MEAN = float(os.environ.get('MTGS_REG_PRE_MEAN', 1.0))
     keep_first = list(video_scene_dict.keys())[:1] if isinstance(config, FrameCentralConfig) else []
+    # The raw errors are measured against the INS, which is itself off by 1-3 m in
+    # some blocks (Boston nb_03/05/06, Vegas nb_13: every pass raw EPE 2-3 m, the
+    # survivor 0.2 m after alignment). An absolute gate then threw 4-5 of 6 good
+    # passes away and put them back on GPS poses, while a block whose passes ALL
+    # exceeded it (nb_20: 432 m and 117 m garbage next to 1-5 m) dropped nothing
+    # and the garbage skewed the fit for everyone. So an outlier is a pass far
+    # from the block's typical raw error (MTGS_REG_PRE_REL x median), and only
+    # above the absolute floor.
+    PRE_REL = float(os.environ.get('MTGS_REG_PRE_REL', 2.5))
+    _epe = np.array([error_dict[vt]['max_end_point_error'] for vt in video_scene_dict])
+    _mean = np.array([error_dict[vt]['mean_error'] for vt in video_scene_dict])
+    epe_gate = max(PRE_EPE, PRE_REL * float(np.median(_epe)))
+    mean_gate = max(PRE_MEAN, PRE_REL * float(np.median(_mean)))
+    CONSOLE.log(f"Pre-alignment outlier gates: EPE > {epe_gate:.2f} m, mean > {mean_gate:.2f} m "
+                f"(block medians {np.median(_epe):.2f} / {np.median(_mean):.2f})")
     outliers = [vt for vt in list(video_scene_dict.keys())
                 if vt not in keep_first
-                and (error_dict[vt]['max_end_point_error'] > PRE_EPE
-                     or error_dict[vt]['mean_error'] > PRE_MEAN)]
+                and (error_dict[vt]['max_end_point_error'] > epe_gate
+                     or error_dict[vt]['mean_error'] > mean_gate)]
     pre_dropped = {}
     if outliers and len(outliers) < len(video_scene_dict):
         for vt in outliers:

@@ -321,6 +321,67 @@ def _apply_vehicle_yaw_fix(ego2global, lidar2ego, cams, log_name):
                     f"(lidar2global unchanged) for log {log_name}", style="yellow")
     return E_new, L_new
 
+def _aligned_reference(video_scene_dict, result_poses_dict_aligned, exclude):
+    """(xy [N,2], z_aligned - z_ins [N], block median) over the ICP-aligned frames.
+
+    align_poses fits the ICP frame onto the INS in x/y only, so a pass put back on
+    its GPS pose sits at INS altitude while the aligned passes sit at the ICP
+    height: 1-7 m apart (fk_gapC_001 trav 2, fk_loc_0009 trav 259 ...), a second
+    road layer in training and a camera under the road in HUGSIM (2026-10-20)."""
+    xy, dz = [], []
+    for vt, v in video_scene_dict.items():
+        if vt in exclude:
+            continue
+        for info in v['frame_infos']:
+            t = info['token']
+            if t not in result_poses_dict_aligned:
+                continue
+            xy.append(result_poses_dict_aligned[t][:2, 3])
+            dz.append(result_poses_dict_aligned[t][2, 3] - info['ego2global'][2, 3])
+    xy = np.array(xy, dtype=float).reshape(-1, 2); dz = np.array(dz, dtype=float)
+    return xy, dz, (float(np.median(dz)) if len(dz) else 0.0)
+
+
+def _gps_pose_on_aligned_height(info, ref, radius=25.0):
+    """The INS pose lifted by the local (aligned - INS) height offset of the
+    ICP-aligned frames within `radius` m, else by the block median."""
+    ref_xy, ref_dz, ref_med = ref
+    p = np.array(info['ego2global'], dtype=float).copy()
+    off = ref_med
+    if len(ref_xy):
+        near = np.linalg.norm(ref_xy - p[:2, 3], axis=1) < radius
+        if near.sum() >= 3:
+            off = float(np.median(ref_dz[near]))
+    p[2, 3] += off
+    return p
+
+
+def _z_inconsistent_videos(video_scene_dict, result_poses_dict_aligned, skip, gate, radius=15.0):
+    """Videos whose registered height is more than `gate` m off the other videos'
+    height along their own trajectory (ICP drift in Z, invisible to the BEV QA)."""
+    P = {vt: np.array([result_poses_dict_aligned[i['token']][:3, 3] for i in v['frame_infos']
+                       if i['token'] in result_poses_dict_aligned])
+         for vt, v in video_scene_dict.items()}
+    out = {}
+    if len(P) < 3:          # with two passes the height disagreement has no majority
+        return out
+    allpts = np.concatenate([q for q in P.values() if len(q)])
+    for vt, pts in P.items():
+        if vt in skip or len(pts) == 0:
+            continue
+        res = []
+        for p in pts:
+            # median over every pass nearby, own frames included: with a consistent
+            # majority the median sits on the majority height, so the odd pass
+            # stands out and the good ones do not (leave-one-out flagged both sides)
+            near = np.linalg.norm(allpts[:, :2] - p[:2], axis=1) < radius
+            if near.sum() >= 3:
+                res.append(p[2] - float(np.median(allpts[near, 2])))
+        if len(res) >= 5 and abs(float(np.median(res))) > gate:
+            out[vt] = float(np.median(res))
+    return out
+
+
 def _is_pinned(video):
     pins = [x for x in os.environ.get('MTGS_PIN_LOGS', '').split(',') if x]
     infos = video.get('frame_infos', [])
@@ -412,8 +473,12 @@ if __name__ == '__main__':
     # below then decides whether any OTHER reject also has to be kept.
     fb_on = os.environ.get('MTGS_ICP_FALLBACK_ENABLE', '1') == '1'
     fb_max = float(os.environ.get('MTGS_ICP_FALLBACK_MAX', 2.0)) if fb_on else 0.0
+    gps_videos = set()   # passes carried on (height-corrected) GPS poses
     if fb_max > 0:
         touched = False
+        sliders = [vt for vt in video_scene_dict
+                   if error_dict_aligned[vt]['mean_error'] > fb_max and error_dict_aligned[vt]['mean_heading_error'] < 2.0]
+        ref = _aligned_reference(video_scene_dict, result_poses_dict_aligned, set(sliders))
         for vt in list(video_scene_dict.keys()):
             e = error_dict_aligned[vt]
             if e['mean_error'] > fb_max and e['mean_heading_error'] < 2.0:
@@ -423,7 +488,8 @@ if __name__ == '__main__':
                             f"(slide, not refinement) -- keeping the GPS pose.",
                             style="yellow")
                 for info in video_scene_dict[vt]['frame_infos']:
-                    result_poses_dict_aligned[info['token']] = info['ego2global'].copy()
+                    result_poses_dict_aligned[info['token']] = _gps_pose_on_aligned_height(info, ref)
+                gps_videos.add(vt)
                 touched = True
         if touched:
             error_dict_aligned = calculate_errors(video_scene_dict, result_poses_dict_aligned)
@@ -455,6 +521,17 @@ if __name__ == '__main__':
                 or mean_heading_error > are_gate):
             bad_videos.append(video_token)
 
+    # Height QA: the BEV metrics above cannot see a pass that ICP settled 1-3 m
+    # above or below the others (fk_loc_0185 trav 20 +3.3 m, fp_gapC_010 trav 18
+    # +1.0 m passed EPE/ATE/ARE and trained a second road layer).
+    dz_gate = float(os.environ.get('MTGS_REG_QA_DZ', 0.75))
+    if dz_gate > 0:
+        for vt, dz in _z_inconsistent_videos(video_scene_dict, result_poses_dict_aligned,
+                                             set(bad_videos) | gps_videos, dz_gate).items():
+            CONSOLE.log(f"Traversal {vt.split('-')[-1]}: registered {dz:+.2f} m off the other "
+                        f"traversals' height (gate {dz_gate} m) -> bad registration.", style="yellow")
+            bad_videos.append(vt)
+
     if isinstance(config, FrameCentralConfig) and list(video_scene_dict.keys())[0] in bad_videos:
         CONSOLE.log("WARNING: The central log has bad registration result. Use log pose and disable multi-traversal.", style="bold red")
         first_key = list(video_scene_dict.keys())[0]
@@ -476,6 +553,7 @@ if __name__ == '__main__':
             # rainy own passes of fl_loc_0252 / fl_loc_0261, which on GPS poses left a
             # grey blob / smeared route (ICP had moved them 1-4.6 m; GPS on a rainy day).
             keep_icp = os.environ.get('MTGS_PIN_KEEP_ICP', '0') == '1'
+            ref = _aligned_reference(video_scene_dict, result_poses_dict_aligned, set(bad_videos) | gps_videos)
             for vt, v in chosen:
                 video_scene_dict[vt] = v
                 if keep_icp and _is_pinned(v):
@@ -489,7 +567,8 @@ if __name__ == '__main__':
                             f"({len(v['frame_infos'])} frames): dropped before alignment, "
                             f"but the block would be short without it.", style="yellow")
                 for info in v['frame_infos']:
-                    result_poses_dict_aligned[info['token']] = info['ego2global'].copy()
+                    result_poses_dict_aligned[info['token']] = _gps_pose_on_aligned_height(info, ref)
+                gps_videos.add(vt)
 
         if config.exclude_bad_registration:
             # Rescue by outcome: dropping every reject is only acceptable while
@@ -503,6 +582,7 @@ if __name__ == '__main__':
                                            error_dict_aligned[v]['mean_heading_error']))
             rescued = ranked[:keep_n] + [v for v in ranked[keep_n:]
                                          if _is_pinned(video_scene_dict[v])]
+            ref = _aligned_reference(video_scene_dict, result_poses_dict_aligned, set(bad_videos) | gps_videos)
             for video_token in rescued:
                 e = error_dict_aligned[video_token]
                 if os.environ.get('MTGS_PIN_KEEP_ICP', '0') == '1' and _is_pinned(video_scene_dict[video_token]):
@@ -515,7 +595,8 @@ if __name__ == '__main__':
                             f"{e['mean_heading_error']:.2f} deg, but the block would "
                             f"otherwise be short).", style="yellow")
                 for info in video_scene_dict[video_token]['frame_infos']:
-                    result_poses_dict_aligned[info['token']] = info['ego2global'].copy()
+                    result_poses_dict_aligned[info['token']] = _gps_pose_on_aligned_height(info, ref)
+                gps_videos.add(video_token)
             for video_token in bad_videos:
                 if video_token in rescued:
                     continue

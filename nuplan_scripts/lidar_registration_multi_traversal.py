@@ -512,6 +512,18 @@ if __name__ == '__main__':
 
     # filter out bad video_info
     bad_videos = []
+    # The post-alignment translation gates compare the ICP pose with the INS, so a
+    # block whose INS is itself off by half a metre on some logs (Boston nb_03:
+    # three passes at mean 0.53-0.63 m, all consistent with the map) fails them
+    # for no registration reason and gets those passes put back on GPS poses.
+    # Like the pre-alignment gate, scale them with the block's typical residual.
+    QA_REL = float(os.environ.get('MTGS_REG_QA_REL', 2.5))
+    _m = np.array([error_dict_aligned[vt]['mean_error'] for vt in video_scene_dict if vt not in gps_videos])
+    _e = np.array([error_dict_aligned[vt]['max_end_point_error'] for vt in video_scene_dict if vt not in gps_videos])
+    qa_mean_gate = max(float(os.environ.get('MTGS_REG_QA_MEAN', 0.5)), QA_REL * float(np.median(_m)) if len(_m) else 0.0)
+    qa_epe_gate = max(float(os.environ.get('MTGS_REG_QA_EPE', 1.0)), QA_REL * float(np.median(_e)) if len(_e) else 0.0)
+    CONSOLE.log(f"Post-alignment QA gates: EPE > {qa_epe_gate:.2f} m, mean > {qa_mean_gate:.2f} m "
+                f"(block medians {np.median(_e) if len(_e) else 0:.2f} / {np.median(_m) if len(_m) else 0:.2f})")
     for video_token in list(video_scene_dict.keys()):
         max_end_point_error = error_dict_aligned[video_token]['max_end_point_error']
         mean_error = error_dict_aligned[video_token]['mean_error']
@@ -531,8 +543,8 @@ if __name__ == '__main__':
             # passes to 1 deg and put them on GPS poses rendered WORSE (ghosting, uneven
             # ground) than the ICP poses in every one of the 7 blocks (user, 2026-10-16).
             are_gate = min(are_gate, float(os.environ.get('MTGS_REG_QA_ARE_PINNED', 2.5)))
-        if (max_end_point_error > float(os.environ.get('MTGS_REG_QA_EPE', 1.0))
-                or mean_error > float(os.environ.get('MTGS_REG_QA_MEAN', 0.5))
+        if (max_end_point_error > qa_epe_gate
+                or mean_error > qa_mean_gate
                 or mean_heading_error > are_gate):
             bad_videos.append(video_token)
 

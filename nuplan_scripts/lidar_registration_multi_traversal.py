@@ -382,6 +382,55 @@ def _z_inconsistent_videos(video_scene_dict, result_poses_dict_aligned, skip, ga
     return out
 
 
+def _harmonize_z(video_scene_dict, result_poses_dict_aligned, radius=15.0, min_nb=3, win=8, gate=0.3):
+    """Put every pass on the height of the passes already registered around it.
+
+    KISS-ICP runs all traversals as one sequence; each new traversal starts from
+    its own GPS height, and when that is further off than the ICP correspondence
+    threshold the flat road gives a stable local minimum one layer up or down
+    (nb_05: six passes split into +1.1 m and -1.2 m groups, nb_04: -2.5..+2.8 m
+    along one pass). x/y/yaw are fine; only z is wrong, and it can drift along the
+    pass. Passes are processed from the longest: for each frame the offset is the
+    median, over the own frames within `win` of it, of (own z - median z of the
+    reference frames within `radius` m); the frame is lowered/raised by it when
+    the pass's median |offset| exceeds `gate`. Frames without reference nearby
+    take the offset of the nearest corrected frame of their pass. Returns
+    {video: median offset applied}."""
+    order = sorted(video_scene_dict, key=lambda vt: -len(video_scene_dict[vt]['frame_infos']))
+    P = {vt: np.array([result_poses_dict_aligned[i['token']][:3, 3] for i in video_scene_dict[vt]['frame_infos']])
+         for vt in order}
+    ref = [P[order[0]]] if len(order) else []
+    applied = {}
+    for vt in order[1:]:
+        pts = P[vt]
+        if len(pts) == 0:
+            continue
+        R = np.concatenate(ref)
+        raw = np.full(len(pts), np.nan)
+        for i, p in enumerate(pts):
+            near = np.linalg.norm(R[:, :2] - p[:2], axis=1) < radius
+            if near.sum() >= min_nb:
+                raw[i] = p[2] - float(np.median(R[near, 2]))
+        ok = ~np.isnan(raw)
+        if ok.sum() >= 5 and abs(float(np.median(raw[ok]))) > gate:
+            off = np.full(len(pts), np.nan)
+            for i in range(len(pts)):
+                lo, hi = max(0, i - win), min(len(pts), i + win + 1)
+                seg = raw[lo:hi]; seg = seg[~np.isnan(seg)]
+                if len(seg):
+                    off[i] = float(np.median(seg))
+            idx_ok = np.where(~np.isnan(off))[0]
+            for i in range(len(pts)):
+                if np.isnan(off[i]):
+                    off[i] = off[idx_ok[np.argmin(abs(idx_ok - i))]]
+            for i, info in enumerate(video_scene_dict[vt]['frame_infos']):
+                result_poses_dict_aligned[info['token']][2, 3] -= off[i]
+            pts = pts.copy(); pts[:, 2] -= off
+            applied[vt] = float(np.median(raw[ok]))
+        ref.append(pts)
+    return applied
+
+
 def _is_pinned(video):
     pins = [x for x in os.environ.get('MTGS_PIN_LOGS', '').split(',') if x]
     infos = video.get('frame_infos', [])
@@ -548,6 +597,12 @@ if __name__ == '__main__':
                 or mean_heading_error > are_gate):
             bad_videos.append(video_token)
 
+    # Height harmonisation (MTGS_REG_Z_HARMONIZE=0 disables): bring every pass
+    # onto the height of the passes registered around it before the height QA.
+    if os.environ.get('MTGS_REG_Z_HARMONIZE', '1') == '1':
+        _applied = _harmonize_z(video_scene_dict, result_poses_dict_aligned)
+        for vt, off in _applied.items():
+            CONSOLE.log(f"Traversal {vt.split('-')[-1]}: height corrected by {-off:+.2f} m onto the other passes.", style="yellow")
     # Height QA: the BEV metrics above cannot see a pass that ICP settled 1-3 m
     # above or below the others (fk_loc_0185 trav 20 +3.3 m, fp_gapC_010 trav 18
     # +1.0 m passed EPE/ATE/ARE and trained a second road layer).

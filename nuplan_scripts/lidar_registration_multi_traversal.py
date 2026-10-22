@@ -834,6 +834,39 @@ if __name__ == '__main__':
             if len(video_scene_dict) == 0:
                 raise ValueError("All videos have bad registration result.")
 
+        # MTGS_REG_MAP_ICP_ALL=1: inter-pass consistency sweep. The passes only agree
+        # as well as the odometry chain and the x/y Kabsch let them (fq_loc_0182,
+        # loc_0188, loc_0211: every pass 1-4 m from the INS and from each other, the
+        # model a blur of ghost copies). Register each pass, worst QA first, by rigid +
+        # per-frame scan-to-map ICP against the map of all the OTHER passes, and accept
+        # the same way as a restored pass. Two sweeps; the second sees the corrected map.
+        if _scans_by_token and os.environ.get('MTGS_REG_MAP_ICP_ALL', '0') == '1':
+            _sweeps = int(os.environ.get('MTGS_REG_MAP_ICP_SWEEPS', 2))
+            _order = sorted(video_scene_dict.keys(),
+                            key=lambda vt: -error_dict_aligned.get(vt, {}).get('mean_error', 0.0))
+            for _sw in range(_sweeps):
+                for vt in _order:
+                    v = video_scene_dict[vt]
+                    _map = _map_icp_inputs(video_scene_dict, result_poses_dict_aligned, {vt}, _scans_by_token)
+                    if _map is None or len(_map) < 5000:
+                        continue
+                    _cur = lambda t: result_poses_dict_aligned.get(t)
+                    fixed, rep = _map_icp_pass(v, _scans_by_token, [("aligned", _cur)], _map, vt)
+                    if fixed is not None:
+                        _d = [np.linalg.norm(fixed[t][:3, 3] - result_poses_dict_aligned[t][:3, 3]) for t in fixed if t in result_poses_dict_aligned]
+                        CONSOLE.log(f"Sweep {_sw + 1}: video {vt.split('-')[-1]} moved onto the other passes "
+                                    f"(median {np.median(_d) if _d else 0:.2f} m, max {max(_d) if _d else 0:.2f} m): {rep}", style="yellow")
+                        result_poses_dict_aligned.update(fixed)
+                    else:
+                        CONSOLE.log(f"Sweep {_sw + 1}: video {vt.split('-')[-1]} left as is ({rep})", style="yellow")
+            # the sweeps move passes onto each other, which can carry the whole block
+            # off the INS by a common offset (synthetic: 1.4 m); re-anchor with the same
+            # x/y Kabsch the block was aligned with, so fallback placement stays valid
+            result_poses_dict_aligned = align_poses(video_scene_dict, result_poses_dict_aligned)
+            _e = calculate_errors(video_scene_dict, result_poses_dict_aligned)
+            CONSOLE.log("After the consistency sweeps (vs INS): " + ", ".join(
+                f"{vt.split('-')[-1]}: {_e[vt]['mean_error']:.2f} m" for vt in video_scene_dict), style="yellow")
+
         # MTGS_REG_LEVEL: 0 = full ICP, 1 = INS attitude + one constant per traversal
         # (measured worse: -1.5..-3 dB), 2 = full ICP minus the drift all traversals share
         level_mode = os.environ.get('MTGS_REG_LEVEL', '0')

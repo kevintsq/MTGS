@@ -489,7 +489,51 @@ def _map_icp_pass(video, scans_by_token, init_pose_sets, ref_cloud, label=""):
         return None, "; ".join(report)
     _, name, T, pose_of = best
     out = {info['token']: T @ pose_of(info['token']) for info in video['frame_infos'] if pose_of(info['token']) is not None}
+    # A rigid fit cannot absorb drift INSIDE the pass (fq_gap_01 video 19: INS
+    # distorted along the drive, the rigid-corrected pass still ghosted). Refine
+    # every frame's pose by scan-to-map ICP from the rigid result, small
+    # correspondence, bounded correction, then smooth the corrections along the
+    # pass so the trajectory stays continuous. MTGS_REG_MAP_ICP_FRAMES=0 disables.
+    if os.environ.get('MTGS_REG_MAP_ICP_FRAMES', '1') == '1':
+        out, frep = _map_icp_frames(video, scans_by_token, out, ref, voxel)
+        report.append(frep)
     return out, f"took {name} (" + "; ".join(report) + ")"
+
+
+def _map_icp_frames(video, scans_by_token, poses, ref, voxel, max_dt=1.0, max_dyaw_deg=3.0, win=5):
+    """Per-frame scan-to-map refinement of `poses` (token -> 4x4) against the
+    open3d map `ref`; returns (refined poses, report)."""
+    import open3d as o3d
+    from scipy.spatial.transform import Rotation as _R
+    tokens = [info['token'] for info in video['frame_infos'] if info['token'] in poses and info['token'] in scans_by_token]
+    corr, n_ok = [], 0
+    for t in tokens:
+        P = scans_by_token[t][:, :3]
+        P = P[np.linalg.norm(P[:, :2], axis=1) < 60.0][::2]
+        src = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(P)).voxel_down_sample(voxel)
+        T = poses[t]
+        for c in (0.8, 0.3):
+            res = o3d.pipelines.registration.registration_icp(
+                src, ref, c, T, o3d.pipelines.registration.TransformationEstimationPointToPlane(),
+                o3d.pipelines.registration.ICPConvergenceCriteria(max_iteration=30))
+            T = res.transformation
+        D = T @ np.linalg.inv(poses[t])                     # correction in the map frame
+        dt = float(np.linalg.norm(D[:3, 3])); dyaw = abs(float(_R.from_matrix(D[:3, :3]).as_euler('zyx', degrees=True)[0]))
+        ok = res.fitness >= 0.3 and dt <= max_dt and dyaw <= max_dyaw_deg
+        corr.append(D if ok else None); n_ok += ok
+    # smooth: replace each correction by the component-wise median of its window
+    # (translation and rotation vector), so a single bad ICP frame cannot kink the pass
+    rv = [(_R.from_matrix(D[:3, :3]).as_rotvec(), D[:3, 3]) if D is not None else None for D in corr]
+    out = dict(poses)
+    for i, t in enumerate(tokens):
+        nb = [rv[j] for j in range(max(0, i - win // 2), min(len(rv), i + win // 2 + 1)) if rv[j] is not None]
+        if len(nb) < 2:
+            continue
+        r = np.median(np.array([x[0] for x in nb]), axis=0); tr = np.median(np.array([x[1] for x in nb]), axis=0)
+        D = np.eye(4); D[:3, :3] = _R.from_rotvec(r).as_matrix(); D[:3, 3] = tr
+        out[t] = D @ poses[t]
+    mags = [float(np.linalg.norm(D[:3, 3])) for D in corr if D is not None]
+    return out, (f"per-frame map ICP: {n_ok}/{len(tokens)} frames refined, median correction {np.median(mags) if mags else 0:.2f} m, max {max(mags) if mags else 0:.2f} m")
 
 
 def _map_icp_inputs(video_scene_dict, result_poses_dict_aligned, exclude, scans_by_token):

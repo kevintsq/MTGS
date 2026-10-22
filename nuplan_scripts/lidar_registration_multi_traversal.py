@@ -431,6 +431,84 @@ def _harmonize_z(video_scene_dict, result_poses_dict_aligned, radius=15.0, min_n
     return applied
 
 
+def _map_icp_pass(video, scans_by_token, init_pose_sets, ref_cloud, label=""):
+    """Rigidly register one pass onto the point map of the aligned passes.
+
+    A pass put back on its GPS poses ghosts wherever the INS is biased against
+    the ICP frame (fq_loc_0182, fq_gap_01: 1-3 m), and MTGS_PIN_KEEP_ICP ghosts
+    where the ICP chain itself slipped. Neither frame is trusted blindly here:
+    every candidate initialisation (ICP poses through the global fit, INS poses
+    at the aligned height) is refined by a single rigid point-to-plane ICP of the
+    pass's own lidar accumulation against the map of the good passes, and the
+    best fit wins if it is good enough. Returns (token->pose dict, report) or
+    (None, report)."""
+    import open3d as o3d
+    voxel = float(os.environ.get('MTGS_REG_MAP_ICP_VOXEL', 0.3))
+    min_fit = float(os.environ.get('MTGS_REG_MAP_ICP_FITNESS', 0.4))
+    max_rmse = float(os.environ.get('MTGS_REG_MAP_ICP_RMSE', 0.35))
+    max_shift = float(os.environ.get('MTGS_REG_MAP_ICP_SHIFT', 6.0))
+
+    def _cloud(points):
+        pc = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(points))
+        pc = pc.voxel_down_sample(voxel)
+        pc.estimate_normals(o3d.geometry.KDTreeSearchParamHybrid(radius=voxel * 4, max_nn=30))
+        return pc
+
+    def _accumulate(pose_of):
+        pts = []
+        for info in video['frame_infos'][::2]:
+            t = info['token']
+            if t not in scans_by_token or pose_of(t) is None:
+                continue
+            P = scans_by_token[t][:, :3]
+            keep = np.linalg.norm(P[:, :2], axis=1) < 60.0
+            P = P[keep][::3]
+            pose = pose_of(t)
+            pts.append((pose[:3, :3] @ P.T).T + pose[:3, 3])
+        return np.concatenate(pts) if pts else None
+
+    best, report = None, []
+    ref = _cloud(ref_cloud)
+    for name, pose_of in init_pose_sets:
+        src_pts = _accumulate(pose_of)
+        if src_pts is None or len(src_pts) < 2000:
+            report.append(f"{name}: no points"); continue
+        src = _cloud(src_pts)
+        T = np.eye(4)
+        for corr in (2.0, 0.8, 0.4):
+            res = o3d.pipelines.registration.registration_icp(
+                src, ref, corr, T, o3d.pipelines.registration.TransformationEstimationPointToPlane(),
+                o3d.pipelines.registration.ICPConvergenceCriteria(max_iteration=60))
+            T = res.transformation
+        shift = float(np.linalg.norm(T[:3, 3])); yaw = float(np.degrees(np.arctan2(T[1, 0], T[0, 0])))
+        report.append(f"{name}: fitness {res.fitness:.2f} rmse {res.inlier_rmse:.2f} m shift {shift:.2f} m yaw {yaw:+.2f} deg")
+        ok = res.fitness >= min_fit and res.inlier_rmse <= max_rmse and shift <= max_shift and abs(yaw) <= 10.0
+        if ok and (best is None or res.inlier_rmse < best[0]):
+            best = (res.inlier_rmse, name, T, pose_of)
+    if best is None:
+        return None, "; ".join(report)
+    _, name, T, pose_of = best
+    out = {info['token']: T @ pose_of(info['token']) for info in video['frame_infos'] if pose_of(info['token']) is not None}
+    return out, f"took {name} (" + "; ".join(report) + ")"
+
+
+def _map_icp_inputs(video_scene_dict, result_poses_dict_aligned, exclude, scans_by_token):
+    """Point map of the aligned (trusted) passes for _map_icp_pass."""
+    pts = []
+    for vt, v in video_scene_dict.items():
+        if vt in exclude:
+            continue
+        for info in v['frame_infos'][::2]:
+            t = info['token']
+            if t not in scans_by_token or t not in result_poses_dict_aligned:
+                continue
+            P = scans_by_token[t][:, :3]
+            P = P[np.linalg.norm(P[:, :2], axis=1) < 60.0][::3]
+            pose = result_poses_dict_aligned[t]
+            pts.append((pose[:3, :3] @ P.T).T + pose[:3, 3])
+    return np.concatenate(pts) if pts else None
+
+
 def _is_pinned(video):
     pins = [x for x in os.environ.get('MTGS_PIN_LOGS', '').split(',') if x]
     infos = video.get('frame_infos', [])
@@ -469,6 +547,9 @@ if __name__ == '__main__':
     result_poses = kiss_icp_dataset.apply_calibration(kiss_icp_pipeline.poses)
     tokens = kiss_icp_dataset.tokens
     result_poses_dict = {token: pose for token, pose in zip(tokens, result_poses)}
+    # raw scans (lidar frame) for the map ICP of passes that fail the gates
+    _scans_by_token = {token: scan for token, scan in zip(tokens, kiss_icp_dataset.scans)} \
+        if os.environ.get('MTGS_REG_MAP_ICP', '1') == '1' else {}
 
     if os.environ.get('MTGS_SKIP_ICP') == '1':
         # KISS-ICP is scan-to-map odometry meant for ~10Hz sequences. nuPlan
@@ -636,8 +717,19 @@ if __name__ == '__main__':
             # grey blob / smeared route (ICP had moved them 1-4.6 m; GPS on a rainy day).
             keep_icp = os.environ.get('MTGS_PIN_KEEP_ICP', '0') == '1'
             ref = _aligned_reference(video_scene_dict, result_poses_dict_aligned, set(bad_videos) | gps_videos)
+            _map = _map_icp_inputs(video_scene_dict, result_poses_dict_aligned, set(bad_videos) | gps_videos, _scans_by_token) if _scans_by_token else None
             for vt, v in chosen:
                 video_scene_dict[vt] = v
+                if _map is not None:
+                    # try to put the pass back on the map, not on the INS
+                    _ins = lambda t, _v=v: next((_gps_pose_on_aligned_height(i, ref) for i in _v['frame_infos'] if i['token'] == t), None)
+                    _icp = lambda t: (_LAST_ALIGN_T @ result_poses_dict[t]) if t in result_poses_dict else None
+                    fixed, rep = _map_icp_pass(v, _scans_by_token, [("icp+global", _icp), ("ins", _ins)], _map, vt)
+                    if fixed is not None:
+                        CONSOLE.log(f"Restoring video {vt.split('-')[-1]} by map ICP ({len(fixed)} frames): {rep}", style="yellow")
+                        result_poses_dict_aligned.update(fixed)
+                        continue
+                    CONSOLE.log(f"Map ICP failed for video {vt.split('-')[-1]} ({rep}); falling back to GPS poses", style="bold red")
                 if keep_icp and _is_pinned(v):
                     CONSOLE.log(f"Restoring video {vt.split('-')[-1]} on its ICP poses through the "
                                 f"global alignment ({len(v['frame_infos'])} frames, MTGS_PIN_KEEP_ICP).",
@@ -665,8 +757,19 @@ if __name__ == '__main__':
             rescued = ranked[:keep_n] + [v for v in ranked[keep_n:]
                                          if _is_pinned(video_scene_dict[v])]
             ref = _aligned_reference(video_scene_dict, result_poses_dict_aligned, set(bad_videos) | gps_videos)
+            _map = _map_icp_inputs(video_scene_dict, result_poses_dict_aligned, set(bad_videos) | gps_videos, _scans_by_token) if (_scans_by_token and rescued) else None
             for video_token in rescued:
                 e = error_dict_aligned[video_token]
+                if _map is not None:
+                    _v = video_scene_dict[video_token]
+                    _ins = lambda t, _v=_v: next((_gps_pose_on_aligned_height(i, ref) for i in _v['frame_infos'] if i['token'] == t), None)
+                    _icp = lambda t: result_poses_dict_aligned.get(t)
+                    fixed, rep = _map_icp_pass(_v, _scans_by_token, [("aligned icp", _icp), ("ins", _ins)], _map, video_token)
+                    if fixed is not None:
+                        CONSOLE.log(f"Keeping video {video_token.split('-')[-1]} by map ICP (QA said mean {e['mean_error']:.2f} m / {e['mean_heading_error']:.2f} deg): {rep}", style="yellow")
+                        result_poses_dict_aligned.update(fixed)
+                        continue
+                    CONSOLE.log(f"Map ICP failed for video {video_token.split('-')[-1]} ({rep}); falling back to GPS poses", style="bold red")
                 if os.environ.get('MTGS_PIN_KEEP_ICP', '0') == '1' and _is_pinned(video_scene_dict[video_token]):
                     CONSOLE.log(f"Keeping video {video_token.split('-')[-1]} on its aligned ICP poses "
                                 f"(QA said mean {e['mean_error']:.2f}m / {e['mean_heading_error']:.2f} deg; "

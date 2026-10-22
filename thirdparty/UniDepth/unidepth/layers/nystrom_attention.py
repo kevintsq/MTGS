@@ -1,11 +1,20 @@
 from functools import partial
-from typing import Optional
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
-from xformers.components.attention import NystromAttention
+
+try:
+    from xformers.components.attention import NystromAttention
+except ImportError:
+    print("Cannot import NystromAttention, you can not run original UniDepth. UniDepthV2 is available.")
+    class NystromAttention():
+        def __init__(self, *args, **kwargs):
+            pass
+        def __call__(self, *args, **kwds):
+            raise NotImplementedError("NystromAttention is not available, please install xformers to use it.")
+            
 
 from .attention import AttentionBlock
 
@@ -20,7 +29,7 @@ class NystromBlock(AttentionBlock):
         cosine: bool = False,
         gated: bool = False,
         layer_scale: float = 1.0,
-        context_dim: Optional[int] = None,
+        context_dim: int | None = None,
     ):
         super().__init__(
             dim=dim,
@@ -39,11 +48,11 @@ class NystromBlock(AttentionBlock):
     def attn(
         self,
         x: torch.Tensor,
-        attn_bias: Optional[torch.Tensor] = None,
-        context: Optional[torch.Tensor] = None,
-        pos_embed: Optional[torch.Tensor] = None,
-        pos_embed_context: Optional[torch.Tensor] = None,
-        rope: Optional[nn.Module] = None,
+        attn_bias: torch.Tensor | None = None,
+        context: torch.Tensor | None = None,
+        pos_embed: torch.Tensor | None = None,
+        pos_embed_context: torch.Tensor | None = None,
+        rope: nn.Module | None = None,
     ) -> torch.Tensor:
         x = self.norm_attnx(x)
         context = self.norm_attnctx(context)

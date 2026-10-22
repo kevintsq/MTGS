@@ -1,5 +1,3 @@
-from typing import Union
-
 import torch
 import torch.nn as nn
 
@@ -8,7 +6,7 @@ class LayerScale(nn.Module):
     def __init__(
         self,
         dim: int,
-        init_values: Union[float, torch.Tensor] = 1e-5,
+        init_values: float | torch.Tensor = 1e-5,
         inplace: bool = False,
     ) -> None:
         super().__init__()

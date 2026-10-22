@@ -3,7 +3,7 @@ Author: Luigi Piccinelli
 Licensed under the CC-BY NC 4.0 license (http://creativecommons.org/licenses/by-nc/4.0/)
 """
 
-from typing import List, Tuple, Union
+from typing import List, Tuple
 
 import torch
 import torch.nn as nn
@@ -113,7 +113,7 @@ class DepthHead(nn.Module):
         hidden_dim: int,
         num_heads: int = 8,
         expansion: int = 4,
-        depths: Union[int, List[int]] = 4,
+        depths: int | list[int] = 4,
         camera_dim: int = 256,
         num_resolutions: int = 4,
         dropout: float = 0.0,
@@ -197,10 +197,9 @@ class DepthHead(nn.Module):
     ) -> torch.Tensor:
         features = features.unbind(dim=-1)
         shapes = self.shapes
+        rays_hr = rays_hr.detach()
 
         # camera_embedding
-        # torch.cuda.synchronize()
-        # start = time()
         rays_embedding_16 = F.normalize(
             flat_interpolate(rays_hr, old=self.original_shapes, new=shapes), dim=-1
         )
@@ -219,8 +218,6 @@ class DepthHead(nn.Module):
         rays_embedding_16 = self.project_rays16(rsh_cart_8(rays_embedding_16))
         rays_embedding_8 = self.project_rays8(rsh_cart_8(rays_embedding_8))
         rays_embedding_4 = self.project_rays4(rsh_cart_8(rays_embedding_4))
-        # torch.cuda.synchronize()
-        # print(f"camera_embedding took {time() - start} seconds")
         features_tokens = torch.cat(features, dim=1)
         features_tokens_pos = pos_embed + level_embed
 
@@ -377,7 +374,10 @@ class Decoder(nn.Module):
             max_stack(original_encoder_outputs[i:j])
             for i, j in self.slices_encoder_range
         ]
-        cls_tokens = [cls_tokens[-i - 1] for i in range(len(self.slices_encoder_range))]
+        # detach tokens for camera
+        cls_tokens = [
+            cls_tokens[-i - 1].detach() for i in range(len(self.slices_encoder_range))
+        ]
 
         # get features in b n d format
         # level shapes, the shape per level, for swin like [[128, 128], [64, 64],...], for vit [[32,32]] -> mult times resolutions
@@ -474,7 +474,6 @@ class Decoder(nn.Module):
         expansion = config["model"]["expansion"]
         dropout = config["model"]["pixel_decoder"]["dropout"]
         depths_encoder = config["model"]["pixel_encoder"]["depths"]
-        num_steps = config["model"].get("num_steps", 100000)
         layer_scale = 1.0
 
         self.depth = depth

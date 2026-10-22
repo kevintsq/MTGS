@@ -11,7 +11,7 @@ import torch
 import wandb
 from PIL import Image
 
-from .misc import ssi_helper
+from unidepth.utils.misc import ssi_helper
 
 
 def colorize(

@@ -1,5 +1,3 @@
-from typing import Optional
-
 import torch
 import torch.nn as nn
 
@@ -15,7 +13,7 @@ class MLP(nn.Module):
         expansion: int = 4,
         dropout: float = 0.0,
         gated: bool = False,
-        output_dim: Optional[int] = None,
+        output_dim: int | None = None,
     ):
         super().__init__()
         if gated:

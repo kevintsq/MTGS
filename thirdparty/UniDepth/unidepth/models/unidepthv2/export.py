@@ -13,7 +13,6 @@ import torch.nn.functional as F
 import torch.onnx
 
 from unidepth.models.unidepthv2 import UniDepthV2
-from unidepth.utils.geometric import generate_rays
 
 
 class UniDepthV2ONNX(UniDepthV2):
@@ -23,120 +22,75 @@ class UniDepthV2ONNX(UniDepthV2):
         eps: float = 1e-6,
         **kwargs,
     ):
-        super(UniDepthV2ONNX, self).__init__(config, eps)
+        super().__init__(config, eps)
 
     def forward(self, rgbs):
-        H, W = rgbs.shape[-2:]
-
+        B, _, H, W = rgbs.shape
         features, tokens = self.pixel_encoder(rgbs)
-
-        cls_tokens = [x.contiguous() for x in tokens]
-        features = [
-            self.stacking_fn(features[i:j]).contiguous()
-            for i, j in self.slices_encoder_range
-        ]
-        tokens = [
-            self.stacking_fn(tokens[i:j]).contiguous()
-            for i, j in self.slices_encoder_range
-        ]
-        global_tokens = [cls_tokens[i] for i in [-2, -1]]
-        camera_tokens = [cls_tokens[i] for i in [-3, -2, -1]] + [tokens[-2]]
 
         inputs = {}
         inputs["image"] = rgbs
-        inputs["features"] = features
-        inputs["tokens"] = tokens
-        inputs["global_tokens"] = global_tokens
-        inputs["camera_tokens"] = camera_tokens
+        inputs["features"] = [
+            self.stacking_fn(features[i:j]).contiguous()
+            for i, j in self.slices_encoder_range
+        ]
+        inputs["tokens"] = [
+            self.stacking_fn(tokens[i:j]).contiguous()
+            for i, j in self.slices_encoder_range
+        ]
+        outputs = self.pixel_decoder(inputs, [])
+        outputs["rays"] = outputs["rays"].permute(0, 2, 1).reshape(B, 3, H, W)
+        pts_3d = outputs["rays"] * outputs["radius"]
 
-        outs = self.pixel_decoder(inputs, {})
-
-        predictions = F.interpolate(
-            outs["depth"],
-            size=(H, W),
-            mode="bilinear",
-        )
-        confidence = F.interpolate(
-            outs["confidence"],
-            size=(H, W),
-            mode="bilinear",
-        )
-
-        return outs["K"], predictions, confidence
+        return pts_3d, outputs["confidence"], outputs["intrinsics"]
 
 
-class UniDepthV2wCamONNX(UniDepthV2):
+class UniDepthV2ONNXcam(UniDepthV2):
     def __init__(
         self,
         config,
         eps: float = 1e-6,
         **kwargs,
     ):
-        super(UniDepthV2wCamONNX, self).__init__(config, eps)
+        super().__init__(config, eps)
 
-    def forward(self, rgbs, K):
-        H, W = rgbs.shape[-2:]
-
+    def forward(self, rgbs, rays):
+        B, _, H, W = rgbs.shape
         features, tokens = self.pixel_encoder(rgbs)
-
-        cls_tokens = [x.contiguous() for x in tokens]
-        features = [
-            self.stacking_fn(features[i:j]).contiguous()
-            for i, j in self.slices_encoder_range
-        ]
-        tokens = [
-            self.stacking_fn(tokens[i:j]).contiguous()
-            for i, j in self.slices_encoder_range
-        ]
-        global_tokens = [cls_tokens[i] for i in [-2, -1]]
-        camera_tokens = [cls_tokens[i] for i in [-3, -2, -1]] + [tokens[-2]]
 
         inputs = {}
         inputs["image"] = rgbs
-        inputs["features"] = features
-        inputs["tokens"] = tokens
-        inputs["global_tokens"] = global_tokens
-        inputs["camera_tokens"] = camera_tokens
-        rays, angles = generate_rays(K, (H, W))
         inputs["rays"] = rays
-        inputs["angles"] = angles
-        inputs["K"] = K
+        inputs["features"] = [
+            self.stacking_fn(features[i:j]).contiguous()
+            for i, j in self.slices_encoder_range
+        ]
+        inputs["tokens"] = [
+            self.stacking_fn(tokens[i:j]).contiguous()
+            for i, j in self.slices_encoder_range
+        ]
+        outputs = self.pixel_decoder(inputs, [])
+        outputs["rays"] = outputs["rays"].permute(0, 2, 1).reshape(B, 3, H, W)
+        pts_3d = outputs["rays"] * outputs["radius"]
 
-        outs = self.pixel_decoder(inputs, {})
-
-        predictions = F.interpolate(
-            outs["depth"],
-            size=(H, W),
-            mode="bilinear",
-        )
-        predictions_normalized = F.interpolate(
-            outs["depth_ssi"],
-            size=(H, W),
-            mode="bilinear",
-        )
-        confidence = F.interpolate(
-            outs["confidence"],
-            size=(H, W),
-            mode="bilinear",
-        )
-
-        return outs["K"], predictions, predictions_normalized, confidence
+        return pts_3d, outputs["confidence"], outputs["intrinsics"]
 
 
-def export(model, path, shape=(462, 616), with_camera=False):
+
+def export(model, path, shape=(462, 630), with_camera=False):
     model.eval()
     image = torch.rand(1, 3, *shape)
-    dynamic_axes_in = {"image": {0: "batch"}}
+    dynamic_axes_in = {"rgbs": {0: "batch"}}
     inputs = [image]
     if with_camera:
-        K = torch.rand(1, 3, 3)
-        inputs.append(K)
-        dynamic_axes_in["K"] = {0: "batch"}
+        rays = torch.rand(1, 3, *shape)
+        inputs.append(rays)
+        dynamic_axes_in["rays"] = {0: "batch"}
 
     dynamic_axes_out = {
-        "out_K": {0: "batch"},
-        "depth": {0: "batch"},
+        "pts_3d": {0: "batch"},
         "confidence": {0: "batch"},
+        "intrinsics": {0: "batch"},
     }
     torch.onnx.export(
         model,
@@ -158,15 +112,15 @@ if __name__ == "__main__":
     parser.add_argument(
         "--backbone",
         type=str,
-        default="vitl14",
-        choices=["vits14", "vitl14"],
+        default="vitl",
+        choices=["vits", "vitb", "vitl"],
         help="Backbone model",
     )
     parser.add_argument(
         "--shape",
         type=int,
         nargs=2,
-        default=(462, 616),
+        default=(462, 630),
         help="Input shape. No dyamic shape supported!",
     )
     parser.add_argument(
@@ -175,7 +129,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--with-camera",
         action="store_true",
-        help="Export model that expects GT camera matrix at inference",
+        help="Export model that expects GT camera as unprojected rays at inference",
     )
     args = parser.parse_args()
 
@@ -192,16 +146,15 @@ if __name__ == "__main__":
         shape = shape_rounded
 
     # assumes command is from root of repo
-    with open(os.path.join("configs", f"config_{version}_{backbone}.json")) as f:
+    with open(os.path.join("configs", f"config_{version}_{backbone}14.json")) as f:
         config = json.load(f)
 
     # tell DINO not to use efficient attention: not exportable
     config["training"]["export"] = True
 
-    model_factory = UniDepthV2ONNX if not with_camera else UniDepthV2wCamONNX
-    model = model_factory(config)
+    model = UniDepthV2ONNX(config) if not with_camera else UniDepthV2ONNXcam(config)
     path = huggingface_hub.hf_hub_download(
-        repo_id=f"lpiccinelli/unidepth-{version}-{backbone}",
+        repo_id=f"lpiccinelli/unidepth-{version}-{backbone}14",
         filename=f"pytorch_model.bin",
         repo_type="model",
     )
@@ -212,7 +165,8 @@ if __name__ == "__main__":
 
     export(
         model=model,
-        path=os.path.join(os.environ["TMPDIR"], output_path),
+        path=os.path.join(os.environ.get("TMPDIR", "."), output_path),
         shape=shape,
         with_camera=with_camera,
     )
+

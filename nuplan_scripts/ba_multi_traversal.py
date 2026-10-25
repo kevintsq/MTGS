@@ -608,19 +608,33 @@ def align_model(video_scene: VideoScene, video_scene_dict, colmap_path, thresh=1
         # poses: give it its own Sim3 and refit the joint one without it.
         vids = np.array([token_video[tk] for tk in tokens_list])
         lim = float(os.environ.get('MTGS_SFM_DISCONNECT_M', 2.0))
+        # One misplaced pass drags a single least-squares fit so far that EVERY pass looks
+        # off (nb_20: all passes at 38 m), so set aside the worst pass and refit until the
+        # rest agree; then re-test the set-aside passes against the final joint fit.
+        keep_v = sorted(set(vids)); out_v = []
+        while len(keep_v) > 1:
+            m_ = np.isin(vids, keep_v)
+            scale, R, t = compute_transformation_matrix_with_scaling(colmap_cam_array[m_], raw_cam_array[m_])
+            res = np.linalg.norm(scale * colmap_cam_array @ R.T + t - raw_cam_array, axis=1)
+            med = {v_: float(np.median(res[vids == v_])) for v_ in keep_v}
+            worst = max(med, key=med.get)
+            if med[worst] <= lim:
+                break
+            keep_v.remove(worst); out_v.append(worst)
+        m_ = np.isin(vids, keep_v)
+        scale, R, t = compute_transformation_matrix_with_scaling(colmap_cam_array[m_], raw_cam_array[m_])
         res = np.linalg.norm(scale * colmap_cam_array @ R.T + t - raw_cam_array, axis=1)
         med = {v_: float(np.median(res[vids == v_])) for v_ in set(vids)}
-        bad = [v_ for v_, m_ in med.items() if m_ > lim]
-        if bad and len(bad) < len(med):
-            keep = ~np.isin(vids, bad)
-            scale, R, t = compute_transformation_matrix_with_scaling(colmap_cam_array[keep], raw_cam_array[keep])
-            for v_ in bad:
-                m_ = vids == v_
-                if m_.sum() >= 6:
-                    sim3_of[v_] = compute_transformation_matrix_with_scaling(colmap_cam_array[m_], raw_cam_array[m_])
+        bad = [v_ for v_ in out_v if med[v_] > lim]
+        for v_ in bad:
+            m_ = vids == v_
+            if m_.sum() >= 6:
+                sim3_of[v_] = compute_transformation_matrix_with_scaling(colmap_cam_array[m_], raw_cam_array[m_])
+        if bad:
             CONSOLE.log(f'[sfm align] disconnected passes {sorted(bad)} (median residual '
-                        f'{", ".join(f"{med[b]:.1f}" for b in sorted(bad))} m under the joint fit): own Sim3 each')
-        CONSOLE.log('[sfm align] joint-fit median residual per pass: '
+                        f'{", ".join(f"{med[b]:.1f}" for b in sorted(bad))} m under the joint fit of '
+                        f'{len(keep_v)} passes): own Sim3 each')
+        CONSOLE.log('[sfm align] joint fit (scale %.4f) median residual per pass: ' % scale
                     + ", ".join(f"{v_.rsplit('-', 1)[1]}:{m_:.2f}" for v_, m_ in sorted(med.items())))
 
     def _sim3_for(tk):
@@ -690,6 +704,12 @@ def align_model(video_scene: VideoScene, video_scene_dict, colmap_path, thresh=1
                     else:
                         cam_info['valid'] = True
                         cam_info['colmap_param'] = colmap_cam_info
+
+    if os.environ.get('MTGS_JOINT_SFM') == '1' and invalid_count > 0.5 * max(1, len(images_out)):
+        # never hand training a block whose SfM poses failed to align (2026-10-25: two runs
+        # trained on 0 and 6 valid images after an alignment failure)
+        raise RuntimeError(f'[sfm align] {invalid_count} of {len(images_out)} images disagree with the metric poses '
+                           f'by more than {thresh} m after alignment -- refusing to continue')
 
     if os.environ.get('MTGS_JOINT_WRITE_EGO') == '1':
         from scipy.spatial.transform import Rotation as _Rot

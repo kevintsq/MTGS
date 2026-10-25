@@ -246,7 +246,9 @@ def _write_rig_config(video_scene_dict, colmap_path, ref='CAM_F0'):
             T[:3, 3] = ci['sensor2ego_translation']; c2e[cam] = T
         r = ref if ref in c2e else sorted(c2e)[0]
         cams = []
-        for cam, T in sorted(c2e.items()):
+        # COLMAP's rig_configurator needs the reference sensor FIRST in the list
+        # ("The reference sensor needs to be added first before other sensors")
+        for cam, T in sorted(c2e.items(), key=lambda kv: (kv[0] != r, kv[0])):
             entry = {'image_prefix': f'{veh}_{cam}/'}
             if cam == r:
                 entry['ref_sensor'] = True

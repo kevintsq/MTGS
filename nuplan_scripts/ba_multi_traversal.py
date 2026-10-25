@@ -702,11 +702,30 @@ def align_model(video_scene: VideoScene, video_scene_dict, colmap_path, thresh=1
         thresh = float(os.environ.get('MTGS_SFM_ALIGN_THRESH', thresh))
     invalid_count = 0
     errors = []
+    rigid_m = float(os.environ.get('MTGS_SFM_RIGID_M', 0.5)) if os.environ.get('MTGS_JOINT_SFM') == '1' else 0
+    n_rigid = 0
     for video_token in video_scene_dict:
         frame_infos = video_scene_dict[video_token]['frame_infos']
         frame_infos = [info for info in frame_infos if not info.get('skipped', False)]
         for info in frame_infos:
             ego2global = info['ego2global']
+            if rigid_m > 0:
+                # The 8 cameras of a frame are rigid. Unconstrained pure SfM misplaces a few of them
+                # (nr_20 model 2: 162/2992 images 0.5-39 m off where the rest of their frame puts
+                # them); a bend of the whole model only shifts the frame. Drop cameras that leave
+                # the frame's median offset from the metric poses by more than rigid_m.
+                dev = {}
+                for cam in info['cams']:
+                    ci_ = info['cams'][cam]
+                    if ci_['token'] in images_aligned:
+                        c2e_ = np.eye(4); c2e_[:3, :3] = Quaternion(ci_['sensor2ego_rotation']).rotation_matrix
+                        c2e_[:3, 3] = ci_['sensor2ego_translation']
+                        dev[cam] = images_aligned[ci_['token']]['sensor2global_translation'] - (ego2global @ c2e_)[:3, 3]
+                if len(dev) >= 3:
+                    off_ = np.median(np.stack(list(dev.values())), axis=0)
+                    for cam, d_ in dev.items():
+                        if np.linalg.norm(d_ - off_) > rigid_m:
+                            info['cams'][cam]['valid'] = False; invalid_count += 1; n_rigid += 1
             for cam in info['cams']:
                 cam_info = info['cams'][cam]
                 token = cam_info['token']
@@ -736,6 +755,8 @@ def align_model(video_scene: VideoScene, video_scene_dict, colmap_path, thresh=1
                         cam_info['valid'] = True
                         cam_info['colmap_param'] = colmap_cam_info
 
+    if rigid_m > 0:
+        CONSOLE.log(f'[sfm align] rigidity gate ({rigid_m} m): dropped {n_rigid} cameras off their frame')
     if os.environ.get('MTGS_JOINT_SFM') == '1' and invalid_count > 0.5 * max(1, len(images_out)):
         # never hand training a block whose SfM poses failed to align (2026-10-25: two runs
         # trained on 0 and 6 valid images after an alignment failure)

@@ -561,6 +561,7 @@ def align_model(video_scene: VideoScene, video_scene_dict, colmap_path, thresh=1
         images_out[token] = cam_info
 
     raw_cam_T = {}
+    token_video = {}
     for video_token in video_scene_dict:
         frame_infos = video_scene_dict[video_token]['frame_infos']
         frame_infos = [info for info in frame_infos if not info.get('skipped', False)]
@@ -587,6 +588,7 @@ def align_model(video_scene: VideoScene, video_scene_dict, colmap_path, thresh=1
                     continue
 
                 raw_cam_T[token] = cam2global[:3, 3]
+                token_video[token] = video_token
 
     colmap_cam_array = []
     raw_cam_array = []
@@ -597,17 +599,53 @@ def align_model(video_scene: VideoScene, video_scene_dict, colmap_path, thresh=1
     raw_cam_array = np.asarray(raw_cam_array)
 
     scale, R, t = compute_transformation_matrix_with_scaling(colmap_cam_array, raw_cam_array)
+    tokens_list = list(images_out.keys())
+    sim3_of = {}                                     # video token -> (scale, R, t)
+    if os.environ.get('MTGS_JOINT_SFM') == '1':
+        # Pure SfM can put a pass that shares no views with the others anywhere in the model
+        # (nb_20 pass 22, its own street: 156 m off, while passes 6/32/33 agreed with the
+        # metric poses to 0.18-0.23 m). Such a pass is constrained only by its own metric
+        # poses: give it its own Sim3 and refit the joint one without it.
+        vids = np.array([token_video[tk] for tk in tokens_list])
+        lim = float(os.environ.get('MTGS_SFM_DISCONNECT_M', 2.0))
+        res = np.linalg.norm(scale * colmap_cam_array @ R.T + t - raw_cam_array, axis=1)
+        med = {v_: float(np.median(res[vids == v_])) for v_ in set(vids)}
+        bad = [v_ for v_, m_ in med.items() if m_ > lim]
+        if bad and len(bad) < len(med):
+            keep = ~np.isin(vids, bad)
+            scale, R, t = compute_transformation_matrix_with_scaling(colmap_cam_array[keep], raw_cam_array[keep])
+            for v_ in bad:
+                m_ = vids == v_
+                if m_.sum() >= 6:
+                    sim3_of[v_] = compute_transformation_matrix_with_scaling(colmap_cam_array[m_], raw_cam_array[m_])
+            CONSOLE.log(f'[sfm align] disconnected passes {sorted(bad)} (median residual '
+                        f'{", ".join(f"{med[b]:.1f}" for b in sorted(bad))} m under the joint fit): own Sim3 each')
+        CONSOLE.log('[sfm align] joint-fit median residual per pass: '
+                    + ", ".join(f"{v_.rsplit('-', 1)[1]}:{m_:.2f}" for v_, m_ in sorted(med.items())))
+
+    def _sim3_for(tk):
+        return sim3_of.get(token_video.get(tk), (scale, R, t))
 
     images_aligned = {}
     for token, cam_info in images_out.items():
         cam_info = copy.deepcopy(cam_info)
-        sensor2global_rotation = R @ Quaternion(cam_info['sensor2global_rotation']).rotation_matrix
+        s_, R_, t_ = _sim3_for(token)
+        sensor2global_rotation = R_ @ Quaternion(cam_info['sensor2global_rotation']).rotation_matrix
         cam_info['sensor2global_rotation'] = Quaternion(matrix=sensor2global_rotation)
-        cam_info['sensor2global_translation'] = scale * (R @ cam_info['sensor2global_translation']).T + t
+        cam_info['sensor2global_translation'] = s_ * (R_ @ cam_info['sensor2global_translation']).T + t_
         images_aligned[token] = cam_info
 
     pts3D_xyz = np.array([p.xyz for p in points3D_new.values()], dtype=np.float32)
-    pts3D_xyz = scale * (pts3D_xyz @ R.T) + t
+    if sim3_of:
+        # each 3D point follows the transform of the pass of its first observing image
+        id_tok = {img.id: (_name_map.get(img.name) or img.name.split('.')[0].split('/')[1]) for img in images.values()}
+        out_xyz = np.empty_like(pts3D_xyz)
+        for i_, p_ in enumerate(points3D_new.values()):
+            s_, R_, t_ = _sim3_for(id_tok.get(int(p_.image_ids[0])))
+            out_xyz[i_] = s_ * (R_ @ pts3D_xyz[i_]) + t_
+        pts3D_xyz = out_xyz.astype(np.float32)
+    else:
+        pts3D_xyz = scale * (pts3D_xyz @ R.T) + t
     pts3D_rgb = np.array([p.rgb for p in points3D_new.values()], dtype=np.float32)
     pts3D_rgb /= 255.0
 

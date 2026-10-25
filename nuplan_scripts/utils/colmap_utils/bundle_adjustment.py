@@ -204,7 +204,12 @@ def run_bundle_adjustment(
     # prior-seeded triangulate+BA below can stay near the (inconsistent) prior poses.
     if os.environ.get("MTGS_JOINT_SFM") == "1":
         mode = os.environ.get("COLMAP_SFM_MAPPER", "incremental")
-        raw = os.path.join(colmap_path, output_model + "_raw"); shutil.rmtree(raw, ignore_errors=True); os.makedirs(raw)
+        raw = os.path.join(colmap_path, output_model + "_raw"); shutil.rmtree(raw, ignore_errors=True); os.makedirs(raw, exist_ok=True)
+        # colmap may run inside a container (manco: ~/bin/colmap -> podman devbox) whose user
+        # owns any directory IT creates, so the host could no longer delete sfm_model_raw/<n>
+        # (PermissionError on images.bin, 2026-10-25). Pre-create the model dirs host-side.
+        for _i in range(32):
+            os.makedirs(os.path.join(raw, str(_i)), exist_ok=True)
         fix = os.environ.get("COLMAP_REFINE_INTRINSICS", "0") != "1"
         if mode == "global":
             mapper_args = [colmap_exe, "global_mapper", "--database_path", f"{colmap_path}/database.db",
@@ -223,7 +228,8 @@ def run_bundle_adjustment(
         except subprocess.CalledProcessError as e:
             print(f"Error executing colmap {mode} mapper: {e}")
             sys.exit(1)
-        models = [d for d in sorted(os.listdir(raw)) if os.path.exists(os.path.join(raw, d, "images.bin"))]
+        models = [d for d in sorted(os.listdir(raw), key=lambda x: int(x) if x.isdigit() else 1e9)
+                  if os.path.exists(os.path.join(raw, d, "images.bin"))]
         if not models:
             print("[sfm] mapper produced no model"); sys.exit(1)
         sizes = {}

@@ -26,6 +26,7 @@ from pyquaternion import Quaternion
 from tqdm import tqdm
 
 from nuplan_scripts.utils.camera_utils import undistort_image_with_cam_info
+from nuplan_scripts.utils import depth_sky
 
 
 def _c2w(frame_info, cam_info):
@@ -111,6 +112,10 @@ def run_da3_multiview(video_scene, video_scene_dict, undistort_mode, max_range, 
             d = np.where((d > max_range) | (d < 0.1), 0, d)
             img = np.zeros((H, W), np.uint16)
             img[y:y + h, x:x + w] = np.clip(np.trunc(d * 100), 0, 65535).astype(np.uint16)
+            if depth_sky.enabled():
+                sky = depth_sky.sky_mask(video_scene, seq[i][2], undistort_mode)
+                if sky is not None and sky.shape == img.shape:
+                    img[sky] = 0                      # sky is not a surface: invalid for the depth losses
             os.makedirs(os.path.dirname(outs[i]), exist_ok=True)
             cv2.imwrite(outs[i], img)
         pbar.update(n)

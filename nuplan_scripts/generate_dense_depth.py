@@ -253,13 +253,19 @@ if __name__ == '__main__':
         os.makedirs(os.path.dirname(output_path), exist_ok=True)
         cv2.imwrite(output_path, depth_image)
 
-    def _write_depth_packed(packed, raw_size, roi, output_path):
+    from nuplan_scripts.utils import depth_sky
+
+    def _write_depth_packed(packed, raw_size, roi, output_path, cam_info=None):
         """packed: [h,w] uint16 (depth in cm) straight off the GPU -> paste into
         the full frame and store as a single-channel 16-bit PNG."""
         raw_height, raw_width = raw_size
         x, y, w, h = roi
         depth_image = np.zeros((raw_height, raw_width), dtype=np.uint16)
         depth_image[y:y+h, x:x+w] = packed
+        if cam_info is not None and depth_sky.enabled():
+            sky = depth_sky.sky_mask(video_scene, cam_info, args.undistort_mode)
+            if sky is not None and sky.shape == depth_image.shape:
+                depth_image[sky] = 0              # sky is not a surface: invalid for the depth losses
         os.makedirs(os.path.dirname(output_path), exist_ok=True)
         cv2.imwrite(output_path, depth_image)
 
@@ -305,6 +311,7 @@ if __name__ == '__main__':
         loader = torch.utils.data.DataLoader(
             dataset, batch_sampler=batches, num_workers=max(args.num_workers, 6),
             collate_fn=_collate, prefetch_factor=4)
+        cam_of = {op: ci for ci, op in dataset.items}   # output path -> cam_info (sky mask lookup)
         batched_infer = None   # probed on the first multi-frame batch
         pbar = accelerate_tqdm(total=len(dataset), ncols=120,
                                desc=f"Generating dense depths (bs={batch_size}, prefetch+fp16)")
@@ -373,7 +380,7 @@ if __name__ == '__main__':
                 # the paste + png encode run in the writer threads (imwrite drops
                 # the GIL), so they no longer stall the main loop
                 writer.submit(_write_depth_packed, pk, (raw_height, raw_width),
-                              (x, y, w, h), output_path)
+                              (x, y, w, h), output_path, cam_of.get(output_path))
                 pbar.update(distributed_state.num_processes)
 
     writer.shutdown(wait=True)

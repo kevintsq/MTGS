@@ -120,7 +120,15 @@ def run_bundle_adjustment(
 
     try:
         _run_colmap(colmap_feature_extractor_args, colmap_path, check=True)
-        _normalize_rigs(f"{colmap_path}/database.db")
+        rig_cfg = f"{colmap_path}/rig_config.json"
+        if os.environ.get("MTGS_JOINT_SFM") == "1" and os.path.exists(rig_cfg):
+            # rigs + frames from the calibration (ba_multi_traversal._write_rig_config); the
+            # mapper then refines cam_from_rig (Mapper.ba_refine_sensor_from_rig, default on)
+            print("[sfm rig] rig_configurator", flush=True)
+            _run_colmap([colmap_exe, "rig_configurator", "--database_path", f"{colmap_path}/database.db",
+                         "--rig_config_path", rig_cfg], colmap_path, check=True)
+        else:
+            _normalize_rigs(f"{colmap_path}/database.db")
     except subprocess.CalledProcessError as e:
         print(f"Error executing colmap feature_extractor: {e}")
         sys.exit(1)

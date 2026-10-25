@@ -214,6 +214,54 @@ def _publish_colmap(work, nfs_path):
                 pass
 
 
+def _sfm_rig():
+    """MTGS_SFM_RIG=1 (with MTGS_JOINT_SFM): one COLMAP rig per vehicle -- the 8 cameras of a
+    frame share one rig pose, their cam_from_rig start at the calibration and are refined by
+    the mapper (user 2026-10-25). COLMAP groups images into frames by the name after the
+    camera folder, so images are named by the frame token in this mode."""
+    return os.environ.get('MTGS_JOINT_SFM') == '1' and os.environ.get('MTGS_SFM_RIG') == '1'
+
+
+def _colmap_image_name(veh, cam, frame_info, cam_info):
+    if _sfm_rig():
+        return f"{veh}_{cam}/{frame_info['token']}.jpg"
+    return f"{veh}_{cam}/{os.path.basename(cam_info['data_path'])}"
+
+
+def _write_rig_config(video_scene_dict, colmap_path, ref='CAM_F0'):
+    """rig_config.json for colmap rig_configurator: per vehicle, ref camera = rig frame,
+    cam_from_rig = inv(cam2ego_cam) @ cam2ego_ref from the first frame's calibration"""
+    import json
+    rigs = {}
+    for vt, v in video_scene_dict.items():
+        veh = v['vehicle_name']
+        if veh in rigs:
+            continue
+        fi = next((f for f in v['frame_infos'] if not f.get('skipped', False)), None)
+        if fi is None:
+            continue
+        c2e = {}
+        for cam, ci in fi['cams'].items():
+            T = np.eye(4); T[:3, :3] = Quaternion(ci['sensor2ego_rotation']).rotation_matrix
+            T[:3, 3] = ci['sensor2ego_translation']; c2e[cam] = T
+        r = ref if ref in c2e else sorted(c2e)[0]
+        cams = []
+        for cam, T in sorted(c2e.items()):
+            entry = {'image_prefix': f'{veh}_{cam}/'}
+            if cam == r:
+                entry['ref_sensor'] = True
+            else:
+                cfr = np.linalg.inv(T) @ c2e[r]
+                q = Quaternion(matrix=cfr[:3, :3], atol=1e-6)
+                entry['cam_from_rig_rotation'] = [float(q.w), float(q.x), float(q.y), float(q.z)]
+                entry['cam_from_rig_translation'] = [float(x) for x in cfr[:3, 3]]
+            cams.append(entry)
+        rigs[veh] = {'cameras': cams}
+    with open(os.path.join(colmap_path, 'rig_config.json'), 'w') as f:
+        json.dump(list(rigs.values()), f, indent=1)
+    CONSOLE.log(f'[sfm rig] rig_config.json: {len(rigs)} rigs ({", ".join(rigs)}), ref {ref}')
+
+
 def create_colmap_model(video_scene: VideoScene, video_scene_dict, colmap_path):
 
     create_colmap_folder(colmap_path)
@@ -230,6 +278,7 @@ def create_colmap_model(video_scene: VideoScene, video_scene_dict, colmap_path):
     invalid_images = 0
     cam_views = []
     image_names = set()
+    name_to_token = {}          # colmap image name -> camera token (align_model)
 
     # Fan the per-frame image/mask I/O out first; the loop below then only does
     # bookkeeping, which must stay ordered. Threads (not processes) because the
@@ -243,7 +292,7 @@ def create_colmap_model(video_scene: VideoScene, video_scene_dict, colmap_path):
             for _cam in _info['cams']:
                 _ci = _info['cams'][_cam]
                 _dp = os.path.join(NUPLAN_SENSOR_ROOT, _ci['data_path'])
-                _ip = f"{_veh}_{_cam}/{os.path.basename(_dp)}"
+                _ip = _colmap_image_name(_veh, _cam, _info, _ci)
                 _tasks.append((
                     _dp,
                     os.path.join(video_scene.raw_mask_path,
@@ -314,7 +363,8 @@ def create_colmap_model(video_scene: VideoScene, video_scene_dict, colmap_path):
 
                 cam_name_colmap = f'{veh_name}_{cam_name}'
                 cam_id = cam_name_mapper[cam_name_colmap]
-                image_path = f'{cam_name_colmap}/{os.path.basename(data_path)}'
+                image_path = _colmap_image_name(veh_name, cam_name, info, cam_info)
+                name_to_token[image_path] = cam_info['token']
 
                 # deduplicate images
                 if image_path in image_names:
@@ -341,6 +391,11 @@ def create_colmap_model(video_scene: VideoScene, video_scene_dict, colmap_path):
     f_images.close()
 
     print(f'Filter out invalid images: {invalid_images}/{len(frame_infos) * 8}')
+    import json as _json
+    with open(f'{colmap_path}/name_to_token.json', 'w') as _f:
+        _json.dump(name_to_token, _f)
+    if _sfm_rig():
+        _write_rig_config(video_scene_dict, colmap_path)
 
     # compute image pairs
     #
@@ -482,6 +537,9 @@ def align_model(video_scene: VideoScene, video_scene_dict, colmap_path, thresh=1
 
     # read image
     images_out = {}
+    _nm = f'{colmap_path}/name_to_token.json'
+    import json as _json
+    _name_map = _json.load(open(_nm)) if os.path.exists(_nm) else {}
     for img in images.values():
         intrinsic, distortion = camera_params[img.camera_id]
         R = Quaternion(img.qvec)
@@ -491,7 +549,7 @@ def align_model(video_scene: VideoScene, video_scene_dict, colmap_path, thresh=1
         c2w[:3, :3] = R.rotation_matrix.T
         c2w[:3, 3] = -R.rotation_matrix.T @ t
 
-        token = img.name.split('.')[0].split('/')[1]
+        token = _name_map.get(img.name) or img.name.split('.')[0].split('/')[1]
         cam_info = {}
         cam_info['sensor2global_rotation'] = Quaternion(matrix=c2w[:3, :3])
         cam_info['sensor2global_translation'] = c2w[:3, 3]

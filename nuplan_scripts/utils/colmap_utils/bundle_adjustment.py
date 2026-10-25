@@ -188,6 +188,46 @@ def run_bundle_adjustment(
                          "--BundleAdjustment.refine_extra_params"):
                 colmap_bundle_adjuster_args[colmap_bundle_adjuster_args.index(flag) + 1] = "0"
     print(f"[ba] COLMAP_BA_MODE={_ba_mode}: {' '.join(colmap_bundle_adjuster_args[1:])}", flush=True)
+    # MTGS_JOINT_SFM=1: pure structure-from-motion -- the mapper reconstructs from the matches
+    # alone (no pose priors), intrinsics fixed to the calibration; the largest model becomes
+    # <output_model>/0 and align_model() then puts it into the metric world frame with one
+    # Sim3 against the lidar-registered camera centres (COLMAP has no scale of its own).
+    # User 2026-10-25: multi-traversal reconstructions were best with plain COLMAP; the
+    # prior-seeded triangulate+BA below can stay near the (inconsistent) prior poses.
+    if os.environ.get("MTGS_JOINT_SFM") == "1":
+        mode = os.environ.get("COLMAP_SFM_MAPPER", "incremental")
+        raw = os.path.join(colmap_path, output_model + "_raw"); shutil.rmtree(raw, ignore_errors=True); os.makedirs(raw)
+        fix = os.environ.get("COLMAP_REFINE_INTRINSICS", "0") != "1"
+        if mode == "global":
+            mapper_args = [colmap_exe, "global_mapper", "--database_path", f"{colmap_path}/database.db",
+                           "--image_path", f"{colmap_path}/images", "--output_path", raw]
+        else:
+            mapper_args = [colmap_exe, "mapper", "--database_path", f"{colmap_path}/database.db",
+                           "--image_path", f"{colmap_path}/images", "--output_path", raw,
+                           "--Mapper.num_threads", f"{num_workers}",
+                           "--Mapper.ba_refine_focal_length", "0" if fix else "1",
+                           "--Mapper.ba_refine_principal_point", "0",
+                           "--Mapper.ba_refine_extra_params", "0" if fix else "1",
+                           "--Mapper.multiple_models", "1", "--Mapper.min_model_size", "50"]
+        print(f"[sfm] {mode} mapper: {' '.join(mapper_args[1:])}", flush=True)
+        try:
+            _run_colmap(mapper_args, colmap_path, check=True)
+        except subprocess.CalledProcessError as e:
+            print(f"Error executing colmap {mode} mapper: {e}")
+            sys.exit(1)
+        models = [d for d in sorted(os.listdir(raw)) if os.path.exists(os.path.join(raw, d, "images.bin"))]
+        if not models:
+            print("[sfm] mapper produced no model"); sys.exit(1)
+        sizes = {}
+        for d in models:
+            with open(os.path.join(raw, d, "images.bin"), "rb") as f:
+                sizes[d] = int.from_bytes(f.read(8), "little")      # images.bin starts with the image count
+        best = max(sizes, key=sizes.get)
+        print(f"[sfm] models (images): {sizes}; using {best}", flush=True)
+        shutil.rmtree(os.path.join(colmap_path, output_model, "0"), ignore_errors=True)
+        shutil.copytree(os.path.join(raw, best), os.path.join(colmap_path, output_model, "0"))
+        sys.exit(0)
+
     # 2 rounds of triangulation + bundle adjustment
     try:
         _run_colmap(colmap_point_triangulator_args + [

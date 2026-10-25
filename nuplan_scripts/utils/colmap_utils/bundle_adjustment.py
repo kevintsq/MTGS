@@ -107,6 +107,19 @@ def run_bundle_adjustment(
 
     colmap_exe = "colmap.bat" if platform.system() == "Windows" else "colmap"
 
+    # MTGS_SFM_IMPORT=<model dir>: take a finished SfM model (e.g. an incremental mapper run on
+    # a faster single-core machine from this block's own database, 2026-10-25) instead of
+    # extracting, matching and mapping here. Its image names must follow this run's naming
+    # (rig mode: <veh>_<cam>/<frame token>.jpg), which name_to_token.json maps back.
+    imp = os.environ.get("MTGS_SFM_IMPORT")
+    if os.environ.get("MTGS_JOINT_SFM") == "1" and imp:
+        if not os.path.exists(os.path.join(imp, "images.bin")):
+            print(f"[sfm] MTGS_SFM_IMPORT={imp} has no images.bin"); sys.exit(1)
+        dst = os.path.join(colmap_path, output_model, "0")
+        shutil.rmtree(dst, ignore_errors=True); shutil.copytree(imp, dst)
+        print(f"[sfm] imported model {imp} -> {dst}", flush=True)
+        sys.exit(0)
+
     print("extracting features...")
     colmap_feature_extractor_args = [
         colmap_exe, "feature_extractor",

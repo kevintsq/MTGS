@@ -31,7 +31,7 @@ class StackRGBPointCloud:
             self.video_scene = video_scene
 
         def __getitem__(self, idx):
-            if self.data_info[idx].get('skipped', False) == 'low_velocity':
+            if self.data_info[idx].get('skipped', False) in ('low_velocity', 'sfm_unregistered'):
                 return self.data_info[idx]
 
             info = copy.deepcopy(self.data_info[idx])

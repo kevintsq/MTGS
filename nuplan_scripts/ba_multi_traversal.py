@@ -636,6 +636,33 @@ def align_model(video_scene: VideoScene, video_scene_dict, colmap_path, thresh=1
                         f'{len(keep_v)} passes): own Sim3 each')
         CONSOLE.log('[sfm align] joint fit (scale %.4f) median residual per pass: ' % scale
                     + ", ".join(f"{v_.rsplit('-', 1)[1]}:{m_:.2f}" for v_, m_ in sorted(med.items())))
+        if os.environ.get('MTGS_SFM_LOCAL_SCALE') == '1':
+            # A smoothly bent SfM trajectory shortens its chords, so the least-squares Sim3 scale
+            # comes out too large locally (nr_20 incremental model: consecutive-frame steps 1.6-2.7%
+            # longer than metric in every pass). Lidar depth is local metric: take the scale from
+            # consecutive-frame steps of the same camera instead and refit the translation.
+            tok_pos = {tk: i_ for i_, tk in enumerate(tokens_list)}
+            ratios = []
+            for video_token in video_scene_dict:
+                seq = {}
+                for info in video_scene_dict[video_token]['frame_infos']:
+                    if info.get('skipped', False):
+                        continue
+                    for cam in info['cams']:
+                        i_ = tok_pos.get(info['cams'][cam]['token'])
+                        if i_ is not None and video_token not in sim3_of:
+                            seq.setdefault(cam, []).append(i_)
+                for lst in seq.values():
+                    for a_, b_ in zip(lst[:-1], lst[1:]):
+                        dB = np.linalg.norm(raw_cam_array[b_] - raw_cam_array[a_])
+                        if dB > 1.0:
+                            ratios.append(scale * np.linalg.norm(colmap_cam_array[b_] - colmap_cam_array[a_]) / dB)
+            if len(ratios) >= 20:
+                r_ = float(np.median(ratios))
+                m_ = np.isin(vids, keep_v)
+                scale = scale / r_
+                t = np.mean(raw_cam_array[m_] - scale * colmap_cam_array[m_] @ R.T, axis=0)
+                CONSOLE.log(f'[sfm align] local-step scale: chord fit / local = {r_:.4f} over {len(ratios)} steps -> scale {scale:.4f}')
 
     def _sim3_for(tk):
         return sim3_of.get(token_video.get(tk), (scale, R, t))
@@ -669,6 +696,10 @@ def align_model(video_scene: VideoScene, video_scene_dict, colmap_path, thresh=1
     os.makedirs(video_scene.sfm_point_cloud_path, exist_ok=True)
     o3d.io.write_point_cloud(f'{video_scene.sfm_point_cloud_path}/{os.path.basename(colmap_path)}.pcd', o3d_points3D)
 
+    if os.environ.get('MTGS_JOINT_SFM') == '1':
+        # a bent pure-SfM model can sit metres from the metric poses yet be internally sharp
+        # (user 2026-10-25, nr_20 incremental model 2): allow trusting it with a looser gate
+        thresh = float(os.environ.get('MTGS_SFM_ALIGN_THRESH', thresh))
     invalid_count = 0
     errors = []
     for video_token in video_scene_dict:
@@ -744,6 +775,21 @@ def align_model(video_scene: VideoScene, video_scene_dict, colmap_path, thresh=1
                 info['lidar2global'] = pose @ info['lidar2ego']
                 n_upd += 1
         CONSOLE.log(f'[Align Colmap] wrote BA ego poses for {n_upd} frames')
+        if os.environ.get('MTGS_JOINT_SFM') == '1' and os.environ.get('MTGS_SFM_DROP_UNREGISTERED', '1') == '1':
+            # a frame without any SfM camera keeps its metric ego pose, which can be metres off the
+            # SfM frame: its lidar would stack as a ghost copy. Skip such frames; drop a pass that
+            # SfM barely registered (nr_20 model 2 holds no image of pass 22).
+            n_skip = 0; dropped = []
+            for video_token in list(video_scene_dict):
+                fis = [f for f in video_scene_dict[video_token]['frame_infos'] if not f.get('skipped', False)]
+                reg = [f for f in fis if any(c.get('valid', True) and 'colmap_param' in c for c in f['cams'].values())]
+                if len(reg) < 0.1 * max(1, len(fis)):
+                    dropped.append(video_token); del video_scene_dict[video_token]; continue
+                for f in fis:
+                    if not any(c.get('valid', True) and 'colmap_param' in c for c in f['cams'].values()):
+                        f['skipped'] = 'sfm_unregistered'; n_skip += 1
+            CONSOLE.log(f'[sfm align] skipped {n_skip} frames without SfM cameras; dropped passes '
+                        f'{[v_.rsplit("-", 1)[1] for v_ in dropped]}')
     CONSOLE.log(f'[Align Colmap] for {os.path.basename(colmap_path)}')
     CONSOLE.log(f'[Align Colmap] invalid count = {invalid_count}, total = {len(images_out)}')
     CONSOLE.log(f'[Align Colmap] error = {np.mean(errors):.3f}')

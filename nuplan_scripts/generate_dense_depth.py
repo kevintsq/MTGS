@@ -180,6 +180,16 @@ if __name__ == '__main__':
         for info in frame_infos:
             total_cams.extend(list(info['cams'].values()))
 
+    # MTGS_DEPTH_MODEL=da3mv: Depth Anything 3 multi-view with the block's metric poses
+    # (median relative error vs lidar 0.033 vs 0.101 for UniDepth on nb_20, 2026-10-25);
+    # same undistortion, PNG encoding and paths, so training is unaffected otherwise.
+    if os.environ.get('MTGS_DEPTH_MODEL', 'unidepth') == 'da3mv':
+        from nuplan_scripts.utils.dense_depth_da3 import run_da3_multiview
+        out_root = (video_scene.optimal_undistorted_depth_path if args.undistort_mode == 'optimal'
+                    else video_scene.undistorted_depth_path)
+        run_da3_multiview(video_scene, video_scene_dict, args.undistort_mode, args.max_range, out_root)
+        exit()
+
     model = UniDepthV2.from_pretrained(model_path)
 
     distributed_state = Accelerator()

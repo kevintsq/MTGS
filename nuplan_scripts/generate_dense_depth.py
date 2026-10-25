@@ -314,9 +314,12 @@ if __name__ == '__main__':
 
             def _infer_per_sample():
                 return {'depth': torch.cat(
-                    [model.infer(inputs[b:b + 1], intrinsics[b:b + 1])['depth']
+                    [model.infer(inputs[b:b + 1], intrinsics[b:b + 1].clone())['depth']
                      for b in range(inputs.shape[0])], dim=0)}
 
+            # UniDepth rescales the intrinsics tensor IN PLACE (fx 1529 -> 822 -> 442 on repeated calls,
+            # 2026-10-25): every call gets its own copy, or a failed batched probe would leave halved
+            # intrinsics for the per-sample retry of that batch.
             with torch.no_grad(), torch.autocast("cuda", dtype=torch.float16):
                 # Stock UniDepth's camera path assumes batch=1 (get_rays builds a
                 # batch-1 uv grid; B>1 intrinsics broadcast against it and
@@ -326,10 +329,10 @@ if __name__ == '__main__':
                 # Frames in a batch share calibration (_calib_key), so both paths
                 # are result-identical.
                 if inputs.shape[0] == 1:
-                    outputs = model.infer(inputs, intrinsics)
+                    outputs = model.infer(inputs, intrinsics.clone())
                 elif batched_infer is None:
                     try:
-                        outputs = model.infer(inputs, intrinsics)
+                        outputs = model.infer(inputs, intrinsics.clone())
                         batched_infer = True
                         print('[generate_dense_depth] batched UniDepth inference OK')
                     except RuntimeError:
@@ -337,7 +340,7 @@ if __name__ == '__main__':
                         print('[generate_dense_depth] stock UniDepth: per-sample forward')
                         outputs = _infer_per_sample()
                 elif batched_infer:
-                    outputs = model.infer(inputs, intrinsics)
+                    outputs = model.infer(inputs, intrinsics.clone())
                 else:
                     outputs = _infer_per_sample()
 

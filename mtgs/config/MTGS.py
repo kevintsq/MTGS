@@ -60,7 +60,11 @@ config = CustomTrainerConfig(
             load_mask=True,
             load_semantic_masks_from="semantic",
             load_instance_masks=False,
-            load_custom_masks=('pedestrian', 'bicycle'),
+            # MTGS_MASK_VEHICLES=1: keep car/truck/bus pixels out of the loss as well. HUGSIM replays the
+            # annotated vehicles as separate assets, so vehicles baked into the background (stationary in
+            # one pass: queues, deliveries, parked) only leave ghost blobs and smears (2026-10-26 audit,
+            # fq_gapC_002 1fed55ad); the road behind them comes from the other passes.
+            load_custom_masks=('pedestrian', 'bicycle') + (('vehicle',) if os.environ.get('MTGS_MASK_VEHICLES') == '1' else ()),
             load_lidar_depth=True,
             load_pseudo_depth=True,
             undistort_images="optimal",

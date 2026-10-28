@@ -97,18 +97,17 @@ if __name__ == '__main__':
         loader = torch.utils.data.DataLoader(
             dataset, batch_size=args.batch_size, num_workers=args.num_workers,
             collate_fn=_collate, pin_memory=True)
-        pbar = tqdm(total=len(dataset), ncols=120,
-                    desc=f"Generating semantic masks (bs={args.batch_size}, fp16)")
-        for pixels, mask_paths, sizes in loader:
-            pixels = pixels.to(distributed_state.device, non_blocking=True)
-            with torch.no_grad(), torch.autocast("cuda", dtype=torch.float16):
-                outputs = model(pixels)
-            seg_maps = processor.post_process_semantic_segmentation(outputs, target_sizes=sizes)
-            for seg, mask_path in zip(seg_maps, mask_paths):
-                writer.submit(_write_mask, seg.cpu().numpy().astype(np.uint8), mask_path)
-            pbar.update(len(mask_paths) * distributed_state.num_processes)
-        # close explicitly: tqdm.__del__ at interpreter shutdown segfaults on py3.13
-        # (kaitain 2026-10-28, faulthandler: tqdm close->display->format_meter), after all masks were written
-        pbar.close()
+        # context-managed bar: closed on the way out (also on exceptions) instead of in tqdm.__del__
+        # at interpreter shutdown, which segfaulted on py3.13 (kaitain 2026-10-28)
+        with tqdm(total=len(dataset), ncols=120,
+                  desc=f"Generating semantic masks (bs={args.batch_size}, fp16)") as pbar:
+            for pixels, mask_paths, sizes in loader:
+                pixels = pixels.to(distributed_state.device, non_blocking=True)
+                with torch.no_grad(), torch.autocast("cuda", dtype=torch.float16):
+                    outputs = model(pixels)
+                seg_maps = processor.post_process_semantic_segmentation(outputs, target_sizes=sizes)
+                for seg, mask_path in zip(seg_maps, mask_paths):
+                    writer.submit(_write_mask, seg.cpu().numpy().astype(np.uint8), mask_path)
+                pbar.update(len(mask_paths) * distributed_state.num_processes)
 
     writer.shutdown(wait=True)

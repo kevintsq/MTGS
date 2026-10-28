@@ -107,5 +107,8 @@ if __name__ == '__main__':
             for seg, mask_path in zip(seg_maps, mask_paths):
                 writer.submit(_write_mask, seg.cpu().numpy().astype(np.uint8), mask_path)
             pbar.update(len(mask_paths) * distributed_state.num_processes)
+        # close explicitly: tqdm.__del__ at interpreter shutdown segfaults on py3.13
+        # (kaitain 2026-10-28, faulthandler: tqdm close->display->format_meter), after all masks were written
+        pbar.close()
 
     writer.shutdown(wait=True)

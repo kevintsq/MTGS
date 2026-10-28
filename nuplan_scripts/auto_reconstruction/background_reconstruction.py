@@ -61,6 +61,17 @@ if __name__ == '__main__':
     # come out ~4x less sharp than the photos. 1.0 = full 1920x1080.
     if os.environ.get('MTGS_CAM_RES_SCALE'):
         ns_config.pipeline.datamanager.camera_res_scale_factor = float(os.environ['MTGS_CAM_RES_SCALE'])
+    # Pose A/B 2026-10-27: the stock camera optimiser (SO3xR3, lr 1e-4, L2 penalties) moves
+    # cameras by millimetres; MTGS_CAM_OPT_LR / MTGS_CAM_OPT_TRANS_PENALTY / MTGS_CAM_OPT_ROT_PENALTY
+    # let a run refine poses photometrically (lr 1e-3, penalties 0), MTGS_CAM_OPT=off disables it.
+    if os.environ.get('MTGS_CAM_OPT'):
+        ns_config.pipeline.model.camera_optimizer.mode = os.environ['MTGS_CAM_OPT']
+    if os.environ.get('MTGS_CAM_OPT_TRANS_PENALTY'):
+        ns_config.pipeline.model.camera_optimizer.trans_l2_penalty = float(os.environ['MTGS_CAM_OPT_TRANS_PENALTY'])
+    if os.environ.get('MTGS_CAM_OPT_ROT_PENALTY'):
+        ns_config.pipeline.model.camera_optimizer.rot_l2_penalty = float(os.environ['MTGS_CAM_OPT_ROT_PENALTY'])
+    if os.environ.get('MTGS_CAM_OPT_LR'):
+        ns_config.optimizers['camera_opt']['optimizer'].lr = float(os.environ['MTGS_CAM_OPT_LR'])
     ns_config.pipeline.datamanager.dataparser.train_scene_travels = travels
     ns_config.pipeline.datamanager.dataparser.eval_scene_travels = travels
     ns_config.pipeline.model.color_corrected_metrics = False

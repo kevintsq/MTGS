@@ -269,128 +269,123 @@ def create_colmap_model(video_scene: VideoScene, video_scene_dict, colmap_path):
     create_colmap_folder(colmap_path)
     cam_name_mapper = create_cameras_per_vehicle(video_scene_dict, colmap_path)
 
-    progress_bar = tqdm(
-        total=VideoScene.count_total_frames(video_scene_dict),
-        desc='Loading image infos', ncols=120)
-
     scale_factor = 10 / max(video_scene.block_size)
 
-    f_images = open(f"{colmap_path}/sparse_model/images.txt", "w")
-    global_image_id = 1
-    invalid_images = 0
-    cam_views = []
-    image_names = set()
-    name_to_token = {}          # colmap image name -> camera token (align_model)
+    with tqdm(total=VideoScene.count_total_frames(video_scene_dict), desc='Loading image infos', ncols=120) as progress_bar, \
+            open(f"{colmap_path}/sparse_model/images.txt", "w") as f_images:
+        global_image_id = 1
+        invalid_images = 0
+        cam_views = []
+        image_names = set()
+        name_to_token = {}          # colmap image name -> camera token (align_model)
 
-    # Fan the per-frame image/mask I/O out first; the loop below then only does
-    # bookkeeping, which must stay ordered. Threads (not processes) because the
-    # work is cv2 read/write and filesystem calls, all of which drop the GIL.
-    _tasks, _keys = [], []
-    for _vt in video_scene_dict:
-        for _info in video_scene_dict[_vt]['frame_infos']:
-            if _info.get('skipped', False):
-                continue
-            _veh = video_scene_dict[_vt]['vehicle_name']
-            for _cam in _info['cams']:
-                _ci = _info['cams'][_cam]
-                _dp = os.path.join(NUPLAN_SENSOR_ROOT, _ci['data_path'])
-                _ip = _colmap_image_name(_veh, _cam, _info, _ci)
-                _tasks.append((
-                    _dp,
-                    os.path.join(video_scene.raw_mask_path,
-                                 video_scene.mask_suffix_cityscape,
-                                 _ci['data_path'].replace('.jpg', '.png')),
-                    os.path.join(video_scene.raw_mask_path,
-                                 video_scene.mask_suffix_ego, f'{_cam}.png'),
-                    f'{colmap_path}/images/{_ip}',
-                    f'{colmap_path}/masks/{_ip}.png',
-                ))
-                _keys.append((_info['token'], _cam))
-
-    _io_workers = int(os.environ.get('MTGS_IO_WORKERS',
-                                     min(64, (os.cpu_count() or 8) * 2)))
-    _prepared = {}
-    with ThreadPoolExecutor(max_workers=_io_workers) as _ex:
-        for _k, _res in zip(_keys, tqdm(
-                _ex.map(_prepare_one_image, _tasks),
-                total=len(_tasks), desc='Preparing images', ncols=120)):
-            _prepared[_k] = _res
-    for _k, (_st, _detail) in _prepared.items():
-        if _st == 'missing':
-            raise FileNotFoundError(
-                f'semantic mask missing/unreadable: {_detail} '
-                '(mask stage output incomplete - regenerate masks for this block)')
-
-    for video_token in video_scene_dict:
-        frame_infos = video_scene_dict[video_token]["frame_infos"]
-        frame_infos = [info for info in frame_infos if not info.get('skipped', False)]
-
-        # same vehicle has same camera calibration
-        veh_name = video_scene_dict[video_token]['vehicle_name']
-
-        for idx, info in enumerate(frame_infos):
-
-            ego2global = info['ego2global']
-
-            for cam_name in info['cams']:
-                cam_info = info['cams'][cam_name]
-
-                data_path = os.path.join(NUPLAN_SENSOR_ROOT, cam_info['data_path'])
-
-                sem_mask_path = os.path.join(
-                    video_scene.raw_mask_path,
-                    video_scene.mask_suffix_cityscape,
-                    cam_info['data_path'].replace('.jpg', '.png')
-                )
-                ego_mask_path = os.path.join(
-                    video_scene.raw_mask_path,
-                    video_scene.mask_suffix_ego,
-                    f'{cam_name}.png'
-                )
-                if _prepared.get((info['token'], cam_name), ('invalid', None))[0] != 'ok':
-                    invalid_images += 1
-                    cam_info['valid'] = False
+        # Fan the per-frame image/mask I/O out first; the loop below then only does
+        # bookkeeping, which must stay ordered. Threads (not processes) because the
+        # work is cv2 read/write and filesystem calls, all of which drop the GIL.
+        _tasks, _keys = [], []
+        for _vt in video_scene_dict:
+            for _info in video_scene_dict[_vt]['frame_infos']:
+                if _info.get('skipped', False):
                     continue
-                cam_info['valid'] = True
+                _veh = video_scene_dict[_vt]['vehicle_name']
+                for _cam in _info['cams']:
+                    _ci = _info['cams'][_cam]
+                    _dp = os.path.join(NUPLAN_SENSOR_ROOT, _ci['data_path'])
+                    _ip = _colmap_image_name(_veh, _cam, _info, _ci)
+                    _tasks.append((
+                        _dp,
+                        os.path.join(video_scene.raw_mask_path,
+                                     video_scene.mask_suffix_cityscape,
+                                     _ci['data_path'].replace('.jpg', '.png')),
+                        os.path.join(video_scene.raw_mask_path,
+                                     video_scene.mask_suffix_ego, f'{_cam}.png'),
+                        f'{colmap_path}/images/{_ip}',
+                        f'{colmap_path}/masks/{_ip}.png',
+                    ))
+                    _keys.append((_info['token'], _cam))
 
-                intrinsic = cam_info['cam_intrinsic']
-                cam2ego = Quaternion(cam_info['sensor2ego_rotation']).transformation_matrix
-                cam2ego[:3, 3] = cam_info['sensor2ego_translation']
-                cam2global = np.dot(ego2global, cam2ego)
-                cam2global[:3, 3] *= scale_factor  # scale to about 10 meters for colmap
+        _io_workers = int(os.environ.get('MTGS_IO_WORKERS',
+                                         min(64, (os.cpu_count() or 8) * 2)))
+        _prepared = {}
+        with ThreadPoolExecutor(max_workers=_io_workers) as _ex:
+            for _k, _res in zip(_keys, tqdm(
+                    _ex.map(_prepare_one_image, _tasks),
+                    total=len(_tasks), desc='Preparing images', ncols=120)):
+                _prepared[_k] = _res
+        for _k, (_st, _detail) in _prepared.items():
+            if _st == 'missing':
+                raise FileNotFoundError(
+                    f'semantic mask missing/unreadable: {_detail} '
+                    '(mask stage output incomplete - regenerate masks for this block)')
 
-                # global2cam
-                Q = Quaternion(matrix=cam2global[:3, :3].T).q
-                T = -cam2global[:3, :3].T @ cam2global[:3, 3]
+        for video_token in video_scene_dict:
+            frame_infos = video_scene_dict[video_token]["frame_infos"]
+            frame_infos = [info for info in frame_infos if not info.get('skipped', False)]
 
-                cam_name_colmap = f'{veh_name}_{cam_name}'
-                cam_id = cam_name_mapper[cam_name_colmap]
-                image_path = _colmap_image_name(veh_name, cam_name, info, cam_info)
-                name_to_token[image_path] = cam_info['token']
+            # same vehicle has same camera calibration
+            veh_name = video_scene_dict[video_token]['vehicle_name']
 
-                # deduplicate images
-                if image_path in image_names:
-                    invalid_images += 1
-                    cam_info['valid'] = False
-                    continue
-                image_names.add(image_path)
+            for idx, info in enumerate(frame_infos):
 
-                view_field = field_of_view_intrinsic(intrinsic, 30 * scale_factor, cam2global)
-                cam_views.append(dict(
-                    token=image_path,
-                    ego_token=info['token'],
-                    view_field=view_field
-                ))
+                ego2global = info['ego2global']
 
-                # write to images.txt
-                line = f'{global_image_id} {Q[0]} {Q[1]} {Q[2]} {Q[3]} {T[0]} {T[1]} {T[2]} {cam_id} {image_path}' + '\n\n'
-                f_images.write(line)
+                for cam_name in info['cams']:
+                    cam_info = info['cams'][cam_name]
 
-                global_image_id += 1
+                    data_path = os.path.join(NUPLAN_SENSOR_ROOT, cam_info['data_path'])
 
-            progress_bar.update(1)
-    progress_bar.close()
-    f_images.close()
+                    sem_mask_path = os.path.join(
+                        video_scene.raw_mask_path,
+                        video_scene.mask_suffix_cityscape,
+                        cam_info['data_path'].replace('.jpg', '.png')
+                    )
+                    ego_mask_path = os.path.join(
+                        video_scene.raw_mask_path,
+                        video_scene.mask_suffix_ego,
+                        f'{cam_name}.png'
+                    )
+                    if _prepared.get((info['token'], cam_name), ('invalid', None))[0] != 'ok':
+                        invalid_images += 1
+                        cam_info['valid'] = False
+                        continue
+                    cam_info['valid'] = True
+
+                    intrinsic = cam_info['cam_intrinsic']
+                    cam2ego = Quaternion(cam_info['sensor2ego_rotation']).transformation_matrix
+                    cam2ego[:3, 3] = cam_info['sensor2ego_translation']
+                    cam2global = np.dot(ego2global, cam2ego)
+                    cam2global[:3, 3] *= scale_factor  # scale to about 10 meters for colmap
+
+                    # global2cam
+                    Q = Quaternion(matrix=cam2global[:3, :3].T).q
+                    T = -cam2global[:3, :3].T @ cam2global[:3, 3]
+
+                    cam_name_colmap = f'{veh_name}_{cam_name}'
+                    cam_id = cam_name_mapper[cam_name_colmap]
+                    image_path = _colmap_image_name(veh_name, cam_name, info, cam_info)
+                    name_to_token[image_path] = cam_info['token']
+
+                    # deduplicate images
+                    if image_path in image_names:
+                        invalid_images += 1
+                        cam_info['valid'] = False
+                        continue
+                    image_names.add(image_path)
+
+                    view_field = field_of_view_intrinsic(intrinsic, 30 * scale_factor, cam2global)
+                    cam_views.append(dict(
+                        token=image_path,
+                        ego_token=info['token'],
+                        view_field=view_field
+                    ))
+
+                    # write to images.txt
+                    line = f'{global_image_id} {Q[0]} {Q[1]} {Q[2]} {Q[3]} {T[0]} {T[1]} {T[2]} {cam_id} {image_path}' + '\n\n'
+                    f_images.write(line)
+
+                    global_image_id += 1
+
+                progress_bar.update(1)
 
     print(f'Filter out invalid images: {invalid_images}/{len(frame_infos) * 8}')
     import json as _json
@@ -463,48 +458,43 @@ def create_sparse_colmap_model(video_scene: VideoScene, video_scene_dict, colmap
     create_colmap_folder(colmap_path)
     cam_name_mapper = create_cameras_per_vehicle(video_scene_dict, colmap_path)
 
-    progress_bar = tqdm(
-        total=VideoScene.count_total_frames(video_scene_dict),
-        desc='Loading image infos', ncols=120)
+    with tqdm(total=VideoScene.count_total_frames(video_scene_dict), desc='Loading image infos', ncols=120) as progress_bar, \
+            open(f"{colmap_path}/sparse_model/images.txt", "w") as f_images:
+        global_image_id = 1
+        for video_token in video_scene_dict:
+            frame_infos = video_scene_dict[video_token]['frame_infos']
+            frame_infos = [info for info in frame_infos if not info.get('skipped', False)]
 
-    f_images = open(f"{colmap_path}/sparse_model/images.txt", "w")
-    global_image_id = 1
-    for video_token in video_scene_dict:
-        frame_infos = video_scene_dict[video_token]['frame_infos']
-        frame_infos = [info for info in frame_infos if not info.get('skipped', False)]
+            # same vehicle has same camera calibration
+            veh_name = video_scene_dict[video_token]['vehicle_name']
 
-        # same vehicle has same camera calibration
-        veh_name = video_scene_dict[video_token]['vehicle_name']
+            for idx, info in enumerate(frame_infos):
 
-        for idx, info in enumerate(frame_infos):
+                ego2global = info['ego2global']
 
-            ego2global = info['ego2global']
+                for cam in info['cams']:
+                    cam_info = info['cams'][cam]
 
-            for cam in info['cams']:
-                cam_info = info['cams'][cam]
+                    data_path = os.path.join(NUPLAN_SENSOR_ROOT, cam_info['data_path'])
 
-                data_path = os.path.join(NUPLAN_SENSOR_ROOT, cam_info['data_path'])
+                    cam2ego = Quaternion(cam_info['sensor2ego_rotation']).transformation_matrix
+                    cam2ego[:3, 3] = cam_info['sensor2ego_translation']
+                    cam2global = np.dot(ego2global, cam2ego)
 
-                cam2ego = Quaternion(cam_info['sensor2ego_rotation']).transformation_matrix
-                cam2ego[:3, 3] = cam_info['sensor2ego_translation']
-                cam2global = np.dot(ego2global, cam2ego)
+                    # global2cam
+                    Q = Quaternion(matrix=cam2global[:3, :3].T).q
+                    T = -cam2global[:3, :3].T @ cam2global[:3, 3]
 
-                # global2cam
-                Q = Quaternion(matrix=cam2global[:3, :3].T).q
-                T = -cam2global[:3, :3].T @ cam2global[:3, 3]
+                    cam_name_colmap = f'{veh_name}_{cam}'
+                    cam_id = cam_name_mapper[cam_name_colmap]
+                    image_path = f'{cam_name_colmap}/{os.path.basename(data_path)}'
 
-                cam_name_colmap = f'{veh_name}_{cam}'
-                cam_id = cam_name_mapper[cam_name_colmap]
-                image_path = f'{cam_name_colmap}/{os.path.basename(data_path)}'
+                    # write to images.txt
+                    line = f'{global_image_id} {Q[0]} {Q[1]} {Q[2]} {Q[3]} {T[0]} {T[1]} {T[2]} {cam_id} {image_path}' + '\n\n'
+                    f_images.write(line)
+                    global_image_id += 1
 
-                # write to images.txt
-                line = f'{global_image_id} {Q[0]} {Q[1]} {Q[2]} {Q[3]} {T[0]} {T[1]} {T[2]} {cam_id} {image_path}' + '\n\n'
-                f_images.write(line)
-                global_image_id += 1
-
-            progress_bar.update(1)
-    progress_bar.close()
-    f_images.close()
+                progress_bar.update(1)
     # create colmap database after everything is done
     create_colmap_database(colmap_path)
     return video_scene_dict

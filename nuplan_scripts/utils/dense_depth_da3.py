@@ -84,40 +84,39 @@ def run_da3_multiview(video_scene, video_scene_dict, undistort_mode, max_range, 
                 streams[(vt, cam_name)].append((ci.get('timestamp', fi['timestamp']), fi, ci))
 
     total = sum(len(s) for s in streams.values()); done = 0
-    pbar = tqdm(total=total, ncols=120, desc='DA3 multi-view depth')
-    for key in sorted(streams):
-        seq = sorted(streams[key], key=lambda t: t[0])
-        outs = [os.path.join(out_root, ci['data_path'].replace('.jpg', '.png')) for _, _, ci in seq]
-        if all(os.path.exists(o) for o in outs):
-            pbar.update(len(seq)); continue
-        loaded = [_load(video_scene, ci, undistort_mode) for _, _, ci in seq]
-        w2c = [np.linalg.inv(_c2w(fi, ci)).astype(np.float32) for _, fi, ci in seq]
-        n = len(seq); best = [None] * n; best_off = [1e9] * n
-        for s0 in _windows(n, Wn, St):
-            idx = list(range(s0, min(n, s0 + Wn)))
-            pred = model.inference(image=[loaded[i][0] for i in idx],
-                                   extrinsics=np.stack([w2c[i] for i in idx]),
-                                   intrinsics=np.stack([loaded[i][1] for i in idx]).astype(np.float32),
-                                   align_to_input_ext_scale=True, ref_view_strategy='saddle_balanced')
-            depth = np.asarray(pred.depth).astype(np.float32)
-            c = s0 + (len(idx) - 1) / 2.0
-            for k, i in enumerate(idx):
-                if abs(i - c) < best_off[i]:
-                    best_off[i] = abs(i - c); best[i] = depth[k]
-        for i in range(n):
-            (H, W), (x, y, w, h) = loaded[i][2], loaded[i][3]
-            d = best[i]
-            if d.shape != (h, w):
-                d = cv2.resize(d, (w, h), interpolation=cv2.INTER_LINEAR)
-            d = np.where((d > max_range) | (d < 0.1), 0, d)
-            img = np.zeros((H, W), np.uint16)
-            img[y:y + h, x:x + w] = np.clip(np.trunc(d * 100), 0, 65535).astype(np.uint16)
-            if depth_sky.enabled():
-                sky = depth_sky.sky_mask(video_scene, seq[i][2], undistort_mode)
-                if sky is not None and sky.shape == img.shape:
-                    img[sky] = 0                      # sky is not a surface: invalid for the depth losses
-            os.makedirs(os.path.dirname(outs[i]), exist_ok=True)
-            cv2.imwrite(outs[i], img)
-        pbar.update(n)
-    pbar.close()
+    with tqdm(total=total, ncols=120, desc='DA3 multi-view depth') as pbar:
+        for key in sorted(streams):
+            seq = sorted(streams[key], key=lambda t: t[0])
+            outs = [os.path.join(out_root, ci['data_path'].replace('.jpg', '.png')) for _, _, ci in seq]
+            if all(os.path.exists(o) for o in outs):
+                pbar.update(len(seq)); continue
+            loaded = [_load(video_scene, ci, undistort_mode) for _, _, ci in seq]
+            w2c = [np.linalg.inv(_c2w(fi, ci)).astype(np.float32) for _, fi, ci in seq]
+            n = len(seq); best = [None] * n; best_off = [1e9] * n
+            for s0 in _windows(n, Wn, St):
+                idx = list(range(s0, min(n, s0 + Wn)))
+                pred = model.inference(image=[loaded[i][0] for i in idx],
+                                       extrinsics=np.stack([w2c[i] for i in idx]),
+                                       intrinsics=np.stack([loaded[i][1] for i in idx]).astype(np.float32),
+                                       align_to_input_ext_scale=True, ref_view_strategy='saddle_balanced')
+                depth = np.asarray(pred.depth).astype(np.float32)
+                c = s0 + (len(idx) - 1) / 2.0
+                for k, i in enumerate(idx):
+                    if abs(i - c) < best_off[i]:
+                        best_off[i] = abs(i - c); best[i] = depth[k]
+            for i in range(n):
+                (H, W), (x, y, w, h) = loaded[i][2], loaded[i][3]
+                d = best[i]
+                if d.shape != (h, w):
+                    d = cv2.resize(d, (w, h), interpolation=cv2.INTER_LINEAR)
+                d = np.where((d > max_range) | (d < 0.1), 0, d)
+                img = np.zeros((H, W), np.uint16)
+                img[y:y + h, x:x + w] = np.clip(np.trunc(d * 100), 0, 65535).astype(np.uint16)
+                if depth_sky.enabled():
+                    sky = depth_sky.sky_mask(video_scene, seq[i][2], undistort_mode)
+                    if sky is not None and sky.shape == img.shape:
+                        img[sky] = 0                      # sky is not a surface: invalid for the depth losses
+                os.makedirs(os.path.dirname(outs[i]), exist_ok=True)
+                cv2.imwrite(outs[i], img)
+            pbar.update(n)
     del model; torch.cuda.empty_cache()

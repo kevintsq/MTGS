@@ -91,5 +91,15 @@ if __name__ == '__main__':
         ns_config.pipeline.datamanager.num_workers = int(os.environ['MTGS_DM_WORKERS'])
     ns_config.output_dir = output_dir
     ns_config.set_base_dir(output_dir)
+    # MTGS_CKPT_MIRROR (preemptible jobs, see CustomTrainer): resume from the mirrored checkpoint if there is one
+    mirror = os.environ.get('MTGS_CKPT_MIRROR')
+    if mirror and os.path.isdir(mirror):
+        steps = sorted(int(f[5:14]) for f in os.listdir(mirror) if f.startswith('step-') and f.endswith('.ckpt'))
+        if steps:
+            from pathlib import Path
+            ns_config.load_dir = Path(mirror)
+            ns_config.load_step = steps[-1]
+            os.environ['MTGS_RESUMED'] = '1'
+            print(f"[resume] {config.road_block_name}: resuming from {mirror}/step-{steps[-1]:09d}.ckpt", flush=True)
 
     main(ns_config)

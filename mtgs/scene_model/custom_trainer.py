@@ -6,6 +6,9 @@
 import time
 import dataclasses
 import os
+import signal
+import shutil
+import threading
 from pathlib import Path
 from dataclasses import dataclass, field
 from typing import Literal, Type
@@ -140,6 +143,53 @@ class CustomTrainer(Trainer):
 
     def __init__(self, config: CustomTrainerConfig, **kwargs):
         super().__init__(config, **kwargs)
+        # Preemption safety (2026-10-29). MTGS_CKPT_MIRROR=<dir on persistent storage>: every periodic
+        # checkpoint is also copied there (latest only, written as .tmp then renamed), and on SIGTERM
+        # (Slurm preemption: SIGTERM, then SIGKILL after KillWait = 30 s on torch) the state after the
+        # last finished step is saved straight into the mirror and the process exits 143.
+        # background_reconstruction.py resumes from the mirror when it holds a checkpoint.
+        self._mirror = Path(os.environ["MTGS_CKPT_MIRROR"]) if os.environ.get("MTGS_CKPT_MIRROR") else None
+        self._term = False
+        self._mirror_thread = None
+        if self._mirror is not None:
+            self._mirror.mkdir(parents=True, exist_ok=True)
+            signal.signal(signal.SIGTERM, self._on_sigterm)
+
+    def _on_sigterm(self, signum, frame):
+        self._term = True
+        CONSOLE.print("[preempt] SIGTERM received: saving to the mirror at the next step boundary", style="bold yellow")
+
+    def _ckpt_dict(self, step: int, completed: bool) -> dict:
+        d = {
+            "step": step,
+            "pipeline": self.pipeline.module.state_dict() if hasattr(self.pipeline, "module") else self.pipeline.state_dict(),  # type: ignore
+        }
+        if not completed:
+            d["optimizers"] = {k: v.state_dict() for (k, v) in self.optimizers.optimizers.items()}
+            d["schedulers"] = {k: v.state_dict() for (k, v) in self.optimizers.schedulers.items()}
+            d["scalers"] = self.grad_scaler.state_dict()
+        return d
+
+    def _mirror_install(self, src: Path, step: int) -> None:
+        # src -> mirror/step-<step>.ckpt via a temp name, then drop older mirror checkpoints
+        dst = self._mirror / f"step-{step:09d}.ckpt"
+        tmp = self._mirror / f".step-{step:09d}.partial"
+        if src != tmp:
+            shutil.copyfile(src, tmp)
+        os.replace(tmp, dst)
+        for f in self._mirror.glob("step-*.ckpt"):
+            if f != dst:
+                f.unlink()
+
+    def _preempt_save_and_exit(self, step: int) -> None:
+        if self._mirror_thread is not None:
+            self._mirror_thread.join()
+        t0 = time.time()
+        tmp = self._mirror / f".step-{step:09d}.partial"
+        torch.save(self._ckpt_dict(step, completed=False), tmp)
+        self._mirror_install(tmp, step)
+        CONSOLE.print(f"[preempt] saved step {step} to {self._mirror} in {time.time() - t0:.1f} s; exiting for requeue", style="bold yellow")
+        os._exit(143)
 
     # MTGS_SYNC_DEBUG=<step>: report every host<->GPU synchronisation made during steps
     # <step> .. <step>+2 (each one drains the GPU queue while Python catches up).
@@ -150,6 +200,8 @@ class CustomTrainer(Trainer):
     _prof = tuple(int(x) for x in os.environ["MTGS_PROFILE_STEPS"].split(":")) if os.environ.get("MTGS_PROFILE_STEPS") else None
 
     def train_iteration(self, step: int):
+        if self._term:   # SIGTERM arrived during the previous step: its state is complete, save it and leave
+            self._preempt_save_and_exit(step - 1)
         if self._prof is not None and step == self._prof[0]:
             torch.cuda.synchronize(); torch.cuda.profiler.start()
         if self._prof is not None and step == self._prof[1]:
@@ -285,6 +337,14 @@ class CustomTrainer(Trainer):
                 else:
                     raise e
 
+        if self._mirror is not None:   # copy to persistent storage in the background (the next save waits for it)
+            if self._mirror_thread is not None:
+                self._mirror_thread.join()
+            self._mirror_thread = threading.Thread(target=self._mirror_install, args=(ckpt_path, step), daemon=False)
+            self._mirror_thread.start()
+            if self.training_state == "completed":
+                self._mirror_thread.join()
+
         # possibly delete old checkpoints
         if self.config.save_only_latest_checkpoint:
             # delete every other checkpoint in the checkpoint folder
@@ -322,3 +382,9 @@ class CustomTrainer(Trainer):
         if "scalers" in loaded_state:
             self.grad_scaler.load_state_dict(loaded_state["scalers"])
         CONSOLE.print(f"Done loading Nerfstudio checkpoint from {load_path}")
+        if os.environ.get("MTGS_RESUMED") == "1":
+            # nerfstudio trains range(start, start + max_num_iterations): shorten it so a resumed run ends at
+            # the original final step instead of running a full schedule on top of the checkpoint
+            total = self.config.max_num_iterations
+            self.config.max_num_iterations = max(0, total - self._start_step)
+            CONSOLE.print(f"[resume] step {self._start_step} of {total}: {self.config.max_num_iterations} steps left", style="bold yellow")

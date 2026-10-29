@@ -59,6 +59,10 @@ if __name__ == '__main__':
         # lazy import to speed up the script
         from nerfstudio.utils.eval_utils import eval_setup
         from mtgs.utils.export_utils import extract_portable_ckpt
+        # a resumed run (MTGS_CKPT_MIRROR) stored load_dir/load_step of the checkpoint it resumed FROM in its
+        # config: clear them so eval_setup takes the latest checkpoint of this run's own directory
+        nerfstudio_config.load_dir = None
+        nerfstudio_config.load_step = None
         nerfstudio_config, pipeline, _, _ = eval_setup(nerfstudio_config, test_mode='inference')
         extract_portable_ckpt(pipeline, dst_ckpt_path)
 

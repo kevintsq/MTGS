@@ -153,11 +153,20 @@ class CustomTrainer(Trainer):
         self._mirror_thread = None
         if self._mirror is not None:
             self._mirror.mkdir(parents=True, exist_ok=True)
+            for f in self._mirror.glob(".step-*.partial"):   # left by a copy that was killed mid-way
+                f.unlink()
             signal.signal(signal.SIGTERM, self._on_sigterm)
 
     def _on_sigterm(self, signum, frame):
-        self._term = True
-        CONSOLE.print("[preempt] SIGTERM received: saving to the mirror at the next step boundary", style="bold yellow")
+        # A full checkpoint (model + Adam state) is ~12 GB for a 6-pass block: it cannot reach network storage
+        # inside Slurm's 30 s KillWait (measured on Civo 2026-10-29: 1.1 of 11.8 GB written). By default just
+        # stop; the run resumes from the last periodic mirror. MTGS_SIGTERM_SAVE=1 tries the save anyway.
+        if os.environ.get("MTGS_SIGTERM_SAVE") == "1":
+            self._term = True
+            CONSOLE.print("[preempt] SIGTERM received: saving to the mirror at the next step boundary", style="bold yellow")
+        else:
+            CONSOLE.print("[preempt] SIGTERM received: exiting; resume will use the last mirrored checkpoint", style="bold yellow")
+            os._exit(143)
 
     def _ckpt_dict(self, step: int, completed: bool) -> dict:
         d = {

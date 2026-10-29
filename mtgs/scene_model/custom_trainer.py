@@ -373,11 +373,11 @@ class CustomTrainer(Trainer):
                 load_step = sorted(int(x[x.find("-") + 1 : x.find(".")]) for x in os.listdir(load_dir))[-1]
             load_path: Path = load_dir / f"step-{load_step:09d}.ckpt"
             assert load_path.exists(), f"Checkpoint {load_path} does not exist"
-            loaded_state = torch.load(load_path, map_location="cpu")
+            loaded_state = torch.load(load_path, map_location="cpu", weights_only=False)   # our own checkpoint (holds numpy scalars)
         elif load_checkpoint is not None:
             assert load_checkpoint.exists(), f"Checkpoint {load_checkpoint} does not exist"
             load_path = load_checkpoint
-            loaded_state = torch.load(load_path, map_location="cpu")
+            loaded_state = torch.load(load_path, map_location="cpu", weights_only=False)   # our own checkpoint (holds numpy scalars)
         else:
             CONSOLE.print("No Nerfstudio checkpoint to load, so training from scratch.")
             return

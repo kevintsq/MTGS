@@ -157,11 +157,23 @@ class CustomTrainer(Trainer):
                 f.unlink()
             signal.signal(signal.SIGTERM, self._on_sigterm)
 
+    def train(self) -> None:
+        # resumed from the run's own final checkpoint (export-only rerun): no loop, no log writer -- just write the
+        # final checkpoint back so the export finds it (nerfstudio's writer divides by max_iter = 0 otherwise)
+        if os.environ.get("MTGS_RESUMED") == "1" and self.config.max_num_iterations == 0:
+            self.training_state = "completed"
+            self.save_checkpoint(self.step)
+            CONSOLE.print(f"[resume] run already finished at step {self.step}: final checkpoint rewritten, nothing to train", style="bold yellow")
+            return
+        super().train()
+
     def _after_train(self) -> None:
         # a run resumed from its final checkpoint performs no step, so nerfstudio's log writer never saw a step and
         # write_out_storage() raises KeyError('step') right after the final save (manco it_w2_13, 2026-10-30)
         from nerfstudio.utils import writer as _w
         _w.GLOBAL_BUFFER.setdefault("step", self.step)
+        if not _w.GLOBAL_BUFFER.get("max_iter"):   # 0 steps left -> its progress line divides by max_iter (Civo w2_02)
+            _w.GLOBAL_BUFFER["max_iter"] = 1
         super()._after_train()
 
     def _on_sigterm(self, signum, frame):

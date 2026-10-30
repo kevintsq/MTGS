@@ -157,6 +157,13 @@ class CustomTrainer(Trainer):
                 f.unlink()
             signal.signal(signal.SIGTERM, self._on_sigterm)
 
+    def _after_train(self) -> None:
+        # a run resumed from its final checkpoint performs no step, so nerfstudio's log writer never saw a step and
+        # write_out_storage() raises KeyError('step') right after the final save (manco it_w2_13, 2026-10-30)
+        from nerfstudio.utils import writer as _w
+        _w.GLOBAL_BUFFER.setdefault("step", self.step)
+        super()._after_train()
+
     def _on_sigterm(self, signum, frame):
         # A full checkpoint (model + Adam state) is ~12 GB for a 6-pass block: it cannot reach network storage
         # inside Slurm's 30 s KillWait (measured on Civo 2026-10-29: 1.1 of 11.8 GB written). By default just

@@ -396,4 +396,8 @@ class CustomTrainer(Trainer):
             # the original final step instead of running a full schedule on top of the checkpoint
             total = self.config.max_num_iterations
             self.config.max_num_iterations = max(0, total - self._start_step)
+            # nerfstudio's final save uses self.step, which the loop sets; a run resumed from its final checkpoint
+            # runs no step at all, so without this the finished model was saved as step 0 (Civo v2_07, 2026-10-30)
+            # and a later resume would have retrained the whole schedule on top of it
+            self.step = self._start_step - 1
             CONSOLE.print(f"[resume] step {self._start_step} of {total}: {self.config.max_num_iterations} steps left", style="bold yellow")

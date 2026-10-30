@@ -261,6 +261,11 @@ def eval_setup(
 
     # load checkpoints from wherever they were saved
     config.load_dir = config.get_checkpoint_dir()
+    # a resumed run (MTGS_CKPT_MIRROR, 2026-10-30) stores the load_step it resumed FROM in its config.yml; that
+    # checkpoint lives in the mirror, not here, so fall back to the latest checkpoint of this run (pa_loc_0191:
+    # render asked for step-45000 after training to 90002 and died)
+    if config.load_step is not None and not (config.load_dir / f"step-{config.load_step:09d}.ckpt").exists():
+        config.load_step = None
     checkpoint_path = find_ckpt_path(config)
 
     if 'camera_optimizer' in config.pipeline.model.__dict__ \

@@ -530,12 +530,47 @@ def _map_icp_pass(video, scans_by_token, init_pose_sets, ref_cloud, label=""):
     return out, f"took {name} (" + "; ".join(report) + ")"
 
 
-def _map_icp_frames(video, scans_by_token, poses, ref, voxel, max_dt=1.0, max_dyaw_deg=3.0, win=5):
+def _map_icp_frames(video, scans_by_token, poses, ref, voxel, max_dt=1.0, max_dyaw_deg=3.0, win=5, tilt=None):
     """Per-frame scan-to-map refinement of `poses` (token -> 4x4) against the
-    open3d map `ref`; returns (refined poses, report)."""
+    open3d map `ref`; returns (refined poses, report).
+
+    tilt (default MTGS_REG_PASS_TILT=1): the INS attitude of a vehicle carries a constant roll/pitch bias (ir_w2_06,
+    2026-10-30: veh-40 vs veh-28 scans differ by a 1.4 deg roll about the driving axis, visible as a tilted ground in
+    a cross-section). That is a rotation about each frame's OWN axes, not a rigid motion of the pass, so the rigid fit
+    cannot remove it and the per-frame step only fixes the frames that overlap the map (82/476 on pass 64). Here a
+    first per-frame round measures the correction in the ego frame, its median roll/pitch is applied to EVERY frame
+    of the pass, and the per-frame round is repeated from there."""
     import open3d as o3d
     from scipy.spatial.transform import Rotation as _R
+    if tilt is None:
+        tilt = os.environ.get('MTGS_REG_PASS_TILT', '1') == '1'
     tokens = [info['token'] for info in video['frame_infos'] if info['token'] in poses and info['token'] in scans_by_token]
+    tilt_rep = ""
+    if tilt:
+        ego_rv = []
+        for t in tokens[::2]:
+            P = scans_by_token[t][:, :3]
+            P = P[np.linalg.norm(P[:, :2], axis=1) < 60.0][::2]
+            src = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(P)).voxel_down_sample(voxel)
+            T = poses[t]
+            for c in (0.8, 0.3):
+                res = o3d.pipelines.registration.registration_icp(
+                    src, ref, c, T, o3d.pipelines.registration.TransformationEstimationPointToPlane(),
+                    o3d.pipelines.registration.ICPConvergenceCriteria(max_iteration=30))
+                T = res.transformation
+            D = T @ np.linalg.inv(poses[t])
+            if res.fitness >= 0.3 and np.linalg.norm(D[:3, 3]) <= max_dt:
+                ego_rv.append(poses[t][:3, :3].T @ _R.from_matrix(D[:3, :3]).as_rotvec(degrees=True))   # roll (x), pitch (y), yaw (z) about the frame's own axes
+        if len(ego_rv) >= 10:
+            med = np.median(np.array(ego_rv), axis=0); roll, pitch = float(med[0]), float(med[1])
+            if max(abs(roll), abs(pitch)) >= 0.1 and max(abs(roll), abs(pitch)) <= 3.0:
+                Rt = _R.from_rotvec([roll, pitch, 0.0], degrees=True).as_matrix()
+                poses = {t: (lambda M: np.block([[M[:3, :3] @ Rt, M[:3, 3:4]], [M[3:4, :]]]))(poses[t]) for t in poses}
+                tilt_rep = f"pass tilt roll {roll:+.2f} / pitch {pitch:+.2f} deg from {len(ego_rv)} frames applied to all; "
+            else:
+                tilt_rep = f"pass tilt roll {roll:+.2f} / pitch {pitch:+.2f} deg ({len(ego_rv)} frames), not applied; "
+        else:
+            tilt_rep = f"pass tilt: only {len(ego_rv)} frames on the map, skipped; "
     corr, n_ok = [], 0
     for t in tokens:
         P = scans_by_token[t][:, :3]
@@ -563,7 +598,7 @@ def _map_icp_frames(video, scans_by_token, poses, ref, voxel, max_dt=1.0, max_dy
         D = np.eye(4); D[:3, :3] = _R.from_rotvec(r).as_matrix(); D[:3, 3] = tr
         out[t] = D @ poses[t]
     mags = [float(np.linalg.norm(D[:3, 3])) for D in corr if D is not None]
-    return out, (f"per-frame map ICP: {n_ok}/{len(tokens)} frames refined, median correction {np.median(mags) if mags else 0:.2f} m, max {max(mags) if mags else 0:.2f} m")
+    return out, (tilt_rep + f"per-frame map ICP: {n_ok}/{len(tokens)} frames refined, median correction {np.median(mags) if mags else 0:.2f} m, max {max(mags) if mags else 0:.2f} m")
 
 
 def _pass_accumulation(video, scans_by_token, poses):
@@ -581,43 +616,63 @@ def _pass_accumulation(video, scans_by_token, poses):
 
 
 def _inconsistent_passes(vt, video_scene_dict, poses, scans_by_token, clouds):
-    """Passes that overlap pass `vt` but are NOT already registered with it: a rigid ICP of vt's accumulation onto
-    each other pass's cloud moves it by more than MTGS_REG_SWEEP_TOL_M / _DEG (0.15 m / 0.3 deg). Same-day passes of
-    one vehicle agree with each other to a few cm, so with the plain all-others map they anchor each other and a
-    cross-vehicle offset (ir_w2_06: a 1.4 deg roll between veh-40 and veh-28, 0.2-0.4 m on the facades) survives the
-    sweeps. Returns (inconsistent tokens, report)."""
+    """Passes that overlap pass `vt` but are NOT already registered with it. Sampled scans of vt are ICP'd one by one
+    onto the other pass's accumulation; the median correction (translation, and roll/pitch/yaw about the scan's own
+    axes) over the overlapping scans must stay within MTGS_REG_SWEEP_TOL_M / _DEG (0.15 m / 0.3 deg). A rigid fit of
+    the whole pass was tried first (2026-10-30) and missed the per-frame 1.4 deg roll of ir_w2_06 entirely. Same-day
+    passes of one vehicle agree to a few cm, so with the plain all-others map they anchor each other and a cross-
+    vehicle offset survives the sweeps. Returns (inconsistent tokens, report)."""
     import open3d as o3d
     from scipy.spatial.transform import Rotation
     voxel = float(os.environ.get('MTGS_REG_MAP_ICP_VOXEL', 0.3))
     tol_m = float(os.environ.get('MTGS_REG_SWEEP_TOL_M', 0.15)); tol_deg = float(os.environ.get('MTGS_REG_SWEEP_TOL_DEG', 0.3))
-    if vt not in clouds:
-        clouds[vt] = _pass_accumulation(video_scene_dict[vt], scans_by_token, poses)
-    src_pts = clouds[vt]
-    if src_pts is None or len(src_pts) < 2000:
-        return [], "no points"
-    src = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(src_pts)).voxel_down_sample(voxel)
+    nsamp = int(os.environ.get('MTGS_REG_SWEEP_SAMPLES', 16))
+    tokens = [i['token'] for i in video_scene_dict[vt]['frame_infos'] if i['token'] in poses and i['token'] in scans_by_token]
+    if len(tokens) < 5:
+        return [], "no frames"
     bad, rep = [], []
     for u in video_scene_dict:
         if u == vt:
             continue
         if u not in clouds:
-            clouds[u] = _pass_accumulation(video_scene_dict[u], scans_by_token, poses)
-        if clouds[u] is None or len(clouds[u]) < 2000:
+            pts = _pass_accumulation(video_scene_dict[u], scans_by_token, poses)
+            if pts is None or len(pts) < 2000:
+                clouds[u] = None
+            else:
+                tgt = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(pts)).voxel_down_sample(voxel)
+                tgt.estimate_normals(o3d.geometry.KDTreeSearchParamHybrid(radius=voxel * 4, max_nn=30))
+                clouds[u] = (tgt, np.asarray(tgt.points)[:, :2])
+        if clouds[u] is None:
             continue
-        tgt = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(clouds[u])).voxel_down_sample(voxel)
-        tgt.estimate_normals(o3d.geometry.KDTreeSearchParamHybrid(radius=voxel * 4, max_nn=30))
-        T = np.eye(4); res = None
-        for corr in (2.0, 0.8, 0.4):
-            res = o3d.pipelines.registration.registration_icp(
-                src, tgt, corr, T, o3d.pipelines.registration.TransformationEstimationPointToPlane(),
-                o3d.pipelines.registration.ICPConvergenceCriteria(max_iteration=60))
-            T = res.transformation
-        if res.fitness < 0.2:
+        tgt, txy = clouds[u]
+        # scans of vt that lie within 30 m of pass u's points
+        from scipy.spatial import cKDTree
+        tree = cKDTree(txy)
+        cand = [t for t in tokens if tree.query(poses[t][:2, 3])[0] < 30.0]
+        if len(cand) < 5:
+            continue
+        cand = cand[::max(1, len(cand) // nsamp)][:nsamp]
+        dts, rvs = [], []
+        for t in cand:
+            P = scans_by_token[t][:, :3]
+            P = P[np.linalg.norm(P[:, :2], axis=1) < 60.0][::2]
+            src = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(P)).voxel_down_sample(voxel)
+            T = poses[t]; res = None
+            for c in (1.0, 0.5, 0.3):
+                res = o3d.pipelines.registration.registration_icp(
+                    src, tgt, c, T, o3d.pipelines.registration.TransformationEstimationPointToPlane(),
+                    o3d.pipelines.registration.ICPConvergenceCriteria(max_iteration=30))
+                T = res.transformation
+            if res.fitness < 0.3:
+                continue
+            D = T @ np.linalg.inv(poses[t])
+            dts.append(float(np.linalg.norm(D[:3, 3] + (D[:3, :3] - np.eye(3)) @ poses[t][:3, 3])))
+            rvs.append(poses[t][:3, :3].T @ Rotation.from_matrix(D[:3, :3]).as_rotvec(degrees=True))
+        if len(dts) < 5:
             continue   # no real overlap
-        c = src_pts.mean(0); shift = float(np.linalg.norm(T[:3, :3] @ c + T[:3, 3] - c))
-        rot = float(np.degrees(np.linalg.norm(Rotation.from_matrix(T[:3, :3]).as_rotvec())))
-        rep.append(f"{u.split('-')[-1]}: {shift:.2f} m / {rot:.2f} deg (fit {res.fitness:.2f})")
-        if shift > tol_m or rot > tol_deg:
+        shift = float(np.median(dts)); rv = np.median(np.array(rvs), axis=0)
+        rep.append(f"{u.split('-')[-1]}: {shift:.2f} m, roll {rv[0]:+.2f} pitch {rv[1]:+.2f} yaw {rv[2]:+.2f} deg ({len(dts)} scans)")
+        if shift > tol_m or np.abs(rv).max() > tol_deg:
             bad.append(u)
     return bad, ", ".join(rep)
 

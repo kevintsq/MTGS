@@ -85,6 +85,14 @@ if __name__ == '__main__':
         ns_config.max_num_iterations = int(os.environ['MTGS_MAX_ITERS'])
     if os.environ.get('MTGS_EVAL_ALL_STEPS'):
         ns_config.steps_per_eval_all_images = int(os.environ['MTGS_EVAL_ALL_STEPS'])
+    # learning-rate knobs (2026-10-30, user A/B "position 8e-5 -> 8e-6, scales 1e-3"); MTGS works in metres, so
+    # these are absolute values, NOT vanilla 3DGS's extent-relative position_lr_init
+    if os.environ.get('MTGS_LR_MEANS'):
+        ns_config.optimizers['means']['optimizer'].lr = float(os.environ['MTGS_LR_MEANS'])
+    if os.environ.get('MTGS_LR_MEANS_FINAL'):
+        ns_config.optimizers['means']['scheduler'].lr_final = float(os.environ['MTGS_LR_MEANS_FINAL'])
+    if os.environ.get('MTGS_LR_SCALES'):
+        ns_config.optimizers['scales']['optimizer'].lr = float(os.environ['MTGS_LR_SCALES'])
     if os.environ.get('MTGS_STEPS_PER_SAVE'):
         ns_config.steps_per_save = int(os.environ['MTGS_STEPS_PER_SAVE'])
     if os.environ.get('MTGS_DM_WORKERS'):

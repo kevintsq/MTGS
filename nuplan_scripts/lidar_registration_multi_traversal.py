@@ -543,7 +543,7 @@ def _map_icp_frames(video, scans_by_token, poses, ref, voxel, max_dt=1.0, max_dy
     import open3d as o3d
     from scipy.spatial.transform import Rotation as _R
     if tilt is None:
-        tilt = os.environ.get('MTGS_REG_PASS_TILT', '1') == '1'
+        tilt = os.environ.get('MTGS_REG_PASS_TILT', '0') == '1'
     tokens = [info['token'] for info in video['frame_infos'] if info['token'] in poses and info['token'] in scans_by_token]
     tilt_rep = ""
     if tilt:
@@ -1019,7 +1019,7 @@ if __name__ == '__main__':
             _sweeps = int(os.environ.get('MTGS_REG_MAP_ICP_SWEEPS', 2))
             _order = sorted(video_scene_dict.keys(),
                             key=lambda vt: -error_dict_aligned.get(vt, {}).get('mean_error', 0.0))
-            _pairwise = os.environ.get('MTGS_REG_SWEEP_PAIRWISE', '1') == '1'
+            _pairwise = os.environ.get('MTGS_REG_SWEEP_PAIRWISE', '0') == '1'
             for _sw in range(_sweeps):
                 _clouds = {}
                 for vt in _order:

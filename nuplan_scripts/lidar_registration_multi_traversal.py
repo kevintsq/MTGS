@@ -566,6 +566,62 @@ def _map_icp_frames(video, scans_by_token, poses, ref, voxel, max_dt=1.0, max_dy
     return out, (f"per-frame map ICP: {n_ok}/{len(tokens)} frames refined, median correction {np.median(mags) if mags else 0:.2f} m, max {max(mags) if mags else 0:.2f} m")
 
 
+def _pass_accumulation(video, scans_by_token, poses):
+    """World-frame accumulation of a pass (every 2nd frame, r < 60 m, every 3rd point) at `poses`."""
+    pts = []
+    for info in video['frame_infos'][::2]:
+        t = info['token']
+        if t not in scans_by_token or t not in poses:
+            continue
+        P = scans_by_token[t][:, :3]
+        P = P[np.linalg.norm(P[:, :2], axis=1) < 60.0][::3]
+        pose = poses[t]
+        pts.append((pose[:3, :3] @ P.T).T + pose[:3, 3])
+    return np.concatenate(pts) if pts else None
+
+
+def _inconsistent_passes(vt, video_scene_dict, poses, scans_by_token, clouds):
+    """Passes that overlap pass `vt` but are NOT already registered with it: a rigid ICP of vt's accumulation onto
+    each other pass's cloud moves it by more than MTGS_REG_SWEEP_TOL_M / _DEG (0.15 m / 0.3 deg). Same-day passes of
+    one vehicle agree with each other to a few cm, so with the plain all-others map they anchor each other and a
+    cross-vehicle offset (ir_w2_06: a 1.4 deg roll between veh-40 and veh-28, 0.2-0.4 m on the facades) survives the
+    sweeps. Returns (inconsistent tokens, report)."""
+    import open3d as o3d
+    from scipy.spatial.transform import Rotation
+    voxel = float(os.environ.get('MTGS_REG_MAP_ICP_VOXEL', 0.3))
+    tol_m = float(os.environ.get('MTGS_REG_SWEEP_TOL_M', 0.15)); tol_deg = float(os.environ.get('MTGS_REG_SWEEP_TOL_DEG', 0.3))
+    if vt not in clouds:
+        clouds[vt] = _pass_accumulation(video_scene_dict[vt], scans_by_token, poses)
+    src_pts = clouds[vt]
+    if src_pts is None or len(src_pts) < 2000:
+        return [], "no points"
+    src = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(src_pts)).voxel_down_sample(voxel)
+    bad, rep = [], []
+    for u in video_scene_dict:
+        if u == vt:
+            continue
+        if u not in clouds:
+            clouds[u] = _pass_accumulation(video_scene_dict[u], scans_by_token, poses)
+        if clouds[u] is None or len(clouds[u]) < 2000:
+            continue
+        tgt = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(clouds[u])).voxel_down_sample(voxel)
+        tgt.estimate_normals(o3d.geometry.KDTreeSearchParamHybrid(radius=voxel * 4, max_nn=30))
+        T = np.eye(4); res = None
+        for corr in (2.0, 0.8, 0.4):
+            res = o3d.pipelines.registration.registration_icp(
+                src, tgt, corr, T, o3d.pipelines.registration.TransformationEstimationPointToPlane(),
+                o3d.pipelines.registration.ICPConvergenceCriteria(max_iteration=60))
+            T = res.transformation
+        if res.fitness < 0.2:
+            continue   # no real overlap
+        c = src_pts.mean(0); shift = float(np.linalg.norm(T[:3, :3] @ c + T[:3, 3] - c))
+        rot = float(np.degrees(np.linalg.norm(Rotation.from_matrix(T[:3, :3]).as_rotvec())))
+        rep.append(f"{u.split('-')[-1]}: {shift:.2f} m / {rot:.2f} deg (fit {res.fitness:.2f})")
+        if shift > tol_m or rot > tol_deg:
+            bad.append(u)
+    return bad, ", ".join(rep)
+
+
 def _map_icp_inputs(video_scene_dict, result_poses_dict_aligned, exclude, scans_by_token):
     """Point map of the aligned (trusted) passes for _map_icp_pass."""
     pts = []
@@ -908,10 +964,21 @@ if __name__ == '__main__':
             _sweeps = int(os.environ.get('MTGS_REG_MAP_ICP_SWEEPS', 2))
             _order = sorted(video_scene_dict.keys(),
                             key=lambda vt: -error_dict_aligned.get(vt, {}).get('mean_error', 0.0))
+            _pairwise = os.environ.get('MTGS_REG_SWEEP_PAIRWISE', '1') == '1'
             for _sw in range(_sweeps):
+                _clouds = {}
                 for vt in _order:
                     v = video_scene_dict[vt]
-                    _map = _map_icp_inputs(video_scene_dict, result_poses_dict_aligned, {vt}, _scans_by_token)
+                    _excl = {vt}
+                    if _pairwise:
+                        # register only against the passes vt does NOT already agree with (see _inconsistent_passes)
+                        _bad, _prep = _inconsistent_passes(vt, video_scene_dict, result_poses_dict_aligned, _scans_by_token, _clouds)
+                        if not _bad:
+                            CONSOLE.log(f"Sweep {_sw + 1}: video {vt.split('-')[-1]} agrees with every overlapping pass ({_prep}), left as is", style="yellow")
+                            continue
+                        CONSOLE.log(f"Sweep {_sw + 1}: video {vt.split('-')[-1]} disagrees with {[u.split('-')[-1] for u in _bad]} ({_prep}); registering onto them", style="yellow")
+                        _excl = set(video_scene_dict) - set(_bad)
+                    _map = _map_icp_inputs(video_scene_dict, result_poses_dict_aligned, _excl, _scans_by_token)
                     if _map is None or len(_map) < 5000:
                         continue
                     _cur = lambda t: result_poses_dict_aligned.get(t)
@@ -920,7 +987,7 @@ if __name__ == '__main__':
                         _d = [np.linalg.norm(fixed[t][:3, 3] - result_poses_dict_aligned[t][:3, 3]) for t in fixed if t in result_poses_dict_aligned]
                         CONSOLE.log(f"Sweep {_sw + 1}: video {vt.split('-')[-1]} moved onto the other passes "
                                     f"(median {np.median(_d) if _d else 0:.2f} m, max {max(_d) if _d else 0:.2f} m): {rep}", style="yellow")
-                        result_poses_dict_aligned.update(fixed)
+                        result_poses_dict_aligned.update(fixed); _clouds.pop(vt, None)
                     else:
                         CONSOLE.log(f"Sweep {_sw + 1}: video {vt.split('-')[-1]} left as is ({rep})", style="yellow")
             # the sweeps move passes onto each other, which can carry the whole block

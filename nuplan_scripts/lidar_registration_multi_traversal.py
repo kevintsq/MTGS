@@ -469,7 +469,37 @@ def _map_icp_pass(video, scans_by_token, init_pose_sets, ref_cloud, label=""):
 
     best, report = None, []
     ref = _cloud(ref_cloud)
+    # Trajectory-shape gate (2026-10-30, w2_07 video 407): an ICP chain that slipped in a turn kept its straight
+    # segment, so the rigid fit of the whole accumulation still passed (fitness/rmse are dominated by the good
+    # frames) while the turn came out up to 60 m / 155 deg off -- floaters in training and a sim camera driving
+    # into the geometry. A candidate whose poses, after a rigid fit onto the INS poses, deviate from the INS
+    # trajectory by more than MTGS_REG_MAP_ICP_TRAJ_M metres or MTGS_REG_MAP_ICP_TRAJ_DEG degrees is rejected.
+    ins_of = dict(init_pose_sets).get("ins")
+    traj_m = float(os.environ.get('MTGS_REG_MAP_ICP_TRAJ_M', 3.0)); traj_deg = float(os.environ.get('MTGS_REG_MAP_ICP_TRAJ_DEG', 8.0))
+
+    def _traj_dev(pose_of):
+        if ins_of is None or pose_of is ins_of:
+            return 0.0, 0.0
+        A, B = [], []
+        for info in video['frame_infos']:
+            a, b = pose_of(info['token']), ins_of(info['token'])
+            if a is not None and b is not None:
+                A.append(a); B.append(b)
+        if len(A) < 3:
+            return 0.0, 0.0
+        A = np.array(A); B = np.array(B); pa, pb = A[:, :3, 3], B[:, :3, 3]
+        ca, cb = pa.mean(0), pb.mean(0); U, _, Vt = np.linalg.svd((pa - ca).T @ (pb - cb))
+        D = np.diag([1, 1, np.sign(np.linalg.det(Vt.T @ U.T))]); Rk = Vt.T @ D @ U.T
+        res = np.linalg.norm((Rk @ (pa - ca).T).T + cb - pb, axis=1)
+        ya = np.degrees(np.arctan2([(Rk @ m[:3, :3])[1, 0] for m in A], [(Rk @ m[:3, :3])[0, 0] for m in A]))
+        yb = np.degrees(np.arctan2(B[:, 1, 0], B[:, 0, 0])); dy = (ya - yb + 180) % 360 - 180; dy -= np.median(dy)
+        return float(res.max()), float(np.abs(dy).max())
+
     for name, pose_of in init_pose_sets:
+        dev_m, dev_deg = _traj_dev(pose_of)
+        if dev_m > traj_m or dev_deg > traj_deg:
+            report.append(f"{name}: trajectory disagrees with INS by {dev_m:.1f} m / {dev_deg:.1f} deg (slipped chain), skipped")
+            continue
         src_pts = _accumulate(pose_of)
         if src_pts is None or len(src_pts) < 2000:
             report.append(f"{name}: no points"); continue

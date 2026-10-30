@@ -411,6 +411,16 @@ class CustomTrainer(Trainer):
             self.grad_scaler.load_state_dict(loaded_state["scalers"])
         CONSOLE.print(f"Done loading Nerfstudio checkpoint from {load_path}")
         if os.environ.get("MTGS_RESUMED") == "1":
+            # the run's config.yml must not keep pointing at the mirror checkpoint it resumed from: the render /
+            # eval / export stages read config.yml and would look for that step in nerfstudio_models (pa_loc_0191,
+            # 2026-10-30: eval died on step-45000 after training to 90002)
+            self.config.load_dir = None
+            self.config.load_step = None
+            try:
+                self.config.save_config()
+            except Exception as e:   # never let bookkeeping stop a resumed run
+                CONSOLE.print(f"[resume] could not rewrite config.yml: {e}")
+        if os.environ.get("MTGS_RESUMED") == "1":
             # nerfstudio trains range(start, start + max_num_iterations): shorten it so a resumed run ends at
             # the original final step instead of running a full schedule on top of the checkpoint
             total = self.config.max_num_iterations

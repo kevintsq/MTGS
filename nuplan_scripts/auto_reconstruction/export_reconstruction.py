@@ -11,6 +11,7 @@ from pathlib import Path
 os.environ["NERFSTUDIO_DATAPARSER_CONFIGS"] = "nuplan=mtgs.config.nuplan_dataparser:nuplan_dataparser"
 os.environ["NERFSTUDIO_METHOD_CONFIGS"] = "mtgs_st=mtgs.config.MTGS_ST:method,mtgs=mtgs.config.MTGS:method"
 
+import nuplan_scripts.utils.ckpt_compat  # noqa: F401  (torch.load weights_only=False for our own checkpoints)
 from nuplan_scripts.utils.config import load_config
 from nuplan_scripts.utils.video_scene_dict_tools import VideoScene
 from nuplan_scripts.utils.constants import CONSOLE

@@ -401,7 +401,7 @@ class NuplanDataParser(DataParser):
         poses[:, :3, 3] *= self.config.scale_factor
 
         if self.config.load_cam_optim_from is not None:
-            model = torch.load(self.config.load_cam_optim_from, map_location='cpu')
+            model = torch.load(self.config.load_cam_optim_from, map_location='cpu', weights_only=False)   # own checkpoint; torch>=2.6 weights_only rejects the numpy scalars a mid-run ckpt carries (rh_w2_06 48k, 2026-10-30)
             pose_adj = model['pipeline'][self.config.cam_optim_key]
             if pose_adj.shape[0] != poses.shape[0]:
                 CONSOLE.log(f"[WARNING] pose_adj shape {pose_adj.shape[0]} does not match poses shape {poses.shape[0]}")

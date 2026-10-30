@@ -284,7 +284,7 @@ def eval_setup(
     pipeline.eval()
 
     # load checkpointed information
-    loaded_state = torch.load(checkpoint_path, map_location="cpu")
+    loaded_state = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     pipeline.load_pipeline(loaded_state["pipeline"], loaded_state["step"])
 
     return config, pipeline, checkpoint_path, loaded_state["step"]

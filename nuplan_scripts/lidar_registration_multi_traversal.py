@@ -672,10 +672,15 @@ if __name__ == '__main__':
     mean_gate = max(PRE_MEAN, PRE_REL * float(np.median(_mean)))
     CONSOLE.log(f"Pre-alignment outlier gates: EPE > {epe_gate:.2f} m, mean > {mean_gate:.2f} m "
                 f"(block medians {np.median(_epe):.2f} / {np.median(_mean):.2f})")
+    # Absolute ceiling on top of the relative gate (2026-10-30, w2_02: half the passes diverged to 145-189 m, the
+    # block median became 73 m and the relative gate let 157 m and 145 m through). A raw EPE of tens of metres is a
+    # lost odometry chain, never an INS bias.
+    PRE_ABS = float(os.environ.get('MTGS_REG_PRE_ABS_EPE', 20.0))
     outliers = [vt for vt in list(video_scene_dict.keys())
                 if vt not in keep_first
                 and (error_dict[vt]['max_end_point_error'] > epe_gate
-                     or error_dict[vt]['mean_error'] > mean_gate)]
+                     or error_dict[vt]['mean_error'] > mean_gate
+                     or error_dict[vt]['max_end_point_error'] > PRE_ABS)]
     pre_dropped = {}
     if outliers and len(outliers) < len(video_scene_dict):
         for vt in outliers:
@@ -726,6 +731,9 @@ if __name__ == '__main__':
     _e = np.array([error_dict_aligned[vt]['max_end_point_error'] for vt in video_scene_dict if vt not in gps_videos])
     qa_mean_gate = max(float(os.environ.get('MTGS_REG_QA_MEAN', 0.5)), QA_REL * float(np.median(_m)) if len(_m) else 0.0)
     qa_epe_gate = max(float(os.environ.get('MTGS_REG_QA_EPE', 1.0)), QA_REL * float(np.median(_e)) if len(_e) else 0.0)
+    # Ceilings on the relative gates (2026-10-30): when most passes are broken the median is broken too.
+    qa_epe_gate = min(qa_epe_gate, max(float(os.environ.get('MTGS_REG_QA_EPE', 1.0)), float(os.environ.get('MTGS_REG_QA_ABS_EPE', 5.0))))
+    qa_mean_gate = min(qa_mean_gate, max(float(os.environ.get('MTGS_REG_QA_MEAN', 0.5)), float(os.environ.get('MTGS_REG_QA_ABS_MEAN', 2.0))))
     CONSOLE.log(f"Post-alignment QA gates: EPE > {qa_epe_gate:.2f} m, mean > {qa_mean_gate:.2f} m "
                 f"(block medians {np.median(_e) if len(_e) else 0:.2f} / {np.median(_m) if len(_m) else 0:.2f})")
     for video_token in list(video_scene_dict.keys()):
@@ -863,6 +871,32 @@ if __name__ == '__main__':
                 video_scene_dict.pop(video_token)
             if len(video_scene_dict) == 0:
                 raise ValueError("All videos have bad registration result.")
+
+        # GPS-pass consolidation (MTGS_REG_GPS_MAPICP, default on; 2026-10-30, w2_02 / w2_06 / v2_07 / nb_18: 4-6
+        # passes left on raw GPS poses, offset from each other by the GPS error -> visible doubling). Every pass
+        # that is still on GPS poses is registered by map ICP (INS start, trajectory gate, per-frame refinement)
+        # onto the passes already trusted, largest first; a newly registered pass joins the reference. When NO pass
+        # is trusted, the pinned (own) pass, else the longest, is taken as the reference on its GPS poses.
+        if _scans_by_token and gps_videos and os.environ.get('MTGS_REG_GPS_MAPICP', '1') == '1':
+            _live = [vt for vt in video_scene_dict if vt in gps_videos]
+            _trusted = {vt for vt in video_scene_dict if vt not in gps_videos}
+            if not _trusted and len(_live) > 1:
+                _root = sorted(_live, key=lambda vt: (not _is_pinned(video_scene_dict[vt]), -len(video_scene_dict[vt]['frame_infos'])))[0]
+                _trusted.add(_root); _live.remove(_root)
+                CONSOLE.log(f"No ICP-registered pass to anchor to: video {_root.split('-')[-1]} (GPS poses) is the reference", style="yellow")
+            for vt in sorted(_live, key=lambda vt: -len(video_scene_dict[vt]['frame_infos'])):
+                _map = _map_icp_inputs(video_scene_dict, result_poses_dict_aligned, set(video_scene_dict) - _trusted, _scans_by_token)
+                if _map is None or len(_map) < 5000:
+                    continue
+                _cur = lambda t: result_poses_dict_aligned.get(t)
+                fixed, rep = _map_icp_pass(video_scene_dict[vt], _scans_by_token, [("ins", _cur)], _map, vt)
+                if fixed is not None:
+                    _d = [np.linalg.norm(fixed[t][:3, 3] - result_poses_dict_aligned[t][:3, 3]) for t in fixed if t in result_poses_dict_aligned]
+                    CONSOLE.log(f"GPS pass {vt.split('-')[-1]} registered onto the trusted passes by map ICP "
+                                f"(moved median {np.median(_d) if _d else 0:.2f} m, max {max(_d) if _d else 0:.2f} m): {rep}", style="yellow")
+                    result_poses_dict_aligned.update(fixed); gps_videos.discard(vt); _trusted.add(vt)
+                else:
+                    CONSOLE.log(f"GPS pass {vt.split('-')[-1]} stays on GPS poses (map ICP: {rep})", style="bold red")
 
         # MTGS_REG_MAP_ICP_ALL=1: inter-pass consistency sweep. The passes only agree
         # as well as the odometry chain and the x/y Kabsch let them (fq_loc_0182,

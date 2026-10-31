@@ -184,6 +184,15 @@ def run_bundle_adjustment(
     #              adopted reconstructions were actually built with
     #   nointr  -- poses only; intrinsics are left to the triangulator's refinement
     _ba_mode = os.environ.get("COLMAP_BA_MODE", "full")
+    if _ba_mode == "distonly":
+        # COLMAP_BA_MODE=distonly (user 2026-10-31: "让colmap优化但限制同车同相机内参相同"): in the joint model every pass
+        # of a vehicle already shares one camera (create_cameras_per_vehicle), so refining here gives ONE lens per
+        # vehicle-camera; the calibrated focal length and principal point are kept (a forward-driving rig constrains
+        # fy weakly: per-video refinement drifted fy to 0.90-0.96 of the calibration in ir_w2_06) and only the
+        # OPENCV distortion is refined. The triangulator gets the same restriction below.
+        colmap_point_triangulator_args += ["--Mapper.ba_refine_focal_length", "0",
+                                           "--Mapper.ba_refine_principal_point", "0",
+                                           "--Mapper.ba_refine_extra_params", "1"]
     if _ba_mode == "legacy":
         colmap_bundle_adjuster_args = [
             colmap_exe, "bundle_adjuster",
@@ -208,6 +217,9 @@ def run_bundle_adjustment(
             for flag in ("--BundleAdjustment.refine_focal_length",
                          "--BundleAdjustment.refine_extra_params"):
                 colmap_bundle_adjuster_args[colmap_bundle_adjuster_args.index(flag) + 1] = "0"
+        elif _ba_mode == "distonly":
+            colmap_bundle_adjuster_args[colmap_bundle_adjuster_args.index("--BundleAdjustment.refine_focal_length") + 1] = "0"
+            colmap_bundle_adjuster_args[colmap_bundle_adjuster_args.index("--BundleAdjustment.refine_extra_params") + 1] = "1"
     print(f"[ba] COLMAP_BA_MODE={_ba_mode}: {' '.join(colmap_bundle_adjuster_args[1:])}", flush=True)
     # MTGS_JOINT_SFM=1: pure structure-from-motion -- the mapper reconstructs from the matches
     # alone (no pose priors), intrinsics fixed to the calibration; the largest model becomes

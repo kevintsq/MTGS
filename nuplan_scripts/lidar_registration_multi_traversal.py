@@ -559,7 +559,7 @@ def _map_icp_frames(video, scans_by_token, poses, ref, voxel, max_dt=1.0, max_dy
                     o3d.pipelines.registration.ICPConvergenceCriteria(max_iteration=30))
                 T = res.transformation
             D = T @ np.linalg.inv(poses[t])
-            if res.fitness >= 0.3 and np.linalg.norm(D[:3, 3]) <= max_dt:
+            if res.fitness >= 0.3 and np.linalg.norm(T[:3, 3] - poses[t][:3, 3]) <= max_dt:   # scan-origin displacement, see below
                 ego_rv.append(poses[t][:3, :3].T @ _R.from_matrix(D[:3, :3]).as_rotvec(degrees=True))   # roll (x), pitch (y), yaw (z) about the frame's own axes
         if len(ego_rv) >= 10:
             med = np.median(np.array(ego_rv), axis=0); roll, pitch = float(med[0]), float(med[1])
@@ -571,6 +571,15 @@ def _map_icp_frames(video, scans_by_token, poses, ref, voxel, max_dt=1.0, max_dy
                 tilt_rep = f"pass tilt roll {roll:+.2f} / pitch {pitch:+.2f} deg ({len(ego_rv)} frames), not applied; "
         else:
             tilt_rep = f"pass tilt: only {len(ego_rv)} frames on the map, skipped; "
+    # Corrections are gated and smoothed AT THE SCAN ORIGIN (2026-10-31, w2_06 rs_). The map-frame form
+    # D = T @ inv(pose) carries a translation of theta*|p| for a rotation theta of a scan |p| metres from the
+    # block origin (1.4 deg at 40 m is already 1 m), so the max_dt gate silently rejected every rotational
+    # correction beyond ~0.3-1 deg once a pass was away from the origin, the window median mixed rotation-
+    # induced translations of neighbouring frames, and the cross-vehicle roll of veh-28 vs veh-40 survived five
+    # sweeps unchanged (pass QA 1.1-1.7 deg, "median correction 0.75 m, max 1.00 m" = theta*|p| at the cap).
+    # The rotation is kept as the map-frame rotation vector of D (position independent), the translation as
+    # the displacement of the scan origin; MTGS_REG_MAP_ICP_FRAME_ROT_DEG bounds the rotation per frame.
+    max_rot_deg = float(os.environ.get('MTGS_REG_MAP_ICP_FRAME_ROT_DEG', 3.0))
     corr, n_ok = [], 0
     for t in tokens:
         P = scans_by_token[t][:, :3]
@@ -582,24 +591,28 @@ def _map_icp_frames(video, scans_by_token, poses, ref, voxel, max_dt=1.0, max_dy
                 src, ref, c, T, o3d.pipelines.registration.TransformationEstimationPointToPlane(),
                 o3d.pipelines.registration.ICPConvergenceCriteria(max_iteration=30))
             T = res.transformation
-        D = T @ np.linalg.inv(poses[t])                     # correction in the map frame
-        dt = float(np.linalg.norm(D[:3, 3])); dyaw = abs(float(_R.from_matrix(D[:3, :3]).as_euler('zyx', degrees=True)[0]))
-        ok = res.fitness >= 0.3 and dt <= max_dt and dyaw <= max_dyaw_deg
-        corr.append(D if ok else None); n_ok += ok
+        D = T @ np.linalg.inv(poses[t])                     # correction in the map frame (rotation part used)
+        rvec = _R.from_matrix(D[:3, :3]).as_rotvec()
+        dp = T[:3, 3] - poses[t][:3, 3]                     # displacement of the scan origin
+        dt = float(np.linalg.norm(dp)); drot = float(np.degrees(np.linalg.norm(rvec)))
+        dyaw = abs(float(_R.from_matrix(D[:3, :3]).as_euler('zyx', degrees=True)[0]))
+        ok = res.fitness >= 0.3 and dt <= max_dt and drot <= max_rot_deg and dyaw <= max_dyaw_deg
+        corr.append((rvec, dp) if ok else None); n_ok += ok
     # smooth: replace each correction by the component-wise median of its window
-    # (translation and rotation vector), so a single bad ICP frame cannot kink the pass
-    rv = [(_R.from_matrix(D[:3, :3]).as_rotvec(), D[:3, 3]) if D is not None else None for D in corr]
+    # (rotation vector and origin displacement), so a single bad ICP frame cannot kink the pass
     out = dict(poses)
     for i, t in enumerate(tokens):
-        nb = [rv[j] for j in range(max(0, i - win // 2), min(len(rv), i + win // 2 + 1)) if rv[j] is not None]
+        nb = [corr[j] for j in range(max(0, i - win // 2), min(len(corr), i + win // 2 + 1)) if corr[j] is not None]
         if len(nb) < 2:
             continue
         r = np.median(np.array([x[0] for x in nb]), axis=0); tr = np.median(np.array([x[1] for x in nb]), axis=0)
-        D = np.eye(4); D[:3, :3] = _R.from_rotvec(r).as_matrix(); D[:3, 3] = tr
-        out[t] = D @ poses[t]
-    mags = [float(np.linalg.norm(D[:3, 3])) for D in corr if D is not None]
-    return out, (tilt_rep + f"per-frame map ICP: {n_ok}/{len(tokens)} frames refined, median correction {np.median(mags) if mags else 0:.2f} m, max {max(mags) if mags else 0:.2f} m")
-
+        M = np.eye(4); M[:3, :3] = _R.from_rotvec(r).as_matrix() @ poses[t][:3, :3]; M[:3, 3] = poses[t][:3, 3] + tr
+        out[t] = M
+    mags = [float(np.linalg.norm(x[1])) for x in corr if x is not None]
+    rots = [float(np.degrees(np.linalg.norm(x[0]))) for x in corr if x is not None]
+    return out, (tilt_rep + f"per-frame map ICP: {n_ok}/{len(tokens)} frames refined, median correction "
+                 f"{np.median(mags) if mags else 0:.2f} m / {np.median(rots) if rots else 0:.2f} deg, "
+                 f"max {max(mags) if mags else 0:.2f} m / {max(rots) if rots else 0:.2f} deg")
 
 def _pass_accumulation(video, scans_by_token, poses):
     """World-frame accumulation of a pass (every 2nd frame, r < 60 m, every 3rd point) at `poses`."""

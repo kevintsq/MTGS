@@ -124,14 +124,13 @@ def run_point_triangulator(
         "--Mapper.ba_global_max_refinements", "3",
         "--Mapper.ba_refine_sensor_from_rig", "0",
     ]
-    # COLMAP_BA_MODE=distonly (2026-10-31): --refine_intrinsics 1 leaves COLMAP's Mapper defaults in force, which
-    # refine the focal length during the global BAs of the triangulation; is_w2_06 came out with fy 1380/1422
-    # although the later bundle_adjuster had refine_focal_length 0 (the restriction only lived in
-    # bundle_adjustment.py). Keep the calibrated focal and principal point here too, refine only the distortion.
+    # COLMAP_BA_MODE=distonly (2026-10-31): the intrinsics stay at the calibration during triangulation and only the
+    # standalone bundle_adjuster refines the distortion. COLMAP's point_triangulator copies --refine_intrinsics into
+    # ba_refine_focal_length AND ba_refine_extra_params (RunPointTriangulatorImpl), overriding any --Mapper.ba_refine_*
+    # flag: with --refine_intrinsics 1 the focal length was refined in every global BA of the triangulation
+    # (is_/ij_/if_w2_06: fy 1300-1420 for a 1545 calibration, FULL_OPENCV coefficients degenerate).
     if os.environ.get("COLMAP_BA_MODE") == "distonly":
-        colmap_point_triangulator_args += ["--Mapper.ba_refine_focal_length", "0",
-                                           "--Mapper.ba_refine_principal_point", "0",
-                                           "--Mapper.ba_refine_extra_params", "1"]
+        colmap_point_triangulator_args[colmap_point_triangulator_args.index("--refine_intrinsics") + 1] = "0"
 
     # point triangulation
     try:

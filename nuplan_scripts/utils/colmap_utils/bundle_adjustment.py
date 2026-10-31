@@ -189,10 +189,10 @@ def run_bundle_adjustment(
         # of a vehicle already shares one camera (create_cameras_per_vehicle), so refining here gives ONE lens per
         # vehicle-camera; the calibrated focal length and principal point are kept (a forward-driving rig constrains
         # fy weakly: per-video refinement drifted fy to 0.90-0.96 of the calibration in ir_w2_06) and only the
-        # OPENCV distortion is refined. The triangulator gets the same restriction below.
-        colmap_point_triangulator_args += ["--Mapper.ba_refine_focal_length", "0",
-                                           "--Mapper.ba_refine_principal_point", "0",
-                                           "--Mapper.ba_refine_extra_params", "1"]
+        # OPENCV distortion is refined -- by the bundle_adjuster only: COLMAP's point_triangulator copies
+        # --refine_intrinsics into ba_refine_focal_length and ba_refine_extra_params, overriding --Mapper.ba_refine_*
+        # (is_/ij_/if_w2_06 refined fy to 1300-1420 in the triangulation), so the triangulation keeps the calibration.
+        colmap_point_triangulator_args[colmap_point_triangulator_args.index("--refine_intrinsics") + 1] = "0"
     if _ba_mode == "legacy":
         colmap_bundle_adjuster_args = [
             colmap_exe, "bundle_adjuster",

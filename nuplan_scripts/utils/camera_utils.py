@@ -1,3 +1,4 @@
+import os
 #-------------------------------------------------------------------------------#
 # MTGS: Multi-Traversal Gaussian Splatting (https://arxiv.org/abs/2503.12552)   #
 # Source code: https://github.com/OpenDriveLab/MTGS                             #
@@ -138,7 +139,9 @@ def undistort_image_keep_focal_length(image, intrinsic, distortion, interpolatio
     return image_undistorted
 
 def undistort_image_with_cam_info(image, cam_info, return_mask=False, interpolation='linear', mode='optimal'):
-    if 'colmap_param' in cam_info:
+    # MTGS_USE_COLMAP_INTRINSICS=0: the calibrated 5-param lens everywhere (training, depth, point cloud), never the
+    # per-video COLMAP refinement (2026-10-31, see the dataparser's use_colmap_intrinsics)
+    if 'colmap_param' in cam_info and os.environ.get('MTGS_USE_COLMAP_INTRINSICS', '1') != '0':
         intrinsic = cam_info['colmap_param']['cam_intrinsic']
         distortion = cam_info['colmap_param']['distortion']
         intrinsic = intrinsic.copy()

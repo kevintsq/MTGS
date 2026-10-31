@@ -8,8 +8,12 @@ import numpy as np
 from pyquaternion import Quaternion
 
 from nuplan_scripts.utils.colmap_utils.database import COLMAPDatabase
+from nuplan_scripts.utils.colmap_utils.read_write_model import CAMERA_MODEL_NAMES
 
 def create_colmap_database(colmap_path, input_model='sparse_model', camera_type='OPENCV'):
+    # The model id comes from each cameras.txt line (OPENCV=4, FULL_OPENCV=6, PINHOLE=1); the old
+    # "4 if OPENCV else 1" wrote FULL_OPENCV rows (12 params) as OPENCV -> colmap aborted in
+    # feature_extractor with "num_params == CameraModelNumParams (12 vs. 8)" (if_w2_06, 2026-10-31).
     camera_type = 4 if camera_type == 'OPENCV' else 1
 
     colmap_db = COLMAPDatabase.connect(f"{colmap_path}/database.db")
@@ -18,7 +22,7 @@ def create_colmap_database(colmap_path, input_model='sparse_model', camera_type=
         cameras = cameras.strip().split()
         colmap_db.add_camera(
             camera_id=int(cameras[0]),
-            model=camera_type, # 1 for PINHOLE, 4 for OPENCV
+            model=CAMERA_MODEL_NAMES[cameras[1]].model_id if cameras[1] in CAMERA_MODEL_NAMES else camera_type,
             width=int(cameras[2]),
             height=int(cameras[3]),
             params=cameras[4:],

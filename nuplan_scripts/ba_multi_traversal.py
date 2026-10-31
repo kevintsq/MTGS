@@ -71,11 +71,23 @@ def create_cameras_per_vehicle(video_scene_dict, colmap_path):
                 cam_info = cam_infos[cam]
                 intrinsic = cam_info['cam_intrinsic']
                 distortion = cam_info['distortion']
-                line = (
-                    f"{global_cam_id} OPENCV 1920 1080 "
-                    + f"{intrinsic[0, 0]} {intrinsic[1, 1]} {intrinsic[0, 2]} {intrinsic[1, 2]} "
-                    + f"{distortion[0]} {distortion[1]} {distortion[2]} {distortion[3]}\n"
-                )
+                # MTGS_COLMAP_CAM_MODEL=FULL_OPENCV (2026-10-31): the calibrated lens has k3 = -0.052, which the
+                # 4-parameter OPENCV model cannot represent; every OPENCV refinement traded it for fy (0.94-0.98 of
+                # the calibration on all 32 vehicle-cameras of loc_0191) and k1/k2. FULL_OPENCV starts from the exact
+                # calibration (k4..k6 = 0); refinement then changes only what the images support.
+                if os.environ.get('MTGS_COLMAP_CAM_MODEL', 'OPENCV') == 'FULL_OPENCV':
+                    k3 = float(distortion[4]) if len(distortion) > 4 else 0.0
+                    line = (
+                        f"{global_cam_id} FULL_OPENCV 1920 1080 "
+                        + f"{intrinsic[0, 0]} {intrinsic[1, 1]} {intrinsic[0, 2]} {intrinsic[1, 2]} "
+                        + f"{distortion[0]} {distortion[1]} {distortion[2]} {distortion[3]} {k3} 0 0 0\n"
+                    )
+                else:
+                    line = (
+                        f"{global_cam_id} OPENCV 1920 1080 "
+                        + f"{intrinsic[0, 0]} {intrinsic[1, 1]} {intrinsic[0, 2]} {intrinsic[1, 2]} "
+                        + f"{distortion[0]} {distortion[1]} {distortion[2]} {distortion[3]}\n"
+                    )
                 f_cameras.write(line)
                 exsiting_veh_name[veh_name][cam] = global_cam_id
                 global_cam_id += 1
@@ -523,6 +535,10 @@ def align_model(video_scene: VideoScene, video_scene_dict, colmap_path, thresh=1
         elif cameras[key].model == 'OPENCV':
             K = np.array([[p[0], 0, p[2], 0, p[1], p[3], 0, 0, 1]]).reshape(3, 3)
             dist = np.array([p[4], p[5], p[6], p[7], 0.])
+        elif cameras[key].model == 'FULL_OPENCV':
+            # k1 k2 p1 p2 k3 k4 k5 k6 -- the 8-coefficient rational model cv2.undistort / initUndistortRectifyMap accept as is
+            K = np.array([[p[0], 0, p[2], 0, p[1], p[3], 0, 0, 1]]).reshape(3, 3)
+            dist = np.array([p[4], p[5], p[6], p[7], p[8], p[9], p[10], p[11]])
         else:
             raise NotImplementedError
         camera_params[cameras[key].id] = (K, dist)

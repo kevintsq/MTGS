@@ -42,7 +42,7 @@ class StackRGBPointCloud:
             lidar2ego = info['lidar2ego']
             for cam in info['cams']:
                 cam_info = info['cams'][cam]
-                if 'colmap_param' in cam_info:
+                if 'colmap_param' in cam_info and os.environ.get('MTGS_USE_COLMAP_INTRINSICS', '1') != '0':   # same lens as training (2026-10-31)
                     intrinsic = cam_info['colmap_param']['cam_intrinsic']
                 else:
                     intrinsic = cam_info['cam_intrinsic']

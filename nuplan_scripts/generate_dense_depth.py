@@ -64,7 +64,9 @@ class MetricDepthError:
                 ego2cam[:3, 3] = -ego2cam[:3, :3] @ cam_info['sensor2ego_translation']
                 lidar2cam = ego2cam @ lidar2ego
 
-                if 'colmap_param' in cam_info:
+                # Same lens as training: MTGS_USE_COLMAP_INTRINSICS=0 (calibrated 5-param, k3 kept) must apply here
+                # too, otherwise the depth maps are undistorted through the 4-param COLMAP lens (2026-10-31).
+                if 'colmap_param' in cam_info and os.environ.get('MTGS_USE_COLMAP_INTRINSICS', '1') != '0':
                     intrinsic = cam_info['colmap_param']['cam_intrinsic']
                     distortion = cam_info['colmap_param']['distortion']
                     intrinsic = intrinsic.copy()
@@ -291,7 +293,7 @@ if __name__ == '__main__':
         # actually uses — which is the BA-refined colmap_param when present, and it
         # differs per camera. Key on exactly that, or the stack hits mismatched shapes.
         def _calib_key(cam_info):
-            src = cam_info.get('colmap_param', cam_info)
+            src = cam_info.get('colmap_param', cam_info) if os.environ.get('MTGS_USE_COLMAP_INTRINSICS', '1') != '0' else cam_info
             return (np.asarray(src['cam_intrinsic']).tobytes(),
                     np.asarray(src['distortion']).tobytes())
 

@@ -237,8 +237,14 @@ def run_bundle_adjustment(
             os.makedirs(os.path.join(raw, str(_i)), exist_ok=True)
         fix = os.environ.get("COLMAP_REFINE_INTRINSICS", "0") != "1"
         if mode == "global":
+            # 2026-11-01: the global mapper (GLOMAP in COLMAP >= 4.3) refines focal/extra params by default;
+            # honour COLMAP_REFINE_INTRINSICS like the incremental branch (calibrated lens fixed when 0).
             mapper_args = [colmap_exe, "global_mapper", "--database_path", f"{colmap_path}/database.db",
-                           "--image_path", f"{colmap_path}/images", "--output_path", raw]
+                           "--image_path", f"{colmap_path}/images", "--output_path", raw,
+                           "--GlobalMapper.num_threads", f"{num_workers}",
+                           "--GlobalMapper.ba_refine_focal_length", "0" if fix else "1",
+                           "--GlobalMapper.ba_refine_principal_point", "0",
+                           "--GlobalMapper.ba_refine_extra_params", "0" if fix else "1"]
         else:
             mapper_args = [colmap_exe, "mapper", "--database_path", f"{colmap_path}/database.db",
                            "--image_path", f"{colmap_path}/images", "--output_path", raw,

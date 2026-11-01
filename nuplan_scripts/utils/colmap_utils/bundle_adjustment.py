@@ -242,6 +242,9 @@ def run_bundle_adjustment(
             mapper_args = [colmap_exe, "global_mapper", "--database_path", f"{colmap_path}/database.db",
                            "--image_path", f"{colmap_path}/images", "--output_path", raw,
                            "--GlobalMapper.num_threads", f"{num_workers}",
+                           # Ceres on the CPU: COLMAP 4.3 defaults gp_use_gpu/ba_ceres_use_gpu to 1 and the GPU
+                           # solver gives worse models (user finding, 2026-11-01)
+                           "--GlobalMapper.gp_use_gpu", "0", "--GlobalMapper.ba_ceres_use_gpu", "0",
                            "--GlobalMapper.ba_refine_focal_length", "0" if fix else "1",
                            "--GlobalMapper.ba_refine_principal_point", "0",
                            "--GlobalMapper.ba_refine_extra_params", "0" if fix else "1"]

@@ -567,6 +567,7 @@ def align_model(video_scene: VideoScene, video_scene_dict, colmap_path, thresh=1
         images_out[token] = cam_info
 
     raw_cam_T = {}
+    raw_cam_R = {}
     token_video = {}
     for video_token in video_scene_dict:
         frame_infos = video_scene_dict[video_token]['frame_infos']
@@ -594,6 +595,7 @@ def align_model(video_scene: VideoScene, video_scene_dict, colmap_path, thresh=1
                     continue
 
                 raw_cam_T[token] = cam2global[:3, 3]
+                raw_cam_R[token] = cam2global[:3, :3]
                 token_video[token] = video_token
 
     colmap_cam_array = []
@@ -604,8 +606,31 @@ def align_model(video_scene: VideoScene, video_scene_dict, colmap_path, thresh=1
     colmap_cam_array = np.asarray(colmap_cam_array)
     raw_cam_array = np.asarray(raw_cam_array)
 
-    scale, R, t = compute_transformation_matrix_with_scaling(colmap_cam_array, raw_cam_array)
     tokens_list = list(images_out.keys())
+    colmap_cam_R = np.array([Quaternion(images_out[tk]['sensor2global_rotation']).rotation_matrix for tk in tokens_list])
+    raw_cam_R_arr = np.array([raw_cam_R[tk] for tk in tokens_list])
+
+    def _fit_sim3(A, B, RA, RB):
+        # Sim3 with B ~ s R A + t. The ROTATION comes from the camera orientations (chordal mean of RB RA^T), the
+        # scale/translation from the centres given that rotation (MTGS_SIM3_ROT=centres restores the old fit).
+        # Camera centres of a drive are nearly coplanar, so a centre-only Umeyama fit leaves the rotation about the
+        # road axis free: the 1.7-2.7 deg "world tilt" that pj_/ph_/pm_ carried into training (2026-11-01).
+        s0, R0, t0 = compute_transformation_matrix_with_scaling(A, B)
+        if os.environ.get('MTGS_SIM3_ROT', 'orient') != 'orient' or RA is None or len(A) < 3:
+            return s0, R0, t0
+        M = np.einsum('nij,nkj->ik', RB, RA)
+        U, S_, Vt = np.linalg.svd(M)
+        R_ = U @ np.diag([1., 1., np.sign(np.linalg.det(U @ Vt))]) @ Vt
+        ma, mb = A.mean(0), B.mean(0)
+        Ar = (A - ma) @ R_.T
+        s_ = float((Ar * (B - mb)).sum() / (Ar ** 2).sum())
+        t_ = mb - s_ * R_ @ ma
+        dang = np.degrees(np.arccos(np.clip((np.trace(R0.T @ R_) - 1) / 2, -1, 1)))
+        CONSOLE.log(f'[align] Sim3 rotation from camera orientations: {dang:.2f} deg away from the centre-only fit '
+                    f'(scale {s_:.4f} vs {s0:.4f}, {len(A)} cameras)')
+        return s_, R_, t_
+
+    scale, R, t = _fit_sim3(colmap_cam_array, raw_cam_array, colmap_cam_R, raw_cam_R_arr)
     sim3_of = {}                                     # video token -> (scale, R, t)
     if os.environ.get('MTGS_JOINT_SFM') == '1':
         # Pure SfM can put a pass that shares no views with the others anywhere in the model
@@ -620,7 +645,7 @@ def align_model(video_scene: VideoScene, video_scene_dict, colmap_path, thresh=1
         keep_v = sorted(set(vids)); out_v = []
         while len(keep_v) > 1:
             m_ = np.isin(vids, keep_v)
-            scale, R, t = compute_transformation_matrix_with_scaling(colmap_cam_array[m_], raw_cam_array[m_])
+            scale, R, t = _fit_sim3(colmap_cam_array[m_], raw_cam_array[m_], colmap_cam_R[m_], raw_cam_R_arr[m_])
             res = np.linalg.norm(scale * colmap_cam_array @ R.T + t - raw_cam_array, axis=1)
             med = {v_: float(np.median(res[vids == v_])) for v_ in keep_v}
             worst = max(med, key=med.get)
@@ -628,14 +653,14 @@ def align_model(video_scene: VideoScene, video_scene_dict, colmap_path, thresh=1
                 break
             keep_v.remove(worst); out_v.append(worst)
         m_ = np.isin(vids, keep_v)
-        scale, R, t = compute_transformation_matrix_with_scaling(colmap_cam_array[m_], raw_cam_array[m_])
+        scale, R, t = _fit_sim3(colmap_cam_array[m_], raw_cam_array[m_], colmap_cam_R[m_], raw_cam_R_arr[m_])
         res = np.linalg.norm(scale * colmap_cam_array @ R.T + t - raw_cam_array, axis=1)
         med = {v_: float(np.median(res[vids == v_])) for v_ in set(vids)}
         bad = [v_ for v_ in out_v if med[v_] > lim]
         for v_ in bad:
             m_ = vids == v_
             if m_.sum() >= 6:
-                sim3_of[v_] = compute_transformation_matrix_with_scaling(colmap_cam_array[m_], raw_cam_array[m_])
+                sim3_of[v_] = _fit_sim3(colmap_cam_array[m_], raw_cam_array[m_], colmap_cam_R[m_], raw_cam_R_arr[m_])
         if bad:
             CONSOLE.log(f'[sfm align] disconnected passes {sorted(bad)} (median residual '
                         f'{", ".join(f"{med[b]:.1f}" for b in sorted(bad))} m under the joint fit of '

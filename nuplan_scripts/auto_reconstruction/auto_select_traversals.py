@@ -106,7 +106,17 @@ def select(stats, test_logs, k, require_logs=()):
     # the served scene is required (MTGS_REQUIRE_WINDOWS: "log=t0-t1;...", us).
     # Without windows every pass of a required log takes a slot, and a block with
     # four served logs had no slot left for covering the routes (loc_0093).
-    req = sorted([s for s in usable if _required(s)], key=lambda s: -s["n"])[:k]
+    req = sorted([s for s in usable if _required(s)], key=lambda s: -s["n"])
+    # A required log WITHOUT a window keeps only its longest pass as required (2026-11-03): with every pass required,
+    # gap3_01's three remaining logs (2 passes each) filled all six slots -> three logs' worth of viewpoints, blurry
+    # far buildings. Its other passes still compete for the free slots below. MTGS_REQUIRE_ALL_PASSES=1: old rule.
+    if os.environ.get('MTGS_REQUIRE_ALL_PASSES', '0') != '1':
+        seen, one = set(), []
+        for s_ in req:
+            if s_["log"] in windows or s_["log"] not in seen:
+                one.append(s_); seen.add(s_["log"])
+        req = one
+    req = req[:k]
     req_idx = {s["idx"] for s in req}
     test = sorted([s for s in usable
                    if s["log"] in test_logs and s["idx"] not in req_idx],
@@ -123,6 +133,17 @@ def select(stats, test_logs, k, require_logs=()):
     COV_R = float(os.environ.get('MTGS_COV_RADIUS', 15.0))
     COV_K = int(os.environ.get('MTGS_COV_FRAMES', 30))   # trajectories here are ~5 Hz; 30 ~ 12 frames of the 2 Hz vsd
     targets = np.concatenate([s["traj"] for s in req]) if req else np.zeros((0, 2))
+    # MTGS_SERVED_ROUTES=<json {scene: [[x, y], ...]}> (global xy): the routes of the scenes this block will serve.
+    # Without them coverage only targets the required logs' own passes; when those are rainy (dropped above) or the
+    # scenes' logs are not in the block at all, nothing pulled in passes along the served routes (gap3_01,
+    # 2026-11-03: 3/5 required logs left, far buildings and a turn unobserved).
+    served = os.environ.get('MTGS_SERVED_ROUTES', '')
+    if served and os.path.exists(served):
+        import json
+        routes = [np.asarray(r, dtype=float)[:, :2] for r in json.load(open(served)).values() if len(r)]
+        if routes:
+            targets = np.concatenate([targets] + routes)
+            print(f"[auto_select] coverage targets include {len(routes)} served scene routes ({served})", flush=True)
     if len(targets) > 400:
         targets = targets[:: len(targets) // 400 + 1]
     def frames_near(pts, traj):

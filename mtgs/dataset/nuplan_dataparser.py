@@ -483,6 +483,12 @@ class NuplanDataParser(DataParser):
         pcd = pcd.remove_statistical_outlier(nb_neighbors=20, std_ratio=0.5)[0]
         pcd = pcd.voxel_down_sample(voxel_size=0.15)
 
+        # a joint COLMAP model (MTGS_JOINT_BA / MTGS_JOINT_SFM) writes ONE sfm_point_cloud/joint.pcd for all passes
+        # (ba_multi_traversal names it after the colmap dir); without it the far field (hills, skyline: the only points
+        # beyond lidar range) was never initialised and the skybox shell stayed at 1 km in front of it (2026-11-03)
+        joint_pcd = Path(self.video_scene.sfm_point_cloud_path) / "joint.pcd"
+        if not any(os.path.exists(p_) for p_ in sfm_pcd_file_paths) and os.path.exists(joint_pcd):
+            sfm_pcd_file_paths = [joint_pcd]
         for path in sfm_pcd_file_paths:
             if os.path.exists(path):
                 pcd += o3d.io.read_point_cloud(str(path))

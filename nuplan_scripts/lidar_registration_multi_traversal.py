@@ -708,7 +708,9 @@ def _map_icp_inputs(video_scene_dict, result_poses_dict_aligned, exclude, scans_
 
 
 def _is_pinned(video):
-    pins = [x for x in os.environ.get('MTGS_PIN_LOGS', '').split(',') if x]
+    # default: the required logs (the served scenes' own drives, MTGS_REQUIRE_LOGS from the prep env) -- without it the
+    # pre-alignment gate dropped own passes for good (2026-11-03: pn_nb_17 / pn_w2_07 lost them, scenes fell back)
+    pins = [x for x in os.environ.get('MTGS_PIN_LOGS', os.environ.get('MTGS_REQUIRE_LOGS', '')).split(',') if x]
     infos = video.get('frame_infos', [])
     ln = infos[0].get('log_name', '') if infos else ''
     return any(pin in ln for pin in pins)

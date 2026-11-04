@@ -38,17 +38,41 @@ def copy_ego_masks(video_scene: VideoScene):
         os.makedirs(os.path.dirname(output_raw_mask_path), exist_ok=True)
         shutil.copytree(raw_mask_path, output_raw_mask_path)
 
+# Everything this pipeline itself writes into a per-model colmap directory. Anything else found there was put
+# there by a person (experiments, variants, snapshots) and must never be deleted by a stage restart: on
+# 2026-11-04 create_colmap_folder wiped pn_w2_21/colmap/joint/variants_1103 (a day of pose-prior experiments)
+# because the stage was restarted with an import that pointed inside it. Deleting is whitelist-only now;
+# MTGS_FORCE_CLEAN=1 overrides for a directory you really want gone.
+COLMAP_OWNED = {'images', 'masks', 'sparse_model', 'sfm_model', 'sfm_model_raw', 'image_pairs.txt',
+                'colmap_ba.log', 'name_to_token.json', 'rig_config.json', 'project.ini', 'prior_outliers.txt'}
+
+
+def _foreign_entries(path):
+    return sorted(e for e in os.listdir(path)
+                  if e not in COLMAP_OWNED and not e.startswith('database.db') and not e.startswith('sfm_model'))
+
+
+def safe_rmtree_colmap(colmap_path, why):
+    """Delete a colmap model directory only if it holds nothing but this pipeline's own files."""
+    if not os.path.exists(colmap_path):
+        return
+    foreign = _foreign_entries(colmap_path)
+    if foreign and os.environ.get('MTGS_FORCE_CLEAN') != '1':
+        raise RuntimeError(f'{why}: refusing to delete {colmap_path}: it holds entries this pipeline did not create '
+                           f'({", ".join(foreign[:6])}{"..." if len(foreign) > 6 else ""}). Move them out, or set '
+                           f'MTGS_FORCE_CLEAN=1 if they are disposable.')
+    shutil.rmtree(colmap_path)
+
+
 def create_colmap_folder(colmap_path):
 
-    # 2026-11-04: an import source INSIDE the colmap dir is wiped with it (pn_w2_21 lost its variants dir and the
-    # pose-prior model it was told to import). Refuse before touching anything.
+    # an import source INSIDE the colmap dir would be wiped with it: refuse before touching anything
     for var in ('MTGS_SFM_IMPORT', 'MTGS_SFM_DB_IMPORT'):
         src = os.environ.get(var)
         if src and os.path.realpath(src).startswith(os.path.realpath(colmap_path) + os.sep):
             raise RuntimeError(f'{var}={src} lies inside {colmap_path}, which this stage recreates from scratch; '
                                f'move the import outside the colmap directory first')
-    if os.path.exists(colmap_path):
-        shutil.rmtree(colmap_path)
+    safe_rmtree_colmap(colmap_path, 'stage restart')
 
     os.makedirs(f"{colmap_path}/images", exist_ok=True)
     os.makedirs(f"{colmap_path}/masks", exist_ok=True)
@@ -59,8 +83,7 @@ def create_colmap_folder(colmap_path):
     ).close()  # create an empty points3D.txt
 
 def clean_colmap_folder(colmap_path):
-    if os.path.exists(colmap_path):
-        shutil.rmtree(colmap_path)
+    safe_rmtree_colmap(colmap_path, 'cleanup')
 
 def create_cameras_per_vehicle(video_scene_dict, colmap_path):
     exsiting_veh_name = {}

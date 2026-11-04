@@ -29,7 +29,19 @@ if __name__ == '__main__':
         "sfm_point_cloud"
     ]
 
+    # colmap/: whitelist-checked per model dir (ba_multi_traversal.safe_rmtree_colmap); the other folders are
+    # pipeline-only trees. A refusal here is deliberate (2026-11-04: experiments living next to the pipeline's files).
+    from nuplan_scripts.ba_multi_traversal import safe_rmtree_colmap
     for folder in folders_to_remove:
         dir_path = os.path.join(data_root, config.road_block_name, folder)
-        if os.path.exists(dir_path):
-            shutil.rmtree(dir_path)
+        if not os.path.exists(dir_path):
+            continue
+        if folder == "colmap":
+            for sub in os.listdir(dir_path):
+                p_ = os.path.join(dir_path, sub)
+                if os.path.isdir(p_):
+                    safe_rmtree_colmap(p_, "clean_temp_files")
+            if os.listdir(dir_path):
+                print(f"[clean] {dir_path} kept: {os.listdir(dir_path)}")
+                continue
+        shutil.rmtree(dir_path)

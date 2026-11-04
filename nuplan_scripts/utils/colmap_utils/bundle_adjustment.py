@@ -75,7 +75,19 @@ def _run_colmap_raw(args, colmap_path, **kwargs):
            for a in args]
     if len(rel) > 1:
         rel = rel + _gpu_flags(rel[1])
+    if len(rel) > 1 and rel[1] in _ONE_BLAS_THREAD and "env" not in kwargs:
+        # Feature extraction and matching are parallel over N worker threads already; the BLAS/OpenMP
+        # runtime inside each worker (the colmap/colmap image links MKL + libomp, Eigen sees OpenMP) opens
+        # another team of OMP_NUM_THREADS, so with the stage-wide OMP_NUM_THREADS=24 one matches_importer
+        # ran 606 threads (577 runnable) on 24 cores. Measured 2026-11-04 (civo-h200-2, 14 cores, 3000
+        # pairs, CPU matching): OMP=14 235 s, OMP=1 109 s. COLMAP_BLAS_THREADS overrides.
+        n = os.environ.get("COLMAP_BLAS_THREADS", "1")
+        kwargs["env"] = {**os.environ, "OMP_NUM_THREADS": n, "MKL_NUM_THREADS": n, "OPENBLAS_NUM_THREADS": n}
     return subprocess.run(rel, cwd=colmap_path, **kwargs)
+
+
+_ONE_BLAS_THREAD = {"feature_extractor", "matches_importer", "exhaustive_matcher", "sequential_matcher",
+                    "spatial_matcher", "vocab_tree_matcher", "transitive_matcher"}
 
 
 def _normalize_rigs(database_path):

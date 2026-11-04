@@ -150,8 +150,11 @@ class VanillaGaussianSplattingModel(torch.nn.Module):
 
         distances, _ = self.k_nearest_sklearn(means.data, 3)
         distances = torch.from_numpy(distances)
-        # find the average of the three nearest neighbors for each point and use that as the scale
-        avg_dist = distances.mean(dim=-1, keepdim=True)
+        # find the average of the three nearest neighbors for each point and use that as the scale.
+        # Floor at 1 cm: the joint COLMAP cloud (sfm_point_cloud/joint.pcd) is written at centimetre precision, so a
+        # few points are exact duplicates; with >= 4 copies all three neighbour distances are 0, log(0) = -inf and the
+        # NaN spread to the whole model within 1000 steps (pn_w2_02 4 copies, pn_w2_05 9 copies, 2026-11-04).
+        avg_dist = distances.mean(dim=-1, keepdim=True).clamp_min(1e-2)
 
         opacities = torch.nn.Parameter(torch.logit(0.1 * torch.ones(num_points, 1)))
 

@@ -120,31 +120,40 @@ def run_bundle_adjustment(
         print(f"[sfm] imported model {imp} -> {dst}", flush=True)
         sys.exit(0)
 
-    print("extracting features...")
-    colmap_feature_extractor_args = [
-        colmap_exe, "feature_extractor",
-        "--database_path", f"{colmap_path}/database.db",
-        "--image_path", f"{colmap_path}/images",
-    ]
-    if os.path.exists(f"{colmap_path}/masks"):
-        colmap_feature_extractor_args += ["--ImageReader.mask_path", f"{colmap_path}/masks"]
-    # COLMAP 4.x renamed SiftExtraction.num_threads -> FeatureExtraction.num_threads
-    colmap_feature_extractor_args += ["--FeatureExtraction.num_threads", f"{num_workers}"]
+    # MTGS_SFM_DB_IMPORT=<database.db>: resume from a snapshot of this block's COLMAP database (civo node
+    # reboot 2026-11-05: joint matching takes ~15 h per block and the stage restarts from scratch otherwise).
+    # Features are kept as they are; matches_importer skips pairs that are already matched, so a snapshot
+    # taken mid-matching resumes where it stopped; one taken after matching goes straight to the mapper.
+    dbimp = os.environ.get("MTGS_SFM_DB_IMPORT")
+    if os.environ.get("MTGS_JOINT_SFM") == "1" and dbimp and os.path.exists(dbimp):
+        shutil.copy2(dbimp, f"{colmap_path}/database.db")
+        print(f"[sfm] imported database {dbimp} ({os.path.getsize(dbimp)/1e9:.2f} GB): extraction skipped, matching resumes", flush=True)
+    else:
+        print("extracting features...")
+        colmap_feature_extractor_args = [
+            colmap_exe, "feature_extractor",
+            "--database_path", f"{colmap_path}/database.db",
+            "--image_path", f"{colmap_path}/images",
+        ]
+        if os.path.exists(f"{colmap_path}/masks"):
+            colmap_feature_extractor_args += ["--ImageReader.mask_path", f"{colmap_path}/masks"]
+        # COLMAP 4.x renamed SiftExtraction.num_threads -> FeatureExtraction.num_threads
+        colmap_feature_extractor_args += ["--FeatureExtraction.num_threads", f"{num_workers}"]
 
-    try:
-        _run_colmap(colmap_feature_extractor_args, colmap_path, check=True)
-        rig_cfg = f"{colmap_path}/rig_config.json"
-        if os.environ.get("MTGS_JOINT_SFM") == "1" and os.path.exists(rig_cfg):
-            # rigs + frames from the calibration (ba_multi_traversal._write_rig_config); the
-            # mapper then refines cam_from_rig (Mapper.ba_refine_sensor_from_rig, default on)
-            print("[sfm rig] rig_configurator", flush=True)
-            _run_colmap([colmap_exe, "rig_configurator", "--database_path", f"{colmap_path}/database.db",
-                         "--rig_config_path", rig_cfg], colmap_path, check=True)
-        else:
-            _normalize_rigs(f"{colmap_path}/database.db")
-    except subprocess.CalledProcessError as e:
-        print(f"Error executing colmap feature_extractor: {e}")
-        sys.exit(1)
+        try:
+            _run_colmap(colmap_feature_extractor_args, colmap_path, check=True)
+            rig_cfg = f"{colmap_path}/rig_config.json"
+            if os.environ.get("MTGS_JOINT_SFM") == "1" and os.path.exists(rig_cfg):
+                # rigs + frames from the calibration (ba_multi_traversal._write_rig_config); the
+                # mapper then refines cam_from_rig (Mapper.ba_refine_sensor_from_rig, default on)
+                print("[sfm rig] rig_configurator", flush=True)
+                _run_colmap([colmap_exe, "rig_configurator", "--database_path", f"{colmap_path}/database.db",
+                             "--rig_config_path", rig_cfg], colmap_path, check=True)
+            else:
+                _normalize_rigs(f"{colmap_path}/database.db")
+        except subprocess.CalledProcessError as e:
+            print(f"Error executing colmap feature_extractor: {e}")
+            sys.exit(1)
 
 
     print("feature matching...")

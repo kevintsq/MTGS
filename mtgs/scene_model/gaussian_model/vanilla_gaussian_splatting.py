@@ -119,6 +119,18 @@ class VanillaGaussianSplattingModel(torch.nn.Module):
         assert points_3d is not None
         assert (features_dc_dim is None) or (features_dc_dim is not None and features_dc_dim > 1), \
             "invalid features_dc_dim [{}], must be set to `None` or larger than 1".format(features_dc_dim)
+        # Drop exact duplicate points (first occurrence kept). The joint COLMAP cloud (sfm_point_cloud/joint.pcd) is
+        # written at centimetre precision, so some points coincide; with >= 4 copies all three nearest-neighbour
+        # distances below are 0, the log scale is -inf and the NaN spread to the whole model within 1000 steps
+        # (pn_w2_02: 4 copies of one point, pn_w2_05: 9 copies, 2026-11-04).
+        xyz = points_3d['xyz']
+        if xyz.shape[0] > 1:
+            _, first = np.unique(xyz.detach().cpu().numpy(), axis=0, return_index=True)
+            if len(first) < xyz.shape[0]:
+                keep = torch.from_numpy(np.sort(first)).to(xyz.device)
+                CONSOLE.log(f"init points: dropped {xyz.shape[0] - len(keep)} exact duplicates of {xyz.shape[0]}")
+                points_3d = {k: (v[keep] if torch.is_tensor(v) and v.dim() >= 1 and v.shape[0] == xyz.shape[0] else v)
+                             for k, v in points_3d.items()}
         means = torch.nn.Parameter(points_3d['xyz'])  # (Location, Color)
 
         self.xys_grad_norm = None
@@ -150,11 +162,8 @@ class VanillaGaussianSplattingModel(torch.nn.Module):
 
         distances, _ = self.k_nearest_sklearn(means.data, 3)
         distances = torch.from_numpy(distances)
-        # find the average of the three nearest neighbors for each point and use that as the scale.
-        # Floor at 1 cm: the joint COLMAP cloud (sfm_point_cloud/joint.pcd) is written at centimetre precision, so a
-        # few points are exact duplicates; with >= 4 copies all three neighbour distances are 0, log(0) = -inf and the
-        # NaN spread to the whole model within 1000 steps (pn_w2_02 4 copies, pn_w2_05 9 copies, 2026-11-04).
-        avg_dist = distances.mean(dim=-1, keepdim=True).clamp_min(1e-2)
+        # find the average of the three nearest neighbors for each point and use that as the scale
+        avg_dist = distances.mean(dim=-1, keepdim=True)
 
         opacities = torch.nn.Parameter(torch.logit(0.1 * torch.ones(num_points, 1)))
 

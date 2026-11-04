@@ -129,8 +129,10 @@ class VanillaGaussianSplattingModel(torch.nn.Module):
             if len(first) < xyz.shape[0]:
                 keep = torch.from_numpy(np.sort(first)).to(xyz.device)
                 CONSOLE.log(f"init points: dropped {xyz.shape[0] - len(keep)} exact duplicates of {xyz.shape[0]}")
-                points_3d = {k: (v[keep] if torch.is_tensor(v) and v.dim() >= 1 and v.shape[0] == xyz.shape[0] else v)
-                             for k, v in points_3d.items()}
+                # in place: subclasses (MultiColorGaussianSplatting) size their own parameters from the caller's dict
+                for k, v in list(points_3d.items()):
+                    if torch.is_tensor(v) and v.dim() >= 1 and v.shape[0] == xyz.shape[0]:
+                        points_3d[k] = v[keep]
         means = torch.nn.Parameter(points_3d['xyz'])  # (Location, Color)
 
         self.xys_grad_norm = None

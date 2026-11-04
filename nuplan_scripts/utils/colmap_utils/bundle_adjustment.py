@@ -9,6 +9,7 @@ import shutil
 import platform
 import subprocess
 import argparse
+import numpy as np
 
 
 def _match_threads(num_workers):
@@ -84,6 +85,50 @@ def _run_colmap_raw(args, colmap_path, **kwargs):
         n = os.environ.get("COLMAP_BLAS_THREADS", "1")
         kwargs["env"] = {**os.environ, "OMP_NUM_THREADS": n, "MKL_NUM_THREADS": n, "OPENBLAS_NUM_THREADS": n}
     return subprocess.run(rel, cwd=colmap_path, **kwargs)
+
+
+def _write_pose_priors(colmap_path):
+    """Camera centres of sparse_model/images.txt (the registered poses) -> pose_priors (CARTESIAN) for every
+    image the feature extractor registered in database.db."""
+    import sqlite3
+    from pyquaternion import Quaternion
+    centres = {}
+    with open(f"{colmap_path}/sparse_model/images.txt") as f:
+        for line in f:
+            t = line.split()
+            if len(t) < 10 or t[0].startswith("#"):
+                continue
+            q = Quaternion(*[float(x) for x in t[1:5]]); tv = np.array([float(x) for x in t[5:8]])
+            centres[t[9]] = -(q.rotation_matrix.T @ tv)
+    db = sqlite3.connect(f"{colmap_path}/database.db")
+    cov = (np.eye(3) * 1.0).astype(np.float64).tobytes()
+    n = 0
+    for image_id, name in db.execute("select image_id, name from images").fetchall():
+        if name in centres:
+            db.execute("insert or replace into pose_priors(image_id, position, coordinate_system, position_covariance) values (?, ?, 1, ?)",
+                       (image_id, centres[name].astype(np.float64).tobytes(), cov))
+            n += 1
+    db.commit(); db.close()
+    print(f"[sfm] pose priors written for {n}/{len(centres)} images", flush=True)
+
+
+def _drop_far_from_prior(colmap_path, model_dir, max_err, colmap_exe):
+    """Delete images whose reconstructed centre is more than max_err m from their prior (pose_prior mode)."""
+    import sqlite3, pycolmap
+    r = pycolmap.Reconstruction(model_dir)
+    db = sqlite3.connect(f"{colmap_path}/database.db")
+    pri = {i: np.frombuffer(p, dtype=np.float64) for i, p in db.execute("select image_id, position from pose_priors")}
+    db.close()
+    bad = [i for i in r.images if i in pri and np.linalg.norm(np.asarray(r.images[i].projection_center()) - pri[i]) > max_err]
+    print(f"[sfm] {len(bad)} of {len(r.images)} images > {max_err} m from their prior", flush=True)
+    if not bad:
+        return
+    ids = os.path.join(colmap_path, "prior_outliers.txt")
+    open(ids, "w").write("\n".join(map(str, bad)) + "\n")
+    tmp = model_dir + "_filtered"; shutil.rmtree(tmp, ignore_errors=True); os.makedirs(tmp)
+    _run_colmap([colmap_exe, "image_deleter", "--input_path", model_dir, "--output_path", tmp, "--image_ids_path", ids],
+                colmap_path, check=True)
+    shutil.rmtree(model_dir); shutil.move(tmp, model_dir)
 
 
 _ONE_BLAS_THREAD = {"feature_extractor", "matches_importer", "exhaustive_matcher", "sequential_matcher",
@@ -269,6 +314,23 @@ def run_bundle_adjustment(
                            "--GlobalMapper.ba_refine_focal_length", "0" if fix else "1",
                            "--GlobalMapper.ba_refine_principal_point", "0",
                            "--GlobalMapper.ba_refine_extra_params", "0" if fix else "1"]
+        elif mode == "pose_prior":
+            # 2026-11-04 (pn_w2_21): incremental mapper with hard position priors from the registered poses
+            # (sparse_model/images.txt -> pose_priors table), std COLMAP_PRIOR_STD m. With 0.1 m and
+            # MTGS_MAX_PAIR_DIST=25 the block that fragmented under the plain mapper registered 3240/3240 images
+            # at 0.07 m median / 0.14 m p90 from the priors, 0.81 px reprojection (33 outliers > 1.5 m).
+            std = os.environ.get("COLMAP_PRIOR_STD", "0.1")
+            _write_pose_priors(colmap_path)
+            mapper_args = [colmap_exe, "pose_prior_mapper", "--database_path", f"{colmap_path}/database.db",
+                           "--image_path", f"{colmap_path}/images", "--output_path", raw,
+                           "--Mapper.num_threads", f"{num_workers}",
+                           "--Mapper.ba_refine_focal_length", "0" if fix else "1",
+                           "--Mapper.ba_refine_principal_point", "0",
+                           "--Mapper.ba_refine_extra_params", "0" if fix else "1",
+                           "--Mapper.multiple_models", "1", "--Mapper.min_model_size", "50",
+                           "--overwrite_priors_covariance", "1",
+                           "--prior_position_std_x", std, "--prior_position_std_y", std, "--prior_position_std_z", std,
+                           "--use_robust_loss_on_prior_position", os.environ.get("COLMAP_PRIOR_ROBUST", "0")]
         else:
             mapper_args = [colmap_exe, "mapper", "--database_path", f"{colmap_path}/database.db",
                            "--image_path", f"{colmap_path}/images", "--output_path", raw,
@@ -295,6 +357,9 @@ def run_bundle_adjustment(
         print(f"[sfm] models (images): {sizes}; using {best}", flush=True)
         shutil.rmtree(os.path.join(colmap_path, output_model, "0"), ignore_errors=True)
         shutil.copytree(os.path.join(raw, best), os.path.join(colmap_path, output_model, "0"))
+        if mode == "pose_prior" and float(os.environ.get("MTGS_SFM_PRIOR_MAX_ERR", "0")) > 0:
+            _drop_far_from_prior(colmap_path, os.path.join(colmap_path, output_model, "0"),
+                                 float(os.environ["MTGS_SFM_PRIOR_MAX_ERR"]), colmap_exe)
         sys.exit(0)
 
     # 2 rounds of triangulation + bundle adjustment

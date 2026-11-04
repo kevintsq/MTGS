@@ -40,6 +40,13 @@ def copy_ego_masks(video_scene: VideoScene):
 
 def create_colmap_folder(colmap_path):
 
+    # 2026-11-04: an import source INSIDE the colmap dir is wiped with it (pn_w2_21 lost its variants dir and the
+    # pose-prior model it was told to import). Refuse before touching anything.
+    for var in ('MTGS_SFM_IMPORT', 'MTGS_SFM_DB_IMPORT'):
+        src = os.environ.get(var)
+        if src and os.path.realpath(src).startswith(os.path.realpath(colmap_path) + os.sep):
+            raise RuntimeError(f'{var}={src} lies inside {colmap_path}, which this stage recreates from scratch; '
+                               f'move the import outside the colmap directory first')
     if os.path.exists(colmap_path):
         shutil.rmtree(colmap_path)
 
@@ -388,7 +395,8 @@ def create_colmap_model(video_scene: VideoScene, video_scene_dict, colmap_path):
                     cam_views.append(dict(
                         token=image_path,
                         ego_token=info['token'],
-                        view_field=view_field
+                        view_field=view_field,
+                        center=-(Quaternion(Q).rotation_matrix.T @ np.asarray(T, dtype=np.float64)),   # camera centre (prior)
                     ))
 
                     # write to images.txt
@@ -417,6 +425,10 @@ def create_colmap_model(video_scene: VideoScene, video_scene_dict, colmap_path):
     # and cross-traversal pairs -- the entire point of a joint model -- are kept
     # first, since those are what tie the traversals to each other.
     max_per_image = int(os.environ.get('MTGS_MAX_PAIRS_PER_IMAGE', '0'))
+    # MTGS_MAX_PAIR_DIST=<m>: no pair between cameras whose prior centres are farther apart (pn_w2_21 2026-11-03:
+    # pruning > 25 m halved the mis-registered images; far pairs on a straight road match well and are wrong).
+    max_dist = float(os.environ.get('MTGS_MAX_PAIR_DIST', '0'))
+    n_far = 0
 
     def _travel_of(token):
         return token.split('/')[0] if '/' in token else token
@@ -429,9 +441,14 @@ def create_colmap_model(video_scene: VideoScene, video_scene_dict, colmap_path):
             v2 = view2['view_field']
             iou = v1.intersection(v2).area / v1.union(v2).area
             if iou > 0.0:
+                if max_dist > 0 and 'center' in view1 and np.linalg.norm(view1['center'] - view2['center']) > max_dist:
+                    n_far += 1
+                    continue
                 candidates[i].append((iou, j))
                 candidates[j].append((iou, i))
 
+    if max_dist > 0:
+        CONSOLE.log(f'[pairs] MTGS_MAX_PAIR_DIST={max_dist} m dropped {n_far} overlapping pairs')
     pairs = set()
     if max_per_image <= 0:
         for i, lst in candidates.items():

@@ -156,8 +156,10 @@ def _prune_db_to_pair_list(db_path, pairs_txt):
     if not os.path.exists(pairs_txt):
         return
     db = sqlite3.connect(db_path)
-    ids = {n: i for i, n in db.execute("select name, image_id from images")}
+    ids = {n: i for n, i in db.execute("select name, image_id from images")}
     allowed = set()
+    if not ids:
+        db.close(); return
     with open(pairs_txt) as f:
         for line in f:
             t = line.split()
@@ -167,6 +169,9 @@ def _prune_db_to_pair_list(db_path, pairs_txt):
             if a > b:
                 a, b = b, a
             allowed.add(a * 2147483647 + b)
+    if not allowed:   # a mismatch between the pair list and the database must never wipe the cache (2026-11-05: inverted name map deleted 367k matches)
+        print(f"[sfm] WARNING: no pair of image_pairs.txt resolves against the imported database; cache left untouched", flush=True)
+        db.close(); return
     db.execute("create temp table keep (pair_id integer primary key)")
     db.executemany("insert into keep values (?)", ((x,) for x in allowed))
     n_m = db.execute("select count(*) from matches where pair_id not in (select pair_id from keep)").fetchone()[0]

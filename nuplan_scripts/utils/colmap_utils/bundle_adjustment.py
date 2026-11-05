@@ -102,10 +102,14 @@ def _write_pose_priors(colmap_path):
             centres[t[9]] = -(q.rotation_matrix.T @ tv)
     db = sqlite3.connect(f"{colmap_path}/database.db")
     cov = (np.eye(3) * 1.0).astype(np.float64).tobytes()
+    # COLMAP 4.2 keys pose_priors by image_id; 4.3 (the manco/kaitain/workstation builds) migrated the table to
+    # corr_data_id (= the image's data id, equal to image_id without rigs) -- pick whichever column exists
+    cols = [r[1] for r in db.execute("pragma table_info(pose_priors)")]
+    key = "corr_data_id" if "corr_data_id" in cols else "image_id"
     n = 0
     for image_id, name in db.execute("select image_id, name from images").fetchall():
         if name in centres:
-            db.execute("insert or replace into pose_priors(image_id, position, coordinate_system, position_covariance) values (?, ?, 1, ?)",
+            db.execute(f"insert or replace into pose_priors({key}, position, coordinate_system, position_covariance) values (?, ?, 1, ?)",
                        (image_id, centres[name].astype(np.float64).tobytes(), cov))
             n += 1
     db.commit(); db.close()

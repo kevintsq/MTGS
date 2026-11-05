@@ -488,7 +488,7 @@ class MTGSSceneModel(Model):
             for k, _ in gs.items():
                 gs_dict[k].append(gs[k])
 
-            if "rgbs" in gs and os.environ.get("MTGS_DEBUG_NAN") == "1":   # (key was misspelt "rbgs": the check never ran)
+            if "rgbs" in gs and _os.environ.get("MTGS_DEBUG_NAN") == "1":   # (key was misspelt "rbgs": the check never ran)
                 if torch.isnan(gs['rgbs']).any() or torch.isinf(gs['rgbs']).any():
                     print(f"NaN or inf in rgbs for model {model_name}", flush=True)
 

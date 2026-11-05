@@ -222,10 +222,25 @@ class MTGSSceneModel(Model):
                     travel_ids=self.train_travel_ids,
                     nearest_train_travel_of_eval=self.datamanager.train_dataparser_outputs.metadata['nearest_train_travel_of_eval'],
                 )
+                init_xyz = self.datamanager.train_dataparser_outputs.metadata["points3D_xyz"]
+                init_rgb = self.datamanager.train_dataparser_outputs.metadata["points3D_rgb"]
+                # Drop initial points inside the training cameras (2026-11-05): the joint COLMAP cloud of pn_w2_02 had
+                # a point 5e-7 m from camera 3284's centre (50 cameras with one within 1 mm, 162 within 10 cm) --
+                # no real surface is that close to a roof camera, and such a gaussian is what blew up that image's
+                # pose gradient. MTGS_INIT_MIN_CAM_DIST (m, default 0.3; 0 disables).
+                min_cam_dist = float(_os.environ.get("MTGS_INIT_MIN_CAM_DIST", "0.3"))
+                if min_cam_dist > 0 and init_xyz.shape[0] > 0:
+                    from scipy.spatial import cKDTree
+                    cam_centres = self.datamanager.train_dataparser_outputs.cameras.camera_to_worlds[:, :3, 3].cpu().numpy()
+                    d_cam, _ = cKDTree(cam_centres).query(init_xyz.detach().cpu().numpy(), k=1)
+                    keep = torch.from_numpy(d_cam >= min_cam_dist)
+                    if (~keep).sum() > 0:
+                        CONSOLE.log(f"init points: dropped {int((~keep).sum())} of {init_xyz.shape[0]} within {min_cam_dist} m of a training camera")
+                        init_xyz = init_xyz[keep]; init_rgb = init_rgb[keep]
                 background_model.populate_modules(
                     points_3d = dict(
-                        xyz = self.datamanager.train_dataparser_outputs.metadata["points3D_xyz"],
-                        rgb = self.datamanager.train_dataparser_outputs.metadata["points3D_rgb"],
+                        xyz = init_xyz,
+                        rgb = init_rgb,
                         normal = None
                     ),
                     num_traversals = self.num_traversals

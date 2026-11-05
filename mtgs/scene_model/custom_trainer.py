@@ -227,6 +227,43 @@ class CustomTrainer(Trainer):
     # `nsys profile --capture-range=cudaProfilerApi`.
     _prof = tuple(int(x) for x in os.environ["MTGS_PROFILE_STEPS"].split(":")) if os.environ.get("MTGS_PROFILE_STEPS") else None
 
+    def _install_nan_debug(self):
+        """MTGS_DEBUG_NAN=1: log the loss dict and camera of the step whose gradient first goes non-finite.
+        (pn_w2_02 2026-11-05: camera_optimizer.pose_adjustment of one image turned NaN at step ~4000 while every
+        gaussian stayed finite; the loss table is not logged during training, so this hook names the term.)"""
+        import math
+        model = self.pipeline.model
+        self._dbg = {"step": None, "loss": {}, "cam": {}}
+        orig = self.pipeline.get_train_loss_dict
+
+        def wrapped(step):
+            model_outputs, loss_dict, metrics_dict = orig(step)
+            self._dbg = {"step": step, "cam": dict(getattr(model, "cur_cam_metas", {}) or {}),
+                         "loss": {k: float(v) for k, v in loss_dict.items()}}
+            bad = {k: v for k, v in self._dbg["loss"].items() if not math.isfinite(v)}
+            if bad:
+                print(f"[nan-debug] step {step} NON-FINITE LOSS {bad} cam {self._dbg['cam']}", flush=True)
+            return model_outputs, loss_dict, metrics_dict
+        self.pipeline.get_train_loss_dict = wrapped
+
+        def make_hook(name):
+            def hook(grad):
+                fin = torch.isfinite(grad)
+                if not bool(fin.all()):
+                    rows = (~fin.reshape(grad.shape[0], -1).all(1)).nonzero().flatten().tolist() if grad.dim() > 1 else []
+                    print(f"[nan-debug] step {self._dbg['step']} {name} grad non-finite: {int((~fin).sum())} values, rows {rows[:8]} "
+                          f"(of {grad.shape[0]}); loss {self._dbg['loss']}; cam {self._dbg['cam']}", flush=True)
+                return grad
+            return hook
+        co = getattr(model, "camera_optimizer", None)
+        if co is not None and hasattr(co, "pose_adjustment"):
+            co.pose_adjustment.register_hook(make_hook("camera_optimizer.pose_adjustment"))
+        for mname, gm in getattr(model, "gaussian_models", {}).items():
+            gp = getattr(gm, "gauss_params", None)
+            if gp is not None and "means" in gp:
+                gp["means"].register_hook(make_hook(f"{mname}.means"))
+        print("[nan-debug] hooks installed", flush=True)
+
     def train_iteration(self, step: int):
         if self._term:   # SIGTERM arrived during the previous step: its state is complete, save it and leave
             self._preempt_save_and_exit(step - 1)
@@ -281,6 +318,9 @@ class CustomTrainer(Trainer):
         self._check_viewer_warnings()
 
         self._load_checkpoint()
+
+        if os.environ.get("MTGS_DEBUG_NAN") == "1":   # 2026-11-05: find which image / loss term produces a non-finite gradient
+            self._install_nan_debug()
 
         self.callbacks = self.pipeline.get_training_callbacks(
             TrainingCallbackAttributes(

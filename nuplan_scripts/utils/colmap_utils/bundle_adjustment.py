@@ -111,6 +111,7 @@ def _write_pose_priors(colmap_path):
         db.close()
         import pycolmap
         pdb = pycolmap.Database.open(dbp)
+        pdb.clear_pose_priors()   # idempotent: a second call (stage restart on an imported database) must not duplicate
         for image_id, name, camera_id in rows:
             if name not in centres:
                 continue
@@ -122,6 +123,7 @@ def _write_pose_priors(colmap_path):
             pdb.write_pose_prior(pp); n += 1
         pdb.close()
     else:   # COLMAP 4.2 (the docker image on torch / civo / ARC): image_id keyed
+        db.execute("delete from pose_priors")
         cov = (np.eye(3) * 1.0).astype(np.float64).tobytes()
         for image_id, name, _cid in rows:
             if name in centres:

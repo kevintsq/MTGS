@@ -113,22 +113,21 @@ def _write_pose_priors(colmap_path):
     rows = db.execute("select image_id, name, camera_id from images").fetchall()
     n = 0
     if "corr_sensor_id" in cols:
-        # COLMAP 4.3 schema (manco / kaitain / workstation builds): priors are keyed by data id = (sensor, image);
-        # pycolmap fills pose_prior_id, corr_sensor_type and gravity for us
-        db.close()
-        import pycolmap
-        pdb = pycolmap.Database.open(dbp)
-        pdb.clear_pose_priors()   # idempotent: a second call (stage restart on an imported database) must not duplicate
+        # COLMAP 4.3 schema (manco / kaitain / workstation builds, and the civo snapshots): priors keyed by
+        # (sensor type 0 = camera, sensor id = camera_id, data id = image_id); gravity unset = three NaNs,
+        # coordinate_system 1 = CARTESIAN -- written with sqlite directly, exactly as pycolmap 4.3 writes them
+        # (2026-11-05: three fk_loc_0113 node runs on civo lost 55 min of matching each at `import pycolmap`,
+        # the stage python there has no pycolmap, and a pycolmap of another version would write another schema)
+        db.execute("delete from pose_priors")   # idempotent: a stage restart on an imported database must not duplicate
+        cov = np.eye(3, dtype=np.float64).tobytes()
+        grav = np.full(3, np.nan, dtype=np.float64).tobytes()
         for image_id, name, camera_id in rows:
             if name not in centres:
                 continue
-            pp = pycolmap.PosePrior()
-            pp.corr_data_id = pycolmap.data_t(pycolmap.sensor_t(pycolmap.SensorType.CAMERA, int(camera_id)), int(image_id))
-            pp.position = centres[name].astype(np.float64)
-            pp.position_covariance = np.eye(3)
-            pp.coordinate_system = pycolmap.PosePriorCoordinateSystem.CARTESIAN
-            pdb.write_pose_prior(pp); n += 1
-        pdb.close()
+            db.execute("insert into pose_priors(corr_data_id, corr_sensor_id, corr_sensor_type, position, position_covariance, gravity, coordinate_system) values (?, ?, 0, ?, ?, ?, 1)",
+                       (int(image_id), int(camera_id), centres[name].astype(np.float64).tobytes(), cov, grav))
+            n += 1
+        db.commit(); db.close()
     else:   # COLMAP 4.2 (the docker image on torch / civo / ARC): image_id keyed
         db.execute("delete from pose_priors")
         cov = (np.eye(3) * 1.0).astype(np.float64).tobytes()

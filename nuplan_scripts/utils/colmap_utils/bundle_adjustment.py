@@ -148,6 +148,35 @@ def _colmap_scale(colmap_path):
     return float(v)
 
 
+def _prune_db_to_pair_list(db_path, pairs_txt):
+    """An imported database is a cache of features and matches; the match graph is defined by this run's
+    image_pairs.txt. Matches / two-view geometries of pairs outside it are deleted (2026-11-05: pn_w2_21 resumed
+    from an unpruned snapshot and MTGS_MAX_PAIR_DIST had no effect, the mapper saw every far pair again)."""
+    import sqlite3
+    if not os.path.exists(pairs_txt):
+        return
+    db = sqlite3.connect(db_path)
+    ids = {n: i for i, n in db.execute("select name, image_id from images")}
+    allowed = set()
+    with open(pairs_txt) as f:
+        for line in f:
+            t = line.split()
+            if len(t) < 2 or t[0] not in ids or t[1] not in ids:
+                continue
+            a, b = ids[t[0]], ids[t[1]]
+            if a > b:
+                a, b = b, a
+            allowed.add(a * 2147483647 + b)
+    db.execute("create temp table keep (pair_id integer primary key)")
+    db.executemany("insert into keep values (?)", ((x,) for x in allowed))
+    n_m = db.execute("select count(*) from matches where pair_id not in (select pair_id from keep)").fetchone()[0]
+    n_g = db.execute("select count(*) from two_view_geometries where pair_id not in (select pair_id from keep)").fetchone()[0]
+    db.execute("delete from matches where pair_id not in (select pair_id from keep)")
+    db.execute("delete from two_view_geometries where pair_id not in (select pair_id from keep)")
+    db.commit(); db.close()
+    print(f"[sfm] imported database pruned to the pair list: {len(allowed)} pairs kept, {n_m} matches / {n_g} two-view geometries outside it deleted", flush=True)
+
+
 def _drop_far_from_prior(colmap_path, model_dir, max_err_m, colmap_exe, scale=1.0):
     """Delete images whose reconstructed centre is more than max_err_m metres from their prior (pose_prior mode)."""
     import sqlite3, pycolmap
@@ -227,6 +256,7 @@ def run_bundle_adjustment(
     if os.environ.get("MTGS_JOINT_SFM") == "1" and dbimp and os.path.exists(dbimp):
         shutil.copy2(dbimp, f"{colmap_path}/database.db")
         print(f"[sfm] imported database {dbimp} ({os.path.getsize(dbimp)/1e9:.2f} GB): extraction skipped, matching resumes", flush=True)
+        _prune_db_to_pair_list(f"{colmap_path}/database.db", f"{colmap_path}/image_pairs.txt")
     else:
         print("extracting features...")
         colmap_feature_extractor_args = [

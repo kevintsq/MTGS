@@ -84,6 +84,9 @@ def run_da3_multiview(video_scene, video_scene_dict, undistort_mode, max_range, 
                 streams[(vt, cam_name)].append((ci.get('timestamp', fi['timestamp']), fi, ci))
 
     total = sum(len(s) for s in streams.values()); done = 0
+    lidar_scale = os.environ.get('MTGS_DA3_LIDAR_SCALE', '1') == '1'
+    scale_tol = float(os.environ.get('MTGS_DA3_SCALE_TOL', '0.15'))
+    lidar_cache = {}; ratios = []; n_scaled_windows = 0
     with tqdm(total=total, ncols=120, desc='DA3 multi-view depth') as pbar:
         for key in sorted(streams):
             seq = sorted(streams[key], key=lambda t: t[0])
@@ -100,6 +103,24 @@ def run_da3_multiview(video_scene, video_scene_dict, undistort_mode, max_range, 
                                        intrinsics=np.stack([loaded[i][1] for i in idx]).astype(np.float32),
                                        align_to_input_ext_scale=True, ref_view_strategy='saddle_balanced')
                 depth = np.asarray(pred.depth).astype(np.float32)
+                # Scale check against the lidar (2026-11-05): align_to_input_ext_scale trusts DA3's own relative
+                # poses; on side cameras with little structure (and in near-static windows) they are wrong and the
+                # whole window comes out 5-10x too close (pn_w2_02: 119 of 3336 maps, max 3-8 m where lidar sees 80 m;
+                # the depth loss then drove one camera's pose to NaN and the model with it). The lidar median ratio
+                # per window fixes the scale; windows without lidar coverage are left as they are.
+                if lidar_scale:
+                    rs = []
+                    for k, i in enumerate(idx):
+                        r = _lidar_ratio(video_scene, seq[i][1], seq[i][2], w2c[i], loaded[i], depth[k], lidar_cache)
+                        if r is not None:
+                            rs.append(r)
+                    if rs:
+                        rw = float(np.exp(np.median(np.log(np.concatenate(rs)))))
+                        n_scaled_windows += 1 if abs(np.log(rw)) > np.log(1.0 + scale_tol) else 0
+                        ratios.append(rw)
+                        if abs(np.log(rw)) > np.log(1.0 + scale_tol):
+                            depth = depth * rw
+                            print(f'[dense_depth_da3] {key[1]} window {s0}: lidar/DA3 scale {rw:.2f} -> rescaled', flush=True)
                 c = s0 + (len(idx) - 1) / 2.0
                 for k, i in enumerate(idx):
                     if abs(i - c) < best_off[i]:
@@ -119,4 +140,43 @@ def run_da3_multiview(video_scene, video_scene_dict, undistort_mode, max_range, 
                 os.makedirs(os.path.dirname(outs[i]), exist_ok=True)
                 cv2.imwrite(outs[i], img)
             pbar.update(n)
+    if lidar_scale and ratios:
+        r = np.array(ratios)
+        print(f'[dense_depth_da3] lidar scale check: {len(r)} windows, median ratio {np.median(r):.3f}, '
+              f'p5 {np.percentile(r, 5):.2f}, p95 {np.percentile(r, 95):.2f}, rescaled {n_scaled_windows} '
+              f'(|log ratio| > log {1.0 + scale_tol:.2f})', flush=True)
     del model; torch.cuda.empty_cache()
+
+
+def _lidar_ratio(video_scene, frame_info, cam_info, w2c, loaded, depth, cache, min_pts=100):
+    """lidar depth / DA3 depth at the lidar hits of one frame (same undistorted crop as the output), or None."""
+    from nuplan_scripts.utils.nuplan_utils_custom import load_lidar
+    lp = frame_info.get('lidar_path')
+    if not lp:
+        return None
+    if lp not in cache:
+        if len(cache) > 64:
+            cache.clear()
+        try:
+            cache[lp] = load_lidar(os.path.join(video_scene.raw_lidar_path, lp))
+        except Exception:
+            cache[lp] = None
+    pts = cache[lp]
+    if pts is None or len(pts) == 0:
+        return None
+    K = loaded[1]; (x, y, w, h) = loaded[3]
+    lidar2global = np.asarray(frame_info['ego2global'], float) @ np.asarray(frame_info['lidar2ego'], float)
+    lidar2cam = np.asarray(w2c, float) @ lidar2global
+    pc = (np.concatenate([pts[:, :3], np.ones((len(pts), 1))], 1) @ lidar2cam.T)[:, :3]
+    pc = pc[pc[:, 2] > 0.5]
+    uv = pc @ K.T; uv[:, :2] /= uv[:, 2:]
+    d = depth if depth.shape == (h, w) else cv2.resize(depth, (w, h), interpolation=cv2.INTER_LINEAR)
+    u = np.round(uv[:, 0]).astype(int); v = np.round(uv[:, 1]).astype(int)
+    ok = (u >= 0) & (u < w) & (v >= 0) & (v < h) & (uv[:, 2] < 80.0)
+    if ok.sum() < min_pts:
+        return None
+    dz = d[v[ok], u[ok]]; lz = uv[ok, 2]
+    good = dz > 0.1
+    if good.sum() < min_pts:
+        return None
+    return lz[good] / dz[good]

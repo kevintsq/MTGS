@@ -110,7 +110,7 @@ def _write_pose_priors(colmap_path):
         # pycolmap fills pose_prior_id, corr_sensor_type and gravity for us
         db.close()
         import pycolmap
-        pdb = pycolmap.Database(dbp)
+        pdb = pycolmap.Database.open(dbp)
         for image_id, name, camera_id in rows:
             if name not in centres:
                 continue

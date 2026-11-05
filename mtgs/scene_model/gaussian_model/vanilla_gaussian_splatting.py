@@ -331,8 +331,13 @@ class VanillaGaussianSplattingModel(torch.nn.Module):
             "if Fourier embedding is used in models derived from `VanillaGaussianSplattingModel`, a new `get_rgbs` function must be implemented"
         colors = torch.cat((self.features_dc[:, None, :], self.features_rest), dim=1)
         if self.sh_degree > 0:
-            viewdirs = self.means.detach() - camera_to_worlds[..., :3, 3]  # (N, 3)
-            viewdirs = viewdirs / viewdirs.norm(dim=-1, keepdim=True)
+            # Camera position detached (as in nerfstudio's splatfacto) and the norm floored: with the position
+            # attached, a gaussian within ~1e-4 m of an image's camera centre gave 1/|d| gradients that turned that
+            # image's pose_adjustment (3 translation values) to NaN while every gaussian stayed finite (means are
+            # detached here); the NaN then spread through camera_opt_regularizer and the model (pn_w2_02 / pn_w2_05,
+            # 2026-11-05, first seen with joint.pcd initial points that lie on the camera trajectories).
+            viewdirs = self.means.detach() - camera_to_worlds[..., :3, 3].detach()  # (N, 3)
+            viewdirs = viewdirs / viewdirs.norm(dim=-1, keepdim=True).clamp_min(1e-6)
             n = min(self.step // self.ctrl_config.sh_degree_interval, self.sh_degree)
             rgbs = spherical_harmonics(n, viewdirs, colors)
             rgbs = torch.clamp(rgbs + 0.5, 0.0, 1.0)

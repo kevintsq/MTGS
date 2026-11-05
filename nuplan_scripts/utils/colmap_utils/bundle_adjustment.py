@@ -134,15 +134,35 @@ def _write_pose_priors(colmap_path):
     print(f"[sfm] pose priors written for {n}/{len(centres)} images", flush=True)
 
 
-def _drop_far_from_prior(colmap_path, model_dir, max_err, colmap_exe):
-    """Delete images whose reconstructed centre is more than max_err m from their prior (pose_prior mode)."""
+def _colmap_scale(colmap_path):
+    """Metres -> COLMAP units. create_colmap_model scales the world to ~10 units per block (scale_factor = 10 / block
+    size) and exports it as MTGS_COLMAP_SCALE / sparse_model/scale_factor.txt; every metre knob of the SfM stage goes
+    through this (2026-11-05: pn_w2_21 ran with std 0.1 *units* = 1.8 m, max err 27 m, pair prune never firing)."""
+    v = os.environ.get("MTGS_COLMAP_SCALE")
+    if not v:
+        f = os.path.join(colmap_path, "sparse_model", "scale_factor.txt")
+        v = open(f).read().strip() if os.path.exists(f) else None
+    if not v:
+        print("[sfm] WARNING: no MTGS_COLMAP_SCALE / sparse_model/scale_factor.txt; metre thresholds used as raw units", flush=True)
+        return 1.0
+    return float(v)
+
+
+def _drop_far_from_prior(colmap_path, model_dir, max_err_m, colmap_exe, scale=1.0):
+    """Delete images whose reconstructed centre is more than max_err_m metres from their prior (pose_prior mode)."""
     import sqlite3, pycolmap
     r = pycolmap.Reconstruction(model_dir)
     db = sqlite3.connect(f"{colmap_path}/database.db")
-    pri = {i: np.frombuffer(p, dtype=np.float64) for i, p in db.execute("select image_id, position from pose_priors")}
+    cols = [c[1] for c in db.execute("pragma table_info(pose_priors)")]
+    key = "image_id" if "image_id" in cols else "corr_data_id"      # COLMAP 4.2 vs 4.3 schema
+    pri = {i: np.frombuffer(p, dtype=np.float64) for i, p in db.execute(f"select {key}, position from pose_priors")}
     db.close()
-    bad = [i for i in r.images if i in pri and np.linalg.norm(np.asarray(r.images[i].projection_center()) - pri[i]) > max_err]
-    print(f"[sfm] {len(bad)} of {len(r.images)} images > {max_err} m from their prior", flush=True)
+    max_err = max_err_m * scale
+    err = {i: np.linalg.norm(np.asarray(r.images[i].projection_center()) - pri[i]) for i in r.images if i in pri}
+    bad = [i for i, e in err.items() if e > max_err]
+    e_m = np.array(list(err.values())) / scale if err else np.zeros(1)
+    print(f"[sfm] {len(bad)} of {len(r.images)} images > {max_err_m} m from their prior "
+          f"(median {np.median(e_m):.3f} m, p90 {np.percentile(e_m, 90):.3f} m)", flush=True)
     if not bad:
         return
     ids = os.path.join(colmap_path, "prior_outliers.txt")
@@ -341,7 +361,9 @@ def run_bundle_adjustment(
             # (sparse_model/images.txt -> pose_priors table), std COLMAP_PRIOR_STD m. With 0.1 m and
             # MTGS_MAX_PAIR_DIST=25 the block that fragmented under the plain mapper registered 3240/3240 images
             # at 0.07 m median / 0.14 m p90 from the priors, 0.81 px reprojection (33 outliers > 1.5 m).
-            std = os.environ.get("COLMAP_PRIOR_STD", "0.1")
+            scale = _colmap_scale(colmap_path)
+            std_m = float(os.environ.get("COLMAP_PRIOR_STD", "0.1")); std = f"{std_m * scale:.6g}"
+            print(f"[sfm] prior std {std_m} m = {std} colmap units (scale {scale:.5g})", flush=True)
             _write_pose_priors(colmap_path)
             mapper_args = [colmap_exe, "pose_prior_mapper", "--database_path", f"{colmap_path}/database.db",
                            "--image_path", f"{colmap_path}/images", "--output_path", raw,
@@ -381,7 +403,7 @@ def run_bundle_adjustment(
         shutil.copytree(os.path.join(raw, best), os.path.join(colmap_path, output_model, "0"))
         if mode == "pose_prior" and float(os.environ.get("MTGS_SFM_PRIOR_MAX_ERR", "0")) > 0:
             _drop_far_from_prior(colmap_path, os.path.join(colmap_path, output_model, "0"),
-                                 float(os.environ["MTGS_SFM_PRIOR_MAX_ERR"]), colmap_exe)
+                                 float(os.environ["MTGS_SFM_PRIOR_MAX_ERR"]), colmap_exe, scale=_colmap_scale(colmap_path))
         sys.exit(0)
 
     # 2 rounds of triangulation + bundle adjustment

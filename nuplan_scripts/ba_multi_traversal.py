@@ -312,6 +312,12 @@ def create_colmap_model(video_scene: VideoScene, video_scene_dict, colmap_path):
     cam_name_mapper = create_cameras_per_vehicle(video_scene_dict, colmap_path)
 
     scale_factor = 10 / max(video_scene.block_size)
+    # the COLMAP frame is this scaled frame (~10 units per block); every metre threshold handed to the SfM stage
+    # (COLMAP_PRIOR_STD, MTGS_SFM_PRIOR_MAX_ERR, MTGS_MAX_PAIR_DIST) must be multiplied by it. Exported for
+    # bundle_adjustment.py (child process) and written next to the model for stage restarts.
+    os.environ['MTGS_COLMAP_SCALE'] = repr(scale_factor)
+    with open(f'{colmap_path}/sparse_model/scale_factor.txt', 'w') as f_scale:
+        f_scale.write(f'{scale_factor!r}\n')
 
     with tqdm(total=VideoScene.count_total_frames(video_scene_dict), desc='Loading image infos', ncols=120) as progress_bar, \
             open(f"{colmap_path}/sparse_model/images.txt", "w") as f_images:
@@ -464,14 +470,14 @@ def create_colmap_model(video_scene: VideoScene, video_scene_dict, colmap_path):
             v2 = view2['view_field']
             iou = v1.intersection(v2).area / v1.union(v2).area
             if iou > 0.0:
-                if max_dist > 0 and 'center' in view1 and np.linalg.norm(view1['center'] - view2['center']) > max_dist:
+                if max_dist > 0 and 'center' in view1 and np.linalg.norm(view1['center'] - view2['center']) > max_dist * scale_factor:   # centres are in the scaled frame
                     n_far += 1
                     continue
                 candidates[i].append((iou, j))
                 candidates[j].append((iou, i))
 
     if max_dist > 0:
-        CONSOLE.log(f'[pairs] MTGS_MAX_PAIR_DIST={max_dist} m dropped {n_far} overlapping pairs')
+        CONSOLE.log(f'[pairs] MTGS_MAX_PAIR_DIST={max_dist} m (= {max_dist * scale_factor:.4g} colmap units) dropped {n_far} overlapping pairs')
     pairs = set()
     if max_per_image <= 0:
         for i, lst in candidates.items():

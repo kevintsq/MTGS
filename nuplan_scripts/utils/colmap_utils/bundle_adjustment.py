@@ -100,19 +100,35 @@ def _write_pose_priors(colmap_path):
                 continue
             q = Quaternion(*[float(x) for x in t[1:5]]); tv = np.array([float(x) for x in t[5:8]])
             centres[t[9]] = -(q.rotation_matrix.T @ tv)
-    db = sqlite3.connect(f"{colmap_path}/database.db")
-    cov = (np.eye(3) * 1.0).astype(np.float64).tobytes()
-    # COLMAP 4.2 keys pose_priors by image_id; 4.3 (the manco/kaitain/workstation builds) migrated the table to
-    # corr_data_id (= the image's data id, equal to image_id without rigs) -- pick whichever column exists
+    dbp = f"{colmap_path}/database.db"
+    db = sqlite3.connect(dbp)
     cols = [r[1] for r in db.execute("pragma table_info(pose_priors)")]
-    key = "corr_data_id" if "corr_data_id" in cols else "image_id"
+    rows = db.execute("select image_id, name, camera_id from images").fetchall()
     n = 0
-    for image_id, name in db.execute("select image_id, name from images").fetchall():
-        if name in centres:
-            db.execute(f"insert or replace into pose_priors({key}, position, coordinate_system, position_covariance) values (?, ?, 1, ?)",
-                       (image_id, centres[name].astype(np.float64).tobytes(), cov))
-            n += 1
-    db.commit(); db.close()
+    if "corr_sensor_id" in cols:
+        # COLMAP 4.3 schema (manco / kaitain / workstation builds): priors are keyed by data id = (sensor, image);
+        # pycolmap fills pose_prior_id, corr_sensor_type and gravity for us
+        db.close()
+        import pycolmap
+        pdb = pycolmap.Database(dbp)
+        for image_id, name, camera_id in rows:
+            if name not in centres:
+                continue
+            pp = pycolmap.PosePrior()
+            pp.corr_data_id = pycolmap.data_t(pycolmap.sensor_t(pycolmap.SensorType.CAMERA, int(camera_id)), int(image_id))
+            pp.position = centres[name].astype(np.float64)
+            pp.position_covariance = np.eye(3)
+            pp.coordinate_system = pycolmap.PosePriorCoordinateSystem.CARTESIAN
+            pdb.write_pose_prior(pp); n += 1
+        pdb.close()
+    else:   # COLMAP 4.2 (the docker image on torch / civo / ARC): image_id keyed
+        cov = (np.eye(3) * 1.0).astype(np.float64).tobytes()
+        for image_id, name, _cid in rows:
+            if name in centres:
+                db.execute("insert or replace into pose_priors(image_id, position, coordinate_system, position_covariance) values (?, ?, 1, ?)",
+                           (image_id, centres[name].astype(np.float64).tobytes(), cov))
+                n += 1
+        db.commit(); db.close()
     print(f"[sfm] pose priors written for {n}/{len(centres)} images", flush=True)
 
 

@@ -91,15 +91,22 @@ def _write_pose_priors(colmap_path):
     """Camera centres of sparse_model/images.txt (the registered poses) -> pose_priors (CARTESIAN) for every
     image the feature extractor registered in database.db."""
     import sqlite3
-    from pyquaternion import Quaternion
+    # no pyquaternion here: this module runs under whatever `python` the stage shell resolves (civo's lacked it,
+    # 2026-11-05, two pose_prior attempts of fk_loc_0113 died on the import); COLMAP images.txt is (qw qx qy qz tx ty tz)
+    def _rot(qw, qx, qy, qz):
+        n = (qw * qw + qx * qx + qy * qy + qz * qz) ** 0.5 or 1.0
+        qw, qx, qy, qz = qw / n, qx / n, qy / n, qz / n
+        return np.array([[1 - 2 * (qy * qy + qz * qz), 2 * (qx * qy - qz * qw), 2 * (qx * qz + qy * qw)],
+                         [2 * (qx * qy + qz * qw), 1 - 2 * (qx * qx + qz * qz), 2 * (qy * qz - qx * qw)],
+                         [2 * (qx * qz - qy * qw), 2 * (qy * qz + qx * qw), 1 - 2 * (qx * qx + qy * qy)]])
     centres = {}
     with open(f"{colmap_path}/sparse_model/images.txt") as f:
         for line in f:
             t = line.split()
             if len(t) < 10 or t[0].startswith("#"):
                 continue
-            q = Quaternion(*[float(x) for x in t[1:5]]); tv = np.array([float(x) for x in t[5:8]])
-            centres[t[9]] = -(q.rotation_matrix.T @ tv)
+            R = _rot(*[float(x) for x in t[1:5]]); tv = np.array([float(x) for x in t[5:8]])
+            centres[t[9]] = -(R.T @ tv)
     dbp = f"{colmap_path}/database.db"
     db = sqlite3.connect(dbp)
     cols = [r[1] for r in db.execute("pragma table_info(pose_priors)")]

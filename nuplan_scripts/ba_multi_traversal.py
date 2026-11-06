@@ -44,7 +44,9 @@ def copy_ego_masks(video_scene: VideoScene):
 # because the stage was restarted with an import that pointed inside it. Deleting is whitelist-only now;
 # MTGS_FORCE_CLEAN=1 overrides for a directory you really want gone.
 COLMAP_OWNED = {'images', 'masks', 'sparse_model', 'sfm_model', 'sfm_model_raw', 'image_pairs.txt',
-                'colmap_ba.log', 'name_to_token.json', 'rig_config.json', 'project.ini', 'prior_outliers.txt'}
+                'colmap_ba.log', 'colmap_triangulation.log',   # both _stage_log names (triangulation was missing:
+                # pn_gap3_01's clean_temp_files refused its own colmap/joint after a finished training, 2026-11-06)
+                'name_to_token.json', 'rig_config.json', 'project.ini', 'prior_outliers.txt'}
 
 
 def _foreign_entries(path):

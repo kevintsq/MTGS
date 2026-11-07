@@ -41,7 +41,8 @@ if __name__ == '__main__':
     video_scene = VideoScene(config)
 
     CONSOLE.log("Exporting background reconstruction model.", style='bold magenta')
-    reconstruction_dir = Path(config.data_root) / 'background_reconstruction' / config.road_block_name
+    recon_subdir = os.environ.get('MTGS_RECON_SUBDIR', 'background_reconstruction')   # as render_reconstruction
+    reconstruction_dir = Path(os.path.join(config.data_root, recon_subdir, config.road_block_name))
     nerfstudio_config = reconstruction_dir / 'config.yml'
 
     dst_ckpt_path = Path(args.output_dir) / f"{config.road_block_name}/background/{config.road_block_name}.ckpt"
@@ -57,17 +58,13 @@ if __name__ == '__main__':
         else:
             shutil.copy2(portable_ckpt_path, dst_ckpt_path)
     else:
-        # lazy import to speed up the script
-        from nerfstudio.utils.eval_utils import eval_setup
-        from mtgs.utils.export_utils import extract_portable_ckpt
-        # a resumed run (MTGS_CKPT_MIRROR) stored load_dir/load_step of the checkpoint it resumed FROM in its
-        # config: clear them so eval_setup takes the latest checkpoint of this run's own directory
-        def _no_resume(cfg):
-            cfg.load_dir = None
-            cfg.load_step = None
-            return cfg
-        nerfstudio_config, pipeline, _, _ = eval_setup(nerfstudio_config, test_mode='inference', update_config_callback=_no_resume)
-        extract_portable_ckpt(pipeline, dst_ckpt_path)
+        # built from the checkpoint file alone (no dataset, no initial point cloud, no GPU): the latest checkpoint
+        # of this run's own directory, whatever load_dir/load_step a resumed run left in its config
+        import yaml
+        from mtgs.utils.export_utils import extract_portable_ckpt_from_file
+        ns_config = yaml.load(nerfstudio_config.read_text(), Loader=yaml.Loader)
+        extract_portable_ckpt_from_file(portable_ckpt_path.with_name(portable_ckpt_path.name[len("portable_"):]),
+                                        ns_config, video_scene, dst_ckpt_path)
 
     CONSOLE.log("Exporting config.", style='bold magenta')
     save_config_path = os.path.join(video_scene.data_root, 'configs', os.path.basename(args.config))

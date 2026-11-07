@@ -41,6 +41,7 @@ from nerfstudio.model_components import renderers
 from nerfstudio.pipelines.base_pipeline import Pipeline
 from nerfstudio.utils import colormaps, install_checks
 from nerfstudio.utils.rich_utils import CONSOLE, ItersPerSecColumn
+from mtgs.utils.ckpt_io import load_ckpt
 
 
 def _render_trajectory_video(
@@ -74,9 +75,8 @@ def _render_trajectory_video(
         depth_near_plane: Closest depth to consider when using the colormap for depth. If None, use min value.
         depth_far_plane: Furthest depth to consider when using the colormap for depth. If None, use max value.
         colormap_options: Options for colormap.
-        keep_images: Also return every rendered frame. Each frame is a float32 array, so a full
-            camera pass costs len(cameras) * H * W * 12 bytes of RAM; leave this off unless the
-            caller genuinely needs the frames in memory rather than in the written video.
+        keep_images: Also return every rendered frame (uint8 arrays, H * W * 3 bytes each); leave this
+            off unless the caller genuinely needs the frames in memory rather than in the written video.
     """
     CONSOLE.print("[bold green]Creating trajectory " + output_format)
     cameras.rescale_output_resolution(rendered_resolution_scaling_factor)
@@ -144,26 +144,20 @@ def _render_trajectory_video(
                     output_image = outputs[rendered_output_name]
                     is_depth = rendered_output_name.find("depth") != -1
                     if is_depth:
-                        output_image = (
-                            colormaps.apply_depth_colormap(
-                                output_image,
-                                accumulation=outputs["accumulation"],
-                                near_plane=depth_near_plane,
-                                far_plane=depth_far_plane,
-                                colormap_options=colormap_options,
-                            )
-                            .cpu()
-                            .numpy()
+                        output_image = colormaps.apply_depth_colormap(
+                            output_image,
+                            accumulation=outputs["accumulation"],
+                            near_plane=depth_near_plane,
+                            far_plane=depth_far_plane,
+                            colormap_options=colormap_options,
                         )
                     else:
-                        output_image = (
-                            colormaps.apply_colormap(
-                                image=output_image,
-                                colormap_options=colormap_options,
-                            )
-                            .cpu()
-                            .numpy()
+                        output_image = colormaps.apply_colormap(
+                            image=output_image,
+                            colormap_options=colormap_options,
                         )
+                    # uint8 on the GPU (mediapy's to_uint8 formula): a quarter of the bytes down the bus, no CPU pass
+                    output_image = (output_image.clamp(0.0, 1.0) * 255.0 + 0.5).to(torch.uint8).cpu().numpy()
                     render_image.append(output_image)
 
                 render_image = np.concatenate(render_image, axis=1)
@@ -272,6 +266,7 @@ def eval_setup(
         and config.pipeline.model.camera_optimizer.mode == "SO3xR3":
         config.pipeline.datamanager.dataparser.load_cam_optim_from = checkpoint_path
     config.pipeline.datamanager.dataparser.eval_2hz = False
+    config.pipeline.datamanager.dataparser.load_3D_points = False   # the checkpoint replaces the initial gaussians
 
     if update_config_callback is not None:
         config = update_config_callback(config)
@@ -283,11 +278,17 @@ def eval_setup(
     assert isinstance(pipeline, Pipeline)
     pipeline.eval()
 
-    # load checkpointed information
-    loaded_state = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    # load checkpointed information (mmap: copied file -> GPU, no full host copy first)
+    loaded_state = load_ckpt(checkpoint_path)
     pipeline.load_pipeline(loaded_state["pipeline"], loaded_state["step"])
 
     return config, pipeline, checkpoint_path, loaded_state["step"]
+
+
+def _rgb_only(pipeline: Pipeline, rendered_output_names: List[str]) -> None:
+    """Skip the expected-depth and normal channels of the rasterization when no such output is written."""
+    if set(rendered_output_names) <= {"rgb", "rgb_appearance"}:
+        pipeline.model.rgb_only = True
 
 def _get_interpolated_camera_path(cameras: Cameras, steps: int, order_poses: bool) -> Cameras:
     """Generate a camera path between two cameras. Uses the camera type of the first camera
@@ -417,6 +418,7 @@ class RenderCameraPath(BaseRender):
             eval_num_rays_per_chunk=self.eval_num_rays_per_chunk,
             test_mode="inference",
         )
+        _rgb_only(pipeline, self.rendered_output_names)
 
         install_checks.check_ffmpeg_installed()
 
@@ -497,6 +499,7 @@ class RenderInterpolated(BaseRender):
             test_mode="inference",
             update_config_callback = update_config
         )
+        _rgb_only(pipeline, self.rendered_output_names)
 
         install_checks.check_ffmpeg_installed()
 

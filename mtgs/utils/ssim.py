@@ -83,7 +83,7 @@ def _ssim(
     C1 = (K1 * data_range) ** 2
     C2 = (K2 * data_range) ** 2
 
-    win = win.to(X.device, dtype=X.dtype)
+    win = win.to(X.device, dtype=X.dtype)   # a no-op when MaskedSSIM already keeps it on the device
 
     mu1 = gaussian_filter(X, win)
     mu2 = gaussian_filter(Y, win)
@@ -220,6 +220,8 @@ class MaskedSSIM(torch.nn.Module):
         self.nonnegative_ssim = nonnegative_ssim
 
     def forward(self, X: Tensor, Y: Tensor, mask: Optional[Tensor] = None) -> Tensor:
+        if self.win.device != X.device or self.win.dtype != X.dtype:   # once: it was copied from the host on every call
+            self.win = self.win.to(X.device, dtype=X.dtype)
         return ssim(
             X,
             Y,

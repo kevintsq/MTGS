@@ -623,8 +623,9 @@ class MTGSSceneModel(Model):
         )
         viewdirs = viewdirs / viewdirs.norm(dim=-1, keepdim=True)
         dots = (normals * viewdirs).sum(-1)
-        negative_dot_indices = dots < 0
-        normals[negative_dot_indices] = -normals[negative_dot_indices]
+        # where instead of a boolean-mask index_put: that needed the hit count on the host (two syncs
+        # in the forward and more in the backward) for every step
+        normals = torch.where((dots < 0)[:, None], -normals, normals)
 
         # convert normals from world space to camera space
         normals = normals @ camera.camera_to_worlds.squeeze(0)[:3, :3]

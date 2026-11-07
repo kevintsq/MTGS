@@ -328,10 +328,9 @@ def calculate_depth_ncc_loss(pred_depth, gt_depth, patch_size=7, stride=7, mask=
     pred_depth_patches = F.unfold(pred_depth.unsqueeze(0).unsqueeze(0), kernel_size=patch_size, padding=pad, stride=stride)
     gt_depth_patches = F.unfold(gt_depth.unsqueeze(0).unsqueeze(0), kernel_size=patch_size, padding=pad, stride=stride)
     mask_depth_patches = F.unfold(mask.unsqueeze(0).unsqueeze(0), kernel_size=patch_size, padding=pad, stride=stride)
-    valid_mask = mask_depth_patches.all(dim=1)
-    valid_mask = valid_mask.squeeze(0)
-    pred_depth_patches = pred_depth_patches[:, :, valid_mask]
-    gt_depth_patches = gt_depth_patches[:, :, valid_mask]
+    # every patch is normalised and the invalid ones are masked out of the mean: the boolean index needed
+    # the number of valid patches on the host (a GPU sync per step); no valid patch gives 0, not NaN
+    valid_mask = mask_depth_patches.all(dim=1).squeeze(0)
     pred_mean = pred_depth_patches.mean(dim=1, keepdim=True)
     gt_mean = gt_depth_patches.mean(dim=1, keepdim=True)
     pred_centered = pred_depth_patches - pred_mean
@@ -342,8 +341,9 @@ def calculate_depth_ncc_loss(pred_depth, gt_depth, patch_size=7, stride=7, mask=
     
     pred_normalized = pred_centered / pred_std
     gt_normalized = gt_centered / gt_std
-    ncc = (pred_normalized * gt_normalized).mean(dim=1)
-    ncc_loss = 1 - ncc.mean()
+    ncc = (pred_normalized * gt_normalized).mean(dim=1).squeeze(0)
+    n_valid = valid_mask.sum()
+    ncc_loss = torch.where(n_valid > 0, 1 - torch.where(valid_mask, ncc, 0.0).sum() / n_valid.clamp_min(1), 0.0)
 
     return ncc_loss
 

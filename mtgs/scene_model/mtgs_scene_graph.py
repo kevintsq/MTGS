@@ -36,7 +36,7 @@ from mtgs.utils.geometric_loss import DepthLossType, DepthLoss, TVLoss, calculat
 from mtgs.utils.ssim import MaskedSSIM
 from mtgs.utils.pnsr import MaskedPSNR, color_correct
 
-from .gaussian_model.vanilla_gaussian_splatting import VanillaGaussianSplattingModelConfig, GaussianSplattingControlConfig
+from .gaussian_model.vanilla_gaussian_splatting import VanillaGaussianSplattingModel, VanillaGaussianSplattingModelConfig, GaussianSplattingControlConfig
 from .gaussian_model.rigid_node import RigidSubModel, rigid_batch_key, batched_rigid_gaussians
 from .gaussian_model.utils import quat_to_rotmat, SH2RGB
 
@@ -54,6 +54,14 @@ def merge_control_cfg(global_control, model_cfg):
                 setattr(default_ctrl_cfg, attr, value)
     model_cfg.control = default_ctrl_cfg
     return model_cfg
+
+
+def masked_mean(x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    """x[mask].mean() without the boolean index, whose output size forces a host sync every call.
+    mask is [..., 1] bool and broadcasts over x's last dim; an empty mask gives 0 instead of NaN."""
+    count = mask.sum() * (x.shape[-1] // mask.shape[-1])
+    return torch.where(mask, x, 0.0).sum() / count.clamp_min(1)
+
 
 @dataclass
 class MTGSSceneModelConfig(ModelConfig):
@@ -619,8 +627,9 @@ class MTGSSceneModel(Model):
         )
         viewdirs = viewdirs / viewdirs.norm(dim=-1, keepdim=True)
         dots = (normals * viewdirs).sum(-1)
-        negative_dot_indices = dots < 0
-        normals[negative_dot_indices] = -normals[negative_dot_indices]
+        # where instead of a boolean-mask index_put: that needed the hit count on the host (two syncs
+        # in the forward and more in the backward) for every step
+        normals = torch.where((dots < 0)[:, None], -normals, normals)
 
         # convert normals from world space to camera space
         normals = normals @ camera.camera_to_worlds.squeeze(0)[:3, :3]
@@ -629,11 +638,10 @@ class MTGSSceneModel(Model):
 
     def get_outputs(self, camera: Cameras) -> Dict[str, Union[torch.Tensor, List]]:
         assert camera.shape[0] == 1, "Only one camera at a time"
-        camera = copy.deepcopy(camera)
-
-        if camera.metadata is None:
-            camera.metadata = {}
-        if camera.times is not None:
+        # only the metadata dict is written below: a shallow copy instead of deepcopy, which cloned every camera tensor
+        camera = copy.copy(camera)
+        camera.metadata = dict(camera.metadata) if camera.metadata is not None else {}
+        if camera.times is not None and "timestamp" not in camera.metadata:   # the dataset stores the host copy
             camera.metadata["timestamp"] = camera.times.item()
 
         travel_id = camera.metadata.get("travel_id")
@@ -649,24 +657,21 @@ class MTGSSceneModel(Model):
             cam_idx = self.cam_token2cam_idx.get(cam_token)
         camera.metadata["cam_idx"] = cam_idx
 
-        linear_velocity = camera.metadata.get("linear_velocity", np.array([0, 0, 0], dtype=np.float32))
-        angular_velocity = camera.metadata.get("angular_velocity", np.array([0, 0, 0], dtype=np.float32))
-        linear_velocity = torch.from_numpy(linear_velocity).float().to(self.device)[None]
-        angular_velocity = torch.from_numpy(angular_velocity).float().to(self.device)[None]
-        camera.metadata["linear_velocity"] = linear_velocity
-        camera.metadata["angular_velocity"] = angular_velocity
+        for key in ("linear_velocity", "angular_velocity"):   # dataset cameras carry them as tensors already (moved with the camera)
+            v = camera.metadata.get(key, np.zeros(3, dtype=np.float32))
+            if not torch.is_tensor(v):
+                v = torch.from_numpy(v).float()[None]
+            camera.metadata[key] = v.to(self.device)
 
         self._record_cur_cam_meta(camera.metadata)
 
         if camera.metadata.get("cam_idx") is not None:
-            optimized_camera_to_world = self.camera_optimizer.apply_to_camera(camera)[0, ...]
-        else:
-            optimized_camera_to_world = camera.camera_to_worlds[0, ...]
-
-        if camera.metadata.get("cam_idx") is not None:
-            camera_idx = torch.tensor([camera.metadata["cam_idx"]], dtype=torch.long, device=camera.device)
+            # a view into a cached device arange: torch.tensor([idx], device=...) is a blocking host->device copy per step
+            camera_idx = self._cam_index_table()[cam_idx:cam_idx + 1]
+            optimized_camera_to_world = self._apply_camera_optimizer(camera, camera_idx)[0, ...]
         else:
             camera_idx = None
+            optimized_camera_to_world = camera.camera_to_worlds[0, ...]
 
         get_gaussians_kwargs = camera.metadata.copy()
         get_gaussians_kwargs["return_features"] = self.config.use_wild_gaussians
@@ -682,18 +687,17 @@ class MTGSSceneModel(Model):
             visible_tokens=visible_tokens,
             camera_to_worlds=optimized_camera_to_world, **get_gaussians_kwargs
         )
+        # host copy of width/height (dataset metadata); .item() on the device camera would stall the GPU queue
+        W, H = camera.metadata.get("image_size") or (int(camera.width.item()), int(camera.height.item()))
         if collected_gaussians['means'].shape[0] == 0:
-            return self.get_empty_outputs(
-                int(camera.width.item()), int(camera.height.item()), self.background_color, travel_id
-            )
+            return self.get_empty_outputs(W, H, self.background_color, travel_id)
         self.collected_gaussians = collected_gaussians
 
         # shift the camera to center of scene looking at center
         R = optimized_camera_to_world[:3, :3]  # 3 x 3
         T = optimized_camera_to_world[:3, 3:4]  # 3 x 1
-        # flip the z and y axes to align with gsplat conventions
-        R_edit = torch.diag(torch.tensor([1, -1, -1], device=self.device, dtype=R.dtype))
-        R = R @ R_edit
+        # flip the z and y axes to align with gsplat conventions (constant cached on the device)
+        R = R @ self._diag_flip_yz(R.dtype)
         # analytic matrix inverse to get world2camera matrix
         R_inv = R.T
         T_inv = -R_inv @ T
@@ -702,7 +706,6 @@ class MTGSSceneModel(Model):
         viewmat[:3, 3:4] = T_inv
         viewmat = viewmat.unsqueeze(0)
 
-        W, H = int(camera.width.item()), int(camera.height.item())
         background = self.background_color
 
         if self.config.output_depth_during_training or (not self.training and not self.rgb_only):
@@ -736,7 +739,7 @@ class MTGSSceneModel(Model):
             opacities=collected_gaussians['opacities'],
             colors=render_colors,
             viewmats=viewmat,  # [1, 4, 4]
-            Ks=camera.get_intrinsics_matrices().cuda(),  # [1, 3, 3]
+            Ks=self._intrinsics_matrix(camera),  # [1, 3, 3], built on the device (nerfstudio's fills a CPU K from device scalars)
             width=W,
             height=H,
             tile_size=BLOCK_WIDTH,
@@ -775,7 +778,9 @@ class MTGSSceneModel(Model):
         if predict_normals:
             start_ch_idx = 3
             normals_im = render[..., start_ch_idx:start_ch_idx+3].squeeze(0)
-            normals_im = normals_im / normals_im.norm(dim=-1, keepdim=True)
+            # floor on the norm: an uncovered pixel (alpha 0) rendered 0/0 = NaN, which the loss then had to
+            # test for on the host every step (torch.isfinite + python if); now the loss is always finite
+            normals_im = normals_im / normals_im.norm(dim=-1, keepdim=True).clamp_min(1e-8)
             normals_im = (normals_im + 1) / 2
         else:
             normals_im = None
@@ -800,6 +805,35 @@ class MTGSSceneModel(Model):
 
     def forward(self, camera: Cameras) -> Dict[str, Union[torch.Tensor, List]]:
         return self.get_outputs(camera)
+
+    # ---- device-resident constants for the train step (each was rebuilt from host data every step) ----
+    def _cam_index_table(self):
+        t = getattr(self, "_cam_index_dev", None)
+        if t is None or t.device != torch.device(self.device) or t.shape[0] < self.num_train_data:
+            t = self._cam_index_dev = torch.arange(self.num_train_data, dtype=torch.long, device=self.device)
+        return t
+
+    def _diag_flip_yz(self, dtype=torch.float32):
+        t = getattr(self, "_diag_flip_dev", None)
+        if t is None or t.device != torch.device(self.device) or t.dtype != dtype:
+            t = self._diag_flip_dev = torch.diag(torch.tensor([1, -1, -1], dtype=dtype)).to(self.device)
+        return t
+
+    @staticmethod
+    def _intrinsics_matrix(camera: Cameras):
+        """camera.get_intrinsics_matrices() for one camera, assembled on the camera's device."""
+        fx, fy, cx, cy = (camera.fx.reshape(()), camera.fy.reshape(()), camera.cx.reshape(()), camera.cy.reshape(()))
+        zero, one = fx.new_zeros(()), fx.new_ones(())
+        return torch.stack([fx, zero, cx, zero, fy, cy, zero, zero, one]).view(1, 3, 3)
+
+    def _apply_camera_optimizer(self, camera: Cameras, camera_idx: torch.Tensor):
+        """CameraOptimizer.apply_to_camera with a device index: nerfstudio builds torch.tensor([idx]) on the
+        host and indexes the device parameter with it (a blocking copy every step). Same maths."""
+        c2w = camera.camera_to_worlds
+        if self.camera_optimizer.config.mode == "off":
+            return c2w
+        adj = self.camera_optimizer(camera_idx)   # [1, 3, 4]
+        return torch.cat([torch.bmm(adj[..., :3, :3], c2w[..., :3, :3]), c2w[..., :3, 3:] + adj[..., :3, 3:]], dim=-1)
 
     def get_gt_img(self, image: torch.Tensor):
         """Compute groundtruth image with iteration dependent downscale factor for evaluation purpose
@@ -842,13 +876,16 @@ class MTGSSceneModel(Model):
             outputs: the output to compute loss dict to
             batch: ground truth batch corresponding to outputs
         """
+        # The trainer only writes metrics every steps_per_log steps (writer.put_dict), yet a full SSIM, LPIPS,
+        # masked PSNR and the depth metrics were computed and discarded on every other step.
+        steps_per_log = getattr(self, "_steps_per_log", None)
+        if self.training and steps_per_log is not None and (steps_per_log == 0 or self.step % steps_per_log != 0):
+            return {}
         gt_rgb = self.composite_with_background(self.get_gt_img(batch["image"]), outputs["background"])
         metrics_dict = {}
         pred_img = outputs["rgb"]
         pred_img_appearance = outputs["rgb_appearance"]
         mask = self.combine_visible_mask(pred_img, gt_rgb, batch=batch)
-        if mask.sum() == 0:
-            assert "no visible mask for the camera."
 
         if self.config.color_corrected_metrics:
             if mask is not None:
@@ -913,12 +950,16 @@ class MTGSSceneModel(Model):
         # This is a little bit sketchy for the SSIM loss.
         combined_mask = self.combine_visible_mask(pred_img, gt_img, batch=batch)
 
-        l1_Loss = torch.abs(gt_img - pred_img_appearance)[combined_mask.squeeze(-1)].mean()
+        l1_Loss = masked_mean(torch.abs(gt_img - pred_img_appearance), combined_mask)
         loss_dict = {
             "L1 Loss": (1 - self.config.ssim_lambda) * l1_Loss
         }
         if self.config.ssim_lambda > 0:
-            if self.config.use_ssim_on_raw_rgb:
+            if (self.config.use_ssim_on_raw_rgb and metrics_dict is not None and "ssim" in metrics_dict
+                    and metrics_dict["ssim"].requires_grad):
+                # the metrics SSIM (log steps) is this exact computation: gt vs raw rgb under the same mask
+                ssim_loss = 1 - metrics_dict["ssim"]
+            elif self.config.use_ssim_on_raw_rgb:
                 ssim_loss = 1 - self.ssim(
                     gt_img.permute(2, 0, 1)[None, ...], 
                     pred_img.permute(2, 0, 1)[None, ...],
@@ -944,89 +985,89 @@ class MTGSSceneModel(Model):
                 raise ValueError(f"Unknown depth source: {self.config.depth_source}")
 
             depth_loss_mask = depth_loss_mask & combined_mask
- 
-            if depth_loss_mask.sum() == 0:
-                loss_dict["Depth Loss"] = torch.tensor(0.0, device=self.device)
-            else:
-                if self.config.use_depth_loss:
-                    pred_depth = outputs["depth"].to(self.device)
-                    if self.config.depth_source == "pseudo":
-                        # use mono dpeth to compute depth loss
-                        if self.config.depth_loss_type == DepthLossType.EdgeAwareLogL1:
-                            depth_loss = self.depth_loss(
-                                pred_depth, gt_depth.float(), gt_img, depth_loss_mask
-                            )
-                            loss_dict['Depth Loss'] = self.config.depth_lambda * depth_loss
-                        else:
-                            depth_loss = self.depth_loss(
-                               pred_depth[depth_loss_mask], gt_depth[depth_loss_mask].float()
-                            )
-                            loss_dict['Depth Loss'] = self.config.depth_lambda * depth_loss
 
-                    elif self.config.depth_source == "lidar":
-                        if self.config.depth_loss_type == DepthLossType.InverseL1:
-                            inverse_gt_depth = 1 / (gt_depth + 1e-5)
-                            inverse_pred_depth = 1 / (pred_depth + 1e-5)
-                            loss_depth = torch.abs(inverse_gt_depth - inverse_pred_depth)[depth_loss_mask].mean()
-                        elif self.config.depth_loss_type == DepthLossType.L1:
-                            loss_depth = torch.abs(gt_depth - pred_depth)[depth_loss_mask].mean()
-                        else:
-                            raise NotImplementedError(f"Lidar depth loss type {self.config.depth_loss_type} not implemented")
-                        loss_dict["Depth Loss"] = self.config.depth_lambda * loss_depth
+            if self.config.use_depth_loss:
+                pred_depth = outputs["depth"]
+                if self.config.depth_source == "pseudo":
+                    # use mono dpeth to compute depth loss (DepthLoss module; empty-mask guard kept here only)
+                    if depth_loss_mask.sum() == 0:
+                        loss_dict["Depth Loss"] = torch.tensor(0.0, device=self.device)
+                    elif self.config.depth_loss_type == DepthLossType.EdgeAwareLogL1:
+                        depth_loss = self.depth_loss(
+                            pred_depth, gt_depth.float(), gt_img, depth_loss_mask
+                        )
+                        loss_dict['Depth Loss'] = self.config.depth_lambda * depth_loss
+                    else:
+                        depth_loss = self.depth_loss(
+                           pred_depth[depth_loss_mask], gt_depth[depth_loss_mask].float()
+                        )
+                        loss_dict['Depth Loss'] = self.config.depth_lambda * depth_loss
+
+                elif self.config.depth_source == "lidar":
+                    # masked means: an empty mask gives 0 (the old .sum()==0 branch) without a host sync
+                    if self.config.depth_loss_type == DepthLossType.InverseL1:
+                        inverse_gt_depth = 1 / (gt_depth + 1e-5)
+                        inverse_pred_depth = 1 / (pred_depth + 1e-5)
+                        loss_depth = masked_mean(torch.abs(inverse_gt_depth - inverse_pred_depth), depth_loss_mask)
+                    elif self.config.depth_loss_type == DepthLossType.L1:
+                        loss_depth = masked_mean(torch.abs(gt_depth - pred_depth), depth_loss_mask)
+                    else:
+                        raise NotImplementedError(f"Lidar depth loss type {self.config.depth_loss_type} not implemented")
+                    loss_dict["Depth Loss"] = self.config.depth_lambda * loss_depth
 
             # "depth" (UniDepth pseudo depth) may be absent for the few frames
             # whose depth map was skipped as degenerate -- skip aux losses then.
             if self.config.ncc_loss_lambda > 0 and "depth" in batch:
                 patch_size = self.config.ncc_patch_size
                 stride = self.config.ncc_stride
-                pred_depth = outputs["depth"].to(self.device)
+                pred_depth = outputs["depth"]
                 gt_depth = batch["depth"].to(self.device)
                 depth_loss_mask = (gt_depth > 0.1) & (gt_depth < 80) & combined_mask
-                if depth_loss_mask.sum() != 0:
-                    ncc_loss = calculate_depth_ncc_loss(pred_depth, gt_depth, patch_size, stride, mask=depth_loss_mask)
-                    loss_dict['ncc_loss'] = ncc_loss * self.config.ncc_loss_lambda
+                # no valid patch -> 0 inside calculate_depth_ncc_loss (the old .sum()!=0 gate was a host sync)
+                ncc_loss = calculate_depth_ncc_loss(pred_depth, gt_depth, patch_size, stride, mask=depth_loss_mask)
+                loss_dict['ncc_loss'] = ncc_loss * self.config.ncc_loss_lambda
 
         # Normal Loss
         if self.config.use_normal_loss:
             normal_loss = 0.0
             gt_normal = None
-            pred_normal = outputs["normal"].to(self.device)
+            pred_normal = outputs["normal"]
 
             if "normal" in batch and self.config.normal_supervision == "mono":
                 gt_normal = batch["normal"].to(self.device)
-                normal_loss_mask = combined_mask.squeeze(-1)
+                normal_loss_mask = combined_mask
 
             elif self.config.normal_supervision == "depth" and "depth" in batch:
                 gt_depth = batch["depth"].to(self.device)
                 normal_loss_mask = (gt_depth > 0.1) & (gt_depth < 50)
                 normal_loss_mask = normal_loss_mask & combined_mask
 
-                normal_loss_mask = normal_loss_mask.squeeze(-1)
-                camera = outputs["camera"].to(self.device)
+                camera = outputs["camera"]
+                # intrinsics stay device tensors (.item() x4 was a sync each), the pixel grid is cached per
+                # image size on the device, and the identity c2w is skipped instead of inverted
                 gt_normal = normal_from_depth_image(
                     depths=gt_depth.detach(),
-                    fx=camera.fx.item(),
-                    fy=camera.fy.item(),
-                    cx=camera.cx.item(),
-                    cy=camera.cy.item(),
-                    img_size=(camera.width.item(), camera.height.item()),
-                    c2w=torch.eye(4, dtype=torch.float, device=self.device),
+                    fx=camera.fx.reshape(()),
+                    fy=camera.fy.reshape(()),
+                    cx=camera.cx.reshape(()),
+                    cy=camera.cy.reshape(()),
+                    img_size=camera.metadata.get("image_size") or (camera.width.item(), camera.height.item()),
+                    c2w=None,
                     device=self.device,
                     smooth=False,
                 )
-                gt_normal = gt_normal @ torch.diag(
-                    gt_normal.new_tensor([1, -1, -1])
-                )
+                gt_normal = gt_normal @ self._diag_flip_yz(gt_normal.dtype)
                 gt_normal = (1 + gt_normal) / 2
 
             if gt_normal is not None:
-                normal_loss = torch.abs(gt_normal - pred_normal)[normal_loss_mask].mean()
+                normal_loss = masked_mean(torch.abs(gt_normal - pred_normal), normal_loss_mask)
 
             if self.config.use_normal_tv_loss:
                 normal_loss += self.tv_loss(pred_normal)
 
-            if torch.isfinite(normal_loss):
-                loss_dict["Normal Loss"] = self.config.normal_lambda * normal_loss
+            # always finite now: the rendered normal is normalised with a floored norm and the masked mean of an
+            # empty mask is 0, so the per-step torch.isfinite host check is gone
+            loss_dict["Normal Loss"] = self.config.normal_lambda * normal_loss
 
         if self.config.two_d_gaussians:
             # loss to minimise gaussian scale corresponding to normal direction
@@ -1041,51 +1082,8 @@ class MTGSSceneModel(Model):
             loss_dict["Adapter Loss"] = self.config.adapter_lambda * adapter_loss
 
         if self.config.oob_lambda != 0.0:
-            oob_loss = 0.0
-            overall_gaussians = 0
-            visible_mask = (outputs['radii'] > 0).flatten()
-            for model_name, model in self.gaussian_models.items():
-                if isinstance(model, RigidSubModel):
-                    # Visibility gate. With contiguous submodel slices all
-                    # rigid models are checked with ONE host sync instead of a
-                    # mask + .sum() sync per model per step.
-                    slices = getattr(self, "_model_slices", None)
-                    if slices is not None:
-                        if not hasattr(self, "_rigid_vis_flags"):
-                            names = [n for n, m in self.gaussian_models.items()
-                                     if isinstance(m, RigidSubModel) and n in slices]
-                            if names:
-                                flags = torch.stack([visible_mask[slices[n][0]:slices[n][1]].any()
-                                                     for n in names]).tolist()
-                                self._rigid_vis_flags = dict(zip(names, flags))
-                            else:
-                                self._rigid_vis_flags = {}
-                        if not self._rigid_vis_flags.get(model_name, False):
-                            continue
-                    else:
-                        model_mask = self.collected_gaussians['model_id'] == self.model_ids[model_name]
-                        if visible_mask[model_mask].sum() == 0:
-                            continue
-                    means = model.means
-                    # cached on the device: new_tensor from a list is a blocking copy
-                    instance_size = getattr(model, "_instance_size_t", None)
-                    if instance_size is None or instance_size.device != means.device:
-                        instance_size = model._instance_size_t = means.new_tensor(model.instance_size)
-                    oob_mask = means.abs() > (instance_size / 2 + self.config.oob_tolerance)[None]
-                    oob_mask = oob_mask.any(-1).detach()
-                    # unconditional tensor accumulation: empty selections sum
-                    # to 0 and cost no host sync (the old .sum()!=0 gate did);
-                    # torch.where instead of a boolean index for the same reason
-                    oob_terms = -torch.log(1 - model.opacities.sigmoid() + 1e-6)
-                    oob_loss = oob_loss + torch.where(oob_mask.view(-1, *([1] * (oob_terms.dim() - 1))),
-                                                      oob_terms, 0.0).sum()
-                    overall_gaussians = overall_gaussians + oob_mask.sum()
-            if hasattr(self, "_rigid_vis_flags"):
-                del self._rigid_vis_flags
-            if torch.is_tensor(overall_gaussians):
-                overall_gaussians = int(overall_gaussians)  # single sync per step
-            if overall_gaussians != 0:
-                oob_loss = oob_loss / overall_gaussians
+            oob_loss = self._oob_loss(outputs['radii'])
+            if oob_loss is not None:
                 loss_dict["OOB Loss"] = self.config.oob_lambda * oob_loss
 
         if self.config.sharp_shape_reg_lambda != 0.0:
@@ -1107,6 +1105,42 @@ class MTGSSceneModel(Model):
             self.camera_optimizer.get_loss_dict(loss_dict)
 
         return loss_dict
+
+    def _oob_loss(self, radii):
+        """Out-of-bounds opacity penalty over every rigid object rendered this step, evaluated in ONE batch
+        over the objects' contiguous slices: per object this was ~8 kernels plus host-side visibility flags
+        (.tolist()) and a final int() sync. Same value: sum of the penalised terms / their count, objects with
+        no visible gaussian excluded; a count of 0 gives 0 (the key was absent before)."""
+        slices = getattr(self, "_model_slices", None)
+        if slices is None:
+            return None
+        names = getattr(self, "_rigid_model_names", None)
+        if names is None:
+            names = self._rigid_model_names = [n for n, m in self.gaussian_models.items() if isinstance(m, RigidSubModel)]
+        nodes = [(self.gaussian_models[n], slices[n]) for n in names if n in slices]
+        if not nodes:
+            return None
+        visible = (radii > 0).flatten()
+        means = torch.cat([m.means for m, _ in nodes])
+        opacities = torch.cat([m.opacities for m, _ in nodes]).squeeze(-1)
+        ar = torch.arange(len(nodes), device=means.device)
+        # object id per parameter row and per rendered row (a slice may hold more rows than the object has
+        # parameters, e.g. mirrored objects): visibility is reduced over the rendered rows
+        row_obj = torch.cat([ar[i:i + 1].expand(m.means.shape[0]) for i, (m, _) in enumerate(nodes)])
+        vis = torch.cat([visible[s:e] for _, (s, e) in nodes])
+        vis_obj = torch.cat([ar[i:i + 1].expand(e - s) for i, (_, (s, e)) in enumerate(nodes)])
+        sizes = []
+        for m, _ in nodes:   # cached on the device: new_tensor from a list is a blocking copy
+            t = getattr(m, "_instance_size_t", None)
+            if t is None or t.device != means.device:
+                t = m._instance_size_t = means.new_tensor(m.instance_size)
+            sizes.append(t)
+        half = torch.stack(sizes) / 2 + self.config.oob_tolerance                      # [K, 3]
+        obj_visible = torch.zeros(len(nodes), device=means.device).index_add_(0, vis_obj, vis.float()) > 0
+        oob_mask = (means.abs() > half.index_select(0, row_obj)).any(-1) & obj_visible.index_select(0, row_obj)
+        oob_mask = oob_mask.detach()
+        oob_terms = -torch.log(1 - opacities.sigmoid() + 1e-6)
+        return torch.where(oob_mask, oob_terms, 0.0).sum() / oob_mask.sum().clamp_min(1)
 
     @torch.no_grad()
     def get_outputs_for_camera(self, camera: Cameras, obb_box: Optional[OrientedBox] = None) -> Dict[str, torch.Tensor]:
@@ -1248,6 +1282,10 @@ class MTGSSceneModel(Model):
         self, training_callback_attributes: TrainingCallbackAttributes
     ) -> List[TrainingCallback]:
         cbs = []
+        trainer = getattr(training_callback_attributes, "trainer", None)
+        if trainer is not None:   # get_metrics_dict computes the train metrics only on the steps the trainer logs
+            self._steps_per_log = trainer.config.logging.steps_per_log
+        self._freeze_zero_lr_params(getattr(training_callback_attributes, "optimizers", None))
 
         cbs.append(
             TrainingCallback(
@@ -1285,6 +1323,30 @@ class MTGSSceneModel(Model):
 
     def step_cb(self, step):
         self.step = step
+        # refinement rebuilds gauss_params as fresh Parameters (requires_grad=True): re-freeze before the
+        # forward, so a zero-lr parameter never gets a gradient or Adam state
+        for model, pname in getattr(self, "_frozen_gauss_params", ()):
+            if model.gauss_params[pname].requires_grad:
+                model.gauss_params[pname].requires_grad_(False)
+
+    def _freeze_zero_lr_params(self, optimizers):
+        """A parameter whose optimizer has lr 0 and no scheduler never changes, yet it received a gradient
+        (an [N, T, 3] zero-filled index backward for multicolor.features_adapters), fused-Adam state and an
+        Adam step every step, and its state was saved in every checkpoint. requires_grad=False drops all of
+        that; the parameter stays in the model and in its (now stateless) param group, so checkpoints,
+        export and the split/dup/cull bookkeeping are unchanged. State loaded from an older checkpoint is
+        dropped here (this runs after the checkpoint load)."""
+        if optimizers is None:
+            return
+        frozen = set()
+        for name, cfg in optimizers.config.items():
+            if cfg["optimizer"].lr == 0 and cfg.get("scheduler") is None:
+                for p in optimizers.parameters[name]:
+                    p.requires_grad_(False)
+                    optimizers.optimizers[name].state.pop(p, None)
+                    frozen.add(p)
+        self._frozen_gauss_params = [(model, pname) for model in self.gaussian_models.values()
+                                     for pname, p in model.gauss_params.items() if p in frozen]
 
     def set_crop(self, crop_box: Optional[OrientedBox]):
         self.crop_box = crop_box
@@ -1298,25 +1360,19 @@ class MTGSSceneModel(Model):
         # (see get_gaussians); slicing avoids one boolean mask + .sum() GPU
         # sync per submodel per step.
         slices = getattr(self, "_model_slices", None)
+        if slices is not None:
+            return self._update_submodel_statistics_batched(step, slices)
+        # no slices (cropped collection): the original per-submodel boolean-mask path
         for model_name, gaussian_model in self.gaussian_models.items():
-            if slices is not None:
-                span = slices.get(model_name)
-            else:
-                model_id = self.model_ids[model_name]
-                submodel_mask = self.collected_gaussians["model_id"] == model_id
-                span = None if submodel_mask.sum() == 0 else submodel_mask
-
-            if span is None:
+            model_id = self.model_ids[model_name]
+            submodel_mask = self.collected_gaussians["model_id"] == model_id
+            if submodel_mask.sum() == 0:
                 gaussian_model.update_statistics(
                     xys_grad=None,
                     radii=None
                 )
                 continue
-
-            if isinstance(span, tuple):
-                index = slice(*span)
-            else:
-                index = span
+            index = submodel_mask
 
             with torch.no_grad():
                 assert self.xys.grad is not None
@@ -1338,6 +1394,62 @@ class MTGSSceneModel(Model):
                 xys_grad=grads,
                 radii=radii
             )
+
+    @torch.no_grad()
+    def _update_submodel_statistics_batched(self, step, slices):
+        """update_statistics for every submodel from ONE grad-norm pass over the concatenated means2d, then
+        the per-submodel after_train accumulation (vis_counts, xys_grad_norm, max_2Dsize) as three foreach
+        kernels over all submodels instead of ~5 kernels per submodel per step (hundreds of rigid objects).
+        The values are the ones VanillaGaussianSplattingModel.after_train computes; submodels with their own
+        update_statistics/after_train keep their per-model path."""
+        assert self.xys.grad is not None
+        radii = self.radii[0]
+        if getattr(self, "_image_size_key", None) != (self.last_size, radii.device):
+            self._image_size_key = (self.last_size, radii.device)
+            self._image_size_t = torch.tensor([[self.last_size[1], self.last_size[0]]], dtype=torch.float32).to(radii.device)
+        grad_norms = {}   # use_abs_grad -> [N] screen-space gradient norm
+
+        def grad_norm(use_abs):
+            if use_abs not in grad_norms:
+                g = self.xys.absgrad[0] if use_abs else self.xys.grad[0]
+                grad_norms[use_abs] = (g.detach() * self._image_size_t * 0.5).norm(dim=-1)
+            return grad_norms[use_abs]
+
+        batched = []
+        for model_name, model in self.gaussian_models.items():
+            span = slices.get(model_name)
+            if span is None:
+                model.update_statistics(xys_grad=None, radii=None)
+                continue
+            index = slice(*span)
+            model.update_statistics(xys_grad=grad_norm(model.config.control.use_abs_grad)[index], radii=radii[index])
+            if (type(model).update_statistics is VanillaGaussianSplattingModel.update_statistics
+                    and type(model).after_train in (VanillaGaussianSplattingModel.after_train, RigidSubModel.after_train)
+                    and not model.frozen and model.step < model.ctrl_config.stop_split_at
+                    and not (isinstance(model, RigidSubModel)
+                             and (model.frame_idx is None or not model.in_frame(model.frame_idx)))):
+                batched.append((model, index))
+        if not batched:
+            return
+        visible = radii > 0
+        visible_f = visible.float()
+        radii_f = radii.float()
+        grad_masked = {k: torch.where(visible, v, 0.0) for k, v in grad_norms.items()}
+        vis_counts, grad_acc, max_sizes, vis_src, grad_src, radii_src = [], [], [], [], [], []
+        for model, index in batched:
+            if model.xys_grad_norm is None:
+                model.xys_grad_norm = torch.zeros(model.num_points, device=radii.device, dtype=torch.float32)
+                model.vis_counts = torch.ones(model.num_points, device=radii.device, dtype=torch.float32)
+            if model.max_2Dsize is None:
+                model.max_2Dsize = torch.zeros(index.stop - index.start, device=radii.device, dtype=torch.float32)
+            vis_counts.append(model.vis_counts); vis_src.append(visible_f[index])
+            grad_acc.append(model.xys_grad_norm); grad_src.append(grad_masked[model.config.control.use_abs_grad][index])
+            max_sizes.append(model.max_2Dsize); radii_src.append(radii_f[index])
+            model._stats_step = step   # its own after_train callback skips this step
+        torch._foreach_add_(vis_counts, vis_src)
+        torch._foreach_add_(grad_acc, grad_src)
+        # max_2Dsize >= 0 and radii == 0 where not visible, so the plain maximum equals the masked update
+        torch._foreach_maximum_(max_sizes, radii_src)
 
     def load_state_dict(self, dict: dict, **kwargs):  # type: ignore
         sub_model_state_dict = {model_name: {} for model_name in self.gaussian_models.keys()}

@@ -78,7 +78,8 @@ class LearnableExposureRGBModel(GSAppearanceModel):
         if indices is None:
             return image
 
-        exposure_factor = self.exposure_factor[indices[0]]
+        # indices[0] is a 0-dim device tensor: indexing with it reads the value back to the host every step
+        exposure_factor = self.exposure_factor.index_select(0, indices[:1])[0]
 
         # exposure_factor = exposure_factor * self.v_adjust.data[indices]
         optimized_image = image.matmul(exposure_factor[:3, :3]) + exposure_factor[None, None, :3, 3]

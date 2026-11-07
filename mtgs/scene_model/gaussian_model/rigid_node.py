@@ -124,6 +124,14 @@ class RigidSubModel(VanillaGaussianSplattingModel):
             })
         return portable_config
 
+    def in_frame(self, frame_idx) -> bool:
+        """in_frame_mask[frame_idx] as a python bool. Indexing the (host) tensor is a .item() each; over the
+        rigid objects of a frame that was ~50 of them per train step (pose, statistics, after_train)."""
+        cache = getattr(self, "_in_frame_list", None)
+        if cache is None or cache[0] is not self.in_frame_mask:
+            cache = self._in_frame_list = (self.in_frame_mask, self.in_frame_mask.tolist())
+        return cache[1][frame_idx]
+
     def get_object_pose(self, frame_idx, timestamp):
         """
             (quat, trans) for the current frame
@@ -136,7 +144,7 @@ class RigidSubModel(VanillaGaussianSplattingModel):
             return self.instance_quats, self.instance_trans
         
         if frame_idx is not None:
-            if frame_idx >= self.num_frames or not self.in_frame_mask[frame_idx]:
+            if frame_idx >= self.num_frames or not self.in_frame(frame_idx):
                 return None, None
 
             quat_cur_frame = self.instance_quats[frame_idx] / self.instance_quats[frame_idx].norm(dim=-1, keepdim=True)
@@ -351,7 +359,7 @@ class RigidSubModel(VanillaGaussianSplattingModel):
 
     def after_train(self, step: int):
         # if the object is not in the current frame, do not update the gaussians grads.
-        if self.frame_idx is None or not self.in_frame_mask[self.frame_idx]:
+        if self.frame_idx is None or not self.in_frame(self.frame_idx):
             return
 
         super().after_train(step)

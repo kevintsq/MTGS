@@ -433,6 +433,15 @@ class CustomInputDataset(InputDataset):
             camera.metadata["frame_idx"] = None
             camera.metadata["cam_idx"] = None
         camera.metadata["data_path"] = dataparser_outputs.image_filenames[idx].parts[-3:]
-        camera.metadata["linear_velocity"] = dataparser_outputs.camera_linear_velocities[idx]
-        camera.metadata["angular_velocity"] = dataparser_outputs.camera_angular_velocities[idx]
+        # tensors, not numpy: Cameras.to() then moves them with the rest of the camera (one copy
+        # per step) instead of the model re-uploading them from pageable memory every step
+        camera.metadata["linear_velocity"] = torch.from_numpy(
+            np.asarray(dataparser_outputs.camera_linear_velocities[idx], dtype=np.float32))[None]
+        camera.metadata["angular_velocity"] = torch.from_numpy(
+            np.asarray(dataparser_outputs.camera_angular_velocities[idx], dtype=np.float32))[None]
+        # host-side copies of the scalar fields: the train step reads them without a GPU sync
+        # (camera.width.item() etc. on a device camera stalls the queue)
+        camera.metadata["image_size"] = (int(camera.width.item()), int(camera.height.item()))
+        if camera.times is not None:
+            camera.metadata["timestamp"] = float(camera.times.item())
         return camera

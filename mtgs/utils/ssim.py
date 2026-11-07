@@ -83,7 +83,7 @@ def _ssim(
     C1 = (K1 * data_range) ** 2
     C2 = (K2 * data_range) ** 2
 
-    win = win.to(X.device, dtype=X.dtype)
+    win = win.to(X.device, dtype=X.dtype)   # a no-op when MaskedSSIM already keeps it on the device
 
     mu1 = gaussian_filter(X, win)
     mu2 = gaussian_filter(Y, win)
@@ -100,8 +100,10 @@ def _ssim(
     ssim_map = ((2 * mu1_mu2 + C1) / (mu1_sq + mu2_sq + C1)) * cs_map
 
     if mask is not None:
-        ssim = torch.masked_select(ssim_map, mask).mean()
-        cs = torch.masked_select(cs_map, mask).mean()
+        # masked_select needs the number of hits on the host (a GPU sync per call, two calls per step)
+        count = mask.sum().clamp_min(1)
+        ssim = torch.where(mask, ssim_map, 0.0).sum() / count
+        cs = torch.where(mask, cs_map, 0.0).sum() / count
         return ssim, cs
     ssim_per_channel = torch.flatten(ssim_map, 2).mean(-1)
     cs = torch.flatten(cs_map, 2).mean(-1)
@@ -218,6 +220,8 @@ class MaskedSSIM(torch.nn.Module):
         self.nonnegative_ssim = nonnegative_ssim
 
     def forward(self, X: Tensor, Y: Tensor, mask: Optional[Tensor] = None) -> Tensor:
+        if self.win.device != X.device or self.win.dtype != X.dtype:   # once: it was copied from the host on every call
+            self.win = self.win.to(X.device, dtype=X.dtype)
         return ssim(
             X,
             Y,

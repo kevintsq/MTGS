@@ -71,17 +71,25 @@ def euclidean_to_z_depth(
     return z_depth
 
 
-def get_camera_coords(img_size: tuple, pixel_offset: float = 0.5) -> Tensor:
+_camera_coords_cache = {}
+
+
+def get_camera_coords(img_size: tuple, pixel_offset: float = 0.5, device=None) -> Tensor:
     """Generates camera pixel coordinates [W,H]
 
     Returns:
         stacked coords [H*W,2] where [:,0] corresponds to W and [:,1] corresponds to H
     """
+    # built once per (size, device): the train step asked for this 518k x 2 grid on the CPU every step
+    key = (int(img_size[0]), int(img_size[1]), pixel_offset, str(device))
+    cached = _camera_coords_cache.get(key)
+    if cached is not None:
+        return cached
 
     # img size is (w,h)
     image_coords = torch.meshgrid(
-        torch.arange(img_size[0]),
-        torch.arange(img_size[1]),
+        torch.arange(img_size[0], device=device),
+        torch.arange(img_size[1], device=device),
         indexing="xy",  # W = u by H = v
     )
     image_coords = (
@@ -90,7 +98,14 @@ def get_camera_coords(img_size: tuple, pixel_offset: float = 0.5) -> Tensor:
     image_coords = image_coords.view(-1, 2)
     image_coords = image_coords.float()
 
+    _camera_coords_cache[key] = image_coords
     return image_coords
+
+
+def _div(x: Tensor, f) -> Tensor:
+    """x / f for a python-float or a 0-dim tensor f. torch applies a python-float divisor as a multiply by
+    its reciprocal, so the tensor form does the same and gives the same bits as the .item() floats did."""
+    return x * f.reciprocal() if torch.is_tensor(f) else x / f
 
 
 def get_means3d_backproj(
@@ -119,19 +134,19 @@ def get_means3d_backproj(
         depths = depths.view(-1, 1)
     if depths.dtype != torch.float:
         depths = depths.float()
-        c2w = c2w.float()
-    if c2w.device != device:
+        c2w = c2w.float() if c2w is not None else None
+    if c2w is not None and c2w.device != device:
         c2w = c2w.to(device)
 
-    image_coords = get_camera_coords(img_size)
-    image_coords = image_coords.to(device)  # note image_coords is (H,W)
+    # fx/fy/cx/cy may be 0-dim device tensors (no .item() sync in the train step)
+    image_coords = get_camera_coords(img_size, device=device)  # note image_coords is (H,W)
 
     # TODO: account for skew / radial distortion
     means3d = torch.empty(
         size=(img_size[0], img_size[1], 3), dtype=torch.float32, device=device
     ).view(-1, 3)
-    means3d[:, 0] = (image_coords[:, 0] - cx) * depths[:, 0] / fx  # x
-    means3d[:, 1] = (image_coords[:, 1] - cy) * depths[:, 0] / fy  # y
+    means3d[:, 0] = _div((image_coords[:, 0] - cx) * depths[:, 0], fx)  # x
+    means3d[:, 1] = _div((image_coords[:, 1] - cy) * depths[:, 0], fy)  # y
     means3d[:, 2] = depths[:, 0]  # z
 
     if mask is not None:
@@ -140,11 +155,10 @@ def get_means3d_backproj(
         means3d = means3d[mask]
         image_coords = image_coords[mask]
 
-    if c2w is None:
-        c2w = torch.eye((means3d.shape[0], 4, 4), device=device)
-
-    # to world coords
-    means3d = means3d @ torch.linalg.inv(c2w[..., :3, :3]) + c2w[..., :3, 3]
+    # c2w None = identity: the camera-frame points are the result (the inverse of an identity was computed before)
+    if c2w is not None:
+        # to world coords
+        means3d = means3d @ torch.linalg.inv(c2w[..., :3, :3]) + c2w[..., :3, 3]
     return means3d, image_coords
 
 

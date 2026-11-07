@@ -100,8 +100,10 @@ def _ssim(
     ssim_map = ((2 * mu1_mu2 + C1) / (mu1_sq + mu2_sq + C1)) * cs_map
 
     if mask is not None:
-        ssim = torch.masked_select(ssim_map, mask).mean()
-        cs = torch.masked_select(cs_map, mask).mean()
+        # masked_select needs the number of hits on the host (a GPU sync per call, two calls per step)
+        count = mask.sum().clamp_min(1)
+        ssim = torch.where(mask, ssim_map, 0.0).sum() / count
+        cs = torch.where(mask, cs_map, 0.0).sum() / count
         return ssim, cs
     ssim_per_channel = torch.flatten(ssim_map, 2).mean(-1)
     cs = torch.flatten(cs_map, 2).mean(-1)

@@ -17,7 +17,7 @@ from torch.utils.data import Dataset, DataLoader
 
 from nuplan_scripts.utils.config import load_config, RoadBlockConfig
 from nuplan_scripts.utils.video_scene_dict_tools import VideoScene
-from nuplan_scripts.utils.nuplan_utils_custom import load_lidar, get_rgb_point_cloud, get_semantic_point_cloud, adjust_brightness_single_frame, adjust_brightness
+from nuplan_scripts.utils.nuplan_utils_custom import load_lidar_with_top, get_rgb_point_cloud, get_semantic_point_cloud, adjust_brightness_single_frame, adjust_brightness
 from nuplan_scripts.utils.stack_point_cloud_utils import extract_frame_background_instance_lidar, accumulate_background_box_point
 from nuplan_scripts.utils.camera_utils import undistort_image_with_cam_info
 from nuplan_scripts.utils.constants import NUPLAN_SENSOR_ROOT
@@ -78,16 +78,13 @@ class StackRGBPointCloud:
             undistorted_sem_masks = np.array(undistorted_sem_masks)  # (n_cam, H, W, 1)
             lidar2imgs = np.array(lidar2imgs)  # (n_cam, 4, 4)
 
-            # use combiled lidar_point_cloud to adjust brightness
-            lidar_points = load_lidar(
-                os.path.join(NUPLAN_SENSOR_ROOT, info['lidar_path']), remove_close=False, only_top=False)
+            # use combiled lidar_point_cloud to adjust brightness (one parse of the sweep for both uses)
+            lidar_points, top_lidar_points = load_lidar_with_top(os.path.join(NUPLAN_SENSOR_ROOT, info['lidar_path']))
             adjust_brightness_single_frame(info, lidar2imgs, undistorted_images, lidar_points)
             for idx, cam_info in enumerate(info['cams'].values()):
                 adjust_factor = cam_info['v_adjust']
                 undistorted_images[idx] = adjust_brightness(undistorted_images[idx], adjust_factor)
 
-            top_lidar_points = load_lidar(
-                os.path.join(NUPLAN_SENSOR_ROOT, info['lidar_path']), remove_close=False, only_top=True)
             info['back_instance_info'] = extract_frame_background_instance_lidar(info, l2g=False, points=top_lidar_points)
 
             # for background points

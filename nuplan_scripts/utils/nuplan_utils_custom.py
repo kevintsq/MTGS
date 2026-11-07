@@ -6,9 +6,9 @@
 import os
 import numpy as np
 import cv2
+import torch
 from pyquaternion import Quaternion
 from shapely.geometry import LineString
-import torch
 from sqlalchemy import func
 
 from nuplan.database.nuplan_db_orm.ego_pose import EgoPose
@@ -66,6 +66,12 @@ class CanBus:
                 0.0,
             ]
         )
+
+def load_lidar_with_top(lidar_path):
+    """(all points, top-lidar points) [n, 3] of one sweep, parsed once (the stack stage parsed it twice per frame)"""
+    points = PointCloud.parse_from_file(lidar_path).to_pcd_bin2().T
+    return points[:, :3], points[points[:, -1] == 0][:, :3]
+
 
 def load_lidar(lidar_path, remove_close=False, only_top=False):
 
@@ -171,11 +177,8 @@ def get_cam_info_from_lidar_pc(log, lidar_pc, rolling_shutter_s=1/60):
 
     return cams
 
-def get_rgb_point_cloud(points, lidar2imgs, images):
-    """ get rdb point cloud from multi-view images 
-    """
-    image_shape = np.array([[image.shape[1], image.shape[0]] for image in images])[:, None, :] # [N, 1, 2]
-
+def _project_to_images(points, lidar2imgs, image_shape):
+    """pixel coordinates normalised to [0, 1) per view [V, N, 2] and the in-view mask [V, N] (unchanged maths)"""
     xyz1 = np.concatenate([points, np.ones_like(points[:, 0:1])], axis=-1)
     pts_2d = lidar2imgs @ xyz1.T
     pts_2d = pts_2d.transpose(0, 2, 1)
@@ -189,17 +192,63 @@ def get_rgb_point_cloud(points, lidar2imgs, images):
                 & (pts_2d[..., 0] >= 0)
                 & (pts_2d[..., 1] < 1)
                 & (pts_2d[..., 1] >= 0))
+    return pts_2d, fov_inds
 
-    pts_2d = torch.from_numpy(pts_2d)
-    pts_2d = pts_2d * 2 - 1  # [-1, +1]
 
-    images = np.array(images, dtype=np.float64)[..., ::-1] / 255.0  # BGR to RGB [0, 1]
-    images = torch.from_numpy(images).permute(0, 3, 1, 2)  # to NCHW
+def _grid_coords(pts_2d, width, height):
+    """the pixel coordinate grid_sample(align_corners=True) derives from the [-1, 1] grid: u * (W - 1), in float64"""
+    grid = pts_2d * 2 - 1
+    return ((grid[..., 0] + 1) / 2) * (width - 1), ((grid[..., 1] + 1) / 2) * (height - 1)
 
-    RGB = torch.nn.functional.grid_sample(
-        images, pts_2d.unsqueeze(2), align_corners=True, padding_mode='zeros').squeeze(3).permute(0, 2, 1)
-    RGB = RGB.cpu().numpy()
-    RGB = np.where(fov_inds[..., None], RGB, 0).sum(0)
+
+def sample_images_bilinear(images, pts_2d, fov_inds):
+    """RGB [V, N, 3] float64 in [0, 1] of the in-view projections, 0 elsewhere.
+
+    Same values as grid_sample(bilinear, align_corners=True, zeros) on float64 copies of the images, which cost
+    ~400 MB and most of the stack stage's time per frame; the four taps are gathered from the uint8 pixels at the
+    sample points only (in-view points never need padding: u < 1 puts the far tap at column W - 1 at most)."""
+    V, N = fov_inds.shape
+    RGB = np.zeros((V, N, 3), dtype=np.float64)
+    for v in range(V):
+        m = fov_inds[v]
+        if not m.any():
+            continue
+        img = images[v]
+        ix, iy = _grid_coords(pts_2d[v][m], img.shape[1], img.shape[0])
+        x0 = np.floor(ix); y0 = np.floor(iy)
+        x1 = x0 + 1; y1 = y0 + 1
+        nw = (x1 - ix) * (y1 - iy); ne = (ix - x0) * (y1 - iy)
+        sw = (x1 - ix) * (iy - y0); se = (ix - x0) * (iy - y0)
+        x0 = x0.astype(np.int64); y0 = y0.astype(np.int64); x1 = x1.astype(np.int64); y1 = y1.astype(np.int64)
+        px = lambda yy, xx: torch.from_numpy(img[yy, xx, ::-1] / 255.0)   # BGR -> RGB [0, 1], as the float64 conversion
+        acc = px(y0, x0) * torch.from_numpy(nw)[:, None]
+        for (yy, xx), w in (((y0, x1), ne), ((y1, x0), sw), ((y1, x1), se)):
+            acc = torch.addcmul(acc, px(yy, xx), torch.from_numpy(w)[:, None])   # fused multiply-add chain = the kernel's
+        RGB[v][m] = acc.numpy()
+    return RGB
+
+
+def sample_masks_nearest(sem_masks, pts_2d, fov_inds):
+    """labels [V, N] int32 of the in-view projections, -1 elsewhere: grid_sample(nearest, align_corners=True) =
+    round half to even of the grid coordinate, read off the uint8 masks directly."""
+    V, N = fov_inds.shape
+    labels = np.full((V, N), -1, dtype=np.int32)
+    for v in range(V):
+        m = fov_inds[v]
+        if not m.any():
+            continue
+        mask = sem_masks[v]
+        ix, iy = _grid_coords(pts_2d[v][m], mask.shape[1], mask.shape[0])
+        labels[v][m] = mask[np.rint(iy).astype(np.int64), np.rint(ix).astype(np.int64), 0]
+    return labels
+
+
+def get_rgb_point_cloud(points, lidar2imgs, images):
+    """ get rdb point cloud from multi-view images 
+    """
+    image_shape = np.array([[image.shape[1], image.shape[0]] for image in images])[:, None, :] # [N, 1, 2]
+    pts_2d, fov_inds = _project_to_images(points, lidar2imgs, image_shape)
+    RGB = sample_images_bilinear(images, pts_2d, fov_inds).sum(0)
     fov_num = fov_inds.sum(0)
     fov_mask = fov_num>0
     RGB[fov_mask] /= fov_num[fov_mask][:, None]
@@ -216,40 +265,9 @@ def get_semantic_point_cloud(points, lidar2imgs, sem_masks):
         fov_mask: [N] boolean mask indicating if point is visible in any view
     """
     image_shape = np.array([[mask.shape[1], mask.shape[0]] for mask in sem_masks])[:, None, :] # [N_views, 1, 2]
+    pts_2d, fov_inds = _project_to_images(points, lidar2imgs, image_shape)
+    labels = sample_masks_nearest(sem_masks, pts_2d, fov_inds)[..., None]   # [N_views, N, 1], -1 outside the view
 
-    xyz1 = np.concatenate([points, np.ones_like(points[:, 0:1])], axis=-1)
-    pts_2d = lidar2imgs @ xyz1.T
-    pts_2d = pts_2d.transpose(0, 2, 1)
-    fov_inds = pts_2d[..., 2] > 0.1
-    pts_2d[..., 2] = np.clip(pts_2d[..., 2], a_min=1e-5, a_max=99999)
-    pts_2d[..., :2] /= pts_2d[..., 2:3]
-    pts_2d = pts_2d[..., :2]
-
-    pts_2d /= image_shape # normalize to [0, 1]
-    fov_inds = (fov_inds & (pts_2d[..., 0] < 1)
-                & (pts_2d[..., 0] >= 0)
-                & (pts_2d[..., 1] < 1)
-                & (pts_2d[..., 1] >= 0))
-
-    pts_2d = torch.from_numpy(pts_2d)
-    pts_2d = pts_2d * 2 - 1  # [-1, +1]
-
-    # Convert masks to [N_views, 1, H, W] format for grid_sample
-    masks = torch.from_numpy(sem_masks).permute(0, 3, 1, 2).to(torch.float64)
-
-    # Use nearest neighbor interpolation for discrete labels
-    labels = torch.nn.functional.grid_sample(
-        masks, pts_2d.unsqueeze(2), 
-        mode='nearest', 
-        align_corners=True,
-        padding_mode='border').squeeze(3).permute(0, 2, 1)
-    
-    labels = labels.cpu().numpy()
-    labels = labels.astype(np.int32)
-    
-    # Mask invalid projections with -1
-    labels = np.where(fov_inds[..., None], labels, -1)
-    
     # Get first valid label for each point
     first_valid_idx = np.argmax(labels >= 0, axis=0)
     rows = first_valid_idx.squeeze()
@@ -340,29 +358,8 @@ def adjust_brightness_single_frame(info, lidar2imgs, images, points=None):
         points = load_lidar(
             os.path.join(NUPLAN_SENSOR_ROOT, info['lidar_path']), remove_close=False)
 
-    xyz1 = np.concatenate([points, np.ones_like(points[:, 0:1])], axis=-1)
-    pts_2d = lidar2imgs @ xyz1.T
-    pts_2d = pts_2d.transpose(0, 2, 1)
-    fov_inds = pts_2d[..., 2] > 0.1
-    pts_2d[..., 2] = np.clip(pts_2d[..., 2], a_min=1e-5, a_max=99999)
-    pts_2d[..., :2] /= pts_2d[..., 2:3]
-    pts_2d = pts_2d[..., :2]
-
-    pts_2d /= image_shape # normalize to [0, 1]
-    fov_inds = (fov_inds & (pts_2d[..., 0] < 1)
-                & (pts_2d[..., 0] >= 0)
-                & (pts_2d[..., 1] < 1)
-                & (pts_2d[..., 1] >= 0))
-
-    pts_2d = torch.from_numpy(pts_2d)
-    pts_2d = pts_2d * 2 - 1  # [-1, +1]
-
-    imgs = np.array(images, dtype=np.float64)[..., ::-1] / 255.0  # BGR to RGB [0, 1]
-    imgs = torch.from_numpy(imgs).permute(0, 3, 1, 2)  # to NCHW
-
-    RGB = torch.nn.functional.grid_sample(
-        imgs, pts_2d.unsqueeze(2), align_corners=True, padding_mode='zeros').squeeze(3).permute(0, 2, 1)
-    RGB = RGB.cpu().numpy()
+    pts_2d, fov_inds = _project_to_images(points, lidar2imgs, image_shape)
+    RGB = sample_images_bilinear(images, pts_2d, fov_inds)   # only read inside fov_inds below
 
     matches = [
         ('CAM_F0', 'CAM_L0'), ('CAM_F0', 'CAM_R0'),

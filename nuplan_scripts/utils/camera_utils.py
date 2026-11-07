@@ -88,6 +88,23 @@ def get_safe_projs(obj_pts_cam, distCoeffs):
 
     return obj_pts_safe
 
+_UNDISTORT_MAPS = {}
+
+
+def undistort_maps(intrinsic, distortion, new_intrinsic, width, height):
+    """cv2.initUndistortRectifyMap cached by lens (a vehicle has 8): it was recomputed for every image, 30-50 ms
+    each at 1920x1080, three times per training image and twice per frame-camera in the prep stages."""
+    key = (np.asarray(intrinsic, np.float64).tobytes(), np.asarray(distortion, np.float64).tobytes(),
+           np.asarray(new_intrinsic, np.float64).tobytes(), width, height)
+    maps = _UNDISTORT_MAPS.get(key)
+    if maps is None:
+        if len(_UNDISTORT_MAPS) >= 64:          # bounded: 16 MB per map
+            _UNDISTORT_MAPS.clear()
+        maps = _UNDISTORT_MAPS[key] = cv2.initUndistortRectifyMap(
+            intrinsic, distortion, None, new_intrinsic, (width, height), cv2.CV_32FC2)
+    return maps
+
+
 def undistort_image_optimal(image, intrinsic, distortion, return_mask=False, interpolation='linear'):
     """
     interpolation: 'nearest', 'linear' or 'cubic'
@@ -102,9 +119,7 @@ def undistort_image_optimal(image, intrinsic, distortion, return_mask=False, int
     new_intrinsic, roi = cv2.getOptimalNewCameraMatrix(
         intrinsic, distortion, (width, height), 1
     )
-    map_undistort_optimal = cv2.initUndistortRectifyMap(
-        intrinsic, distortion, None, new_intrinsic, (width, height), cv2.CV_32FC2
-    )
+    map_undistort_optimal = undistort_maps(intrinsic, distortion, new_intrinsic, width, height)
     image_optimal = cv2.remap(
         image, map_undistort_optimal[0], map_undistort_optimal[1], 
         interpolation=interpolation_map[interpolation]
@@ -128,9 +143,7 @@ def undistort_image_keep_focal_length(image, intrinsic, distortion, interpolatio
     }
 
     height, width = image.shape[:2]
-    map_undistort = cv2.initUndistortRectifyMap(
-        intrinsic, distortion, None, intrinsic, (width, height), cv2.CV_32FC2
-    )
+    map_undistort = undistort_maps(intrinsic, distortion, intrinsic, width, height)
     image_undistorted = cv2.remap(
         image, map_undistort[0], map_undistort[1], 
         interpolation=interpolation_map[interpolation]

@@ -308,6 +308,41 @@ def _write_rig_config(video_scene_dict, colmap_path, ref='CAM_F0'):
     CONSOLE.log(f'[sfm rig] rig_config.json: {len(rigs)} rigs ({", ".join(rigs)}), ref {ref}')
 
 
+def _overlapping_pairs(cam_views, max_dist_scaled):
+    """(i, j, iou, far) for every view pair i < j whose view fields overlap (iou > 0), ascending (i, j).
+
+    The python double loop over N^2/2 shapely IoUs it replaces was single-core and quadratic (3,240 images = 5.2 M
+    pairs, 8,679 = 37.6 M). An STRtree query finds the intersecting pairs in C, the IoU is then evaluated for those
+    only, vectorised and in threads (shapely 2 releases the GIL). The GEOS calls are the same, so the IoUs and the
+    candidate set are identical, and the ascending order keeps every per-image list in the order the loop built it
+    (verified on pn_w2_21). Far pairs need no union: iou > 0 <=> intersection area > 0."""
+    import shapely
+    geoms = np.array([v['view_field'] for v in cam_views], dtype=object)
+    qi, qj = shapely.STRtree(geoms).query(geoms, predicate='intersects')
+    keep = qi < qj
+    qi, qj = qi[keep], qj[keep]
+    order = np.lexsort((qj, qi))
+    qi, qj = qi[order], qj[order]
+    far = np.zeros(len(qi), dtype=bool)
+    if max_dist_scaled > 0 and all('center' in v for v in cam_views):
+        centers = np.array([v['center'] for v in cam_views], dtype=np.float64)
+        far = np.linalg.norm(centers[qi] - centers[qj], axis=1) > max_dist_scaled
+    threads = min(16, int(os.environ.get('MTGS_CPU_BUDGET', 0)) or int(os.environ.get('SLURM_CPUS_PER_TASK', 0))
+                  or multiprocessing.cpu_count())
+    chunks = np.array_split(np.arange(len(qi)), max(1, min(len(qi), threads * 4)))
+    inter = np.zeros(len(qi)); union = np.ones(len(qi))      # far pairs keep union 1: their iou is never used
+
+    def _areas(c):
+        inter[c] = shapely.area(shapely.intersection(geoms[qi[c]], geoms[qj[c]]))
+        n = c[~far[c]]
+        union[n] = shapely.area(shapely.union(geoms[qi[n]], geoms[qj[n]]))
+    with ThreadPoolExecutor(max_workers=threads) as ex:
+        list(ex.map(_areas, chunks))
+    pos = inter > 0.0
+    iou = inter[pos] / union[pos]
+    return zip(qi[pos].tolist(), qj[pos].tolist(), iou.tolist(), far[pos].tolist())
+
+
 def create_colmap_model(video_scene: VideoScene, video_scene_dict, colmap_path):
 
     create_colmap_folder(colmap_path)
@@ -465,18 +500,12 @@ def create_colmap_model(video_scene: VideoScene, video_scene_dict, colmap_path):
         return token.split('/')[0] if '/' in token else token
 
     candidates = defaultdict(list)          # image -> [(iou, other_index)]
-    for i, view1 in enumerate(tqdm(cam_views, desc='Computing camera pairs...', ncols=120)):
-        for j in range(i + 1, len(cam_views)):
-            view2 = cam_views[j]
-            v1 = view1['view_field']
-            v2 = view2['view_field']
-            iou = v1.intersection(v2).area / v1.union(v2).area
-            if iou > 0.0:
-                if max_dist > 0 and 'center' in view1 and np.linalg.norm(view1['center'] - view2['center']) > max_dist * scale_factor:   # centres are in the scaled frame
-                    n_far += 1
-                    continue
-                candidates[i].append((iou, j))
-                candidates[j].append((iou, i))
+    for i, j, iou, far in _overlapping_pairs(cam_views, max_dist * scale_factor):
+        if far:                              # centres are in the scaled frame
+            n_far += 1
+            continue
+        candidates[i].append((iou, j))
+        candidates[j].append((iou, i))
 
     if max_dist > 0:
         CONSOLE.log(f'[pairs] MTGS_MAX_PAIR_DIST={max_dist} m (= {max_dist * scale_factor:.4g} colmap units) dropped {n_far} overlapping pairs')

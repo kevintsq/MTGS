@@ -21,6 +21,7 @@ from PIL import Image
 from mtgs.dataset.nuplan_dataparser import NuPlanDataparserOutputs
 from mtgs.utils.nuplan_pointcloud import load_lidar
 from nuplan_scripts.utils.constants import cityscape_label
+from nuplan_scripts.utils.camera_utils import undistort_maps
 
 
 def adjust_brightness(image, factor):
@@ -118,15 +119,11 @@ class CustomInputDataset(InputDataset):
             new_intrinsic, roi = cv2.getOptimalNewCameraMatrix(
                 intrinsic, distortion, (width, height), 1
             )
-            map_undistort = cv2.initUndistortRectifyMap(
-                intrinsic, distortion, None, new_intrinsic, (width, height), cv2.CV_32FC2
-            )
         elif self.undistort_images == "keep_focal_length":
             new_intrinsic = intrinsic.copy()
             roi = (0, 0, width, height)
-            map_undistort = cv2.initUndistortRectifyMap(
-                intrinsic, distortion, None, new_intrinsic, (width, height), cv2.CV_32FC2
-            )
+        # maps cached per lens (image, ego mask and semantic map of every image recomputed them before)
+        map_undistort = undistort_maps(intrinsic, distortion, new_intrinsic, width, height)
 
         new_intrinsic[0, 2] += 0.5
         new_intrinsic[1, 2] += 0.5

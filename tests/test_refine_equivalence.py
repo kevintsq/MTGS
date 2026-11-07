@@ -2,7 +2,8 @@
 
 Runs one refinement sequence on a synthetic model in a given source tree and dumps the result
 (content hashes of every parameter and Adam moment, num_points, peak memory, time); `compare`
-asserts that two dumps are identical. Usage:
+asserts that two dumps are identical. Usage (the reference tree is a detached worktree at the
+commit before the rewrite: `git -C /home/kevin/MTGS worktree add --detach /home/kevin/MTGS_w2_old b751a3c`):
 
     python tests/test_refine_equivalence.py run --tree /home/kevin/MTGS_w2_old --out /tmp/old.pt --model multicolor --n 200000 --t 6
     python tests/test_refine_equivalence.py run --tree /home/kevin/MTGS_w2     --out /tmp/new.pt --model multicolor --n 200000 --t 6

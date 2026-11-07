@@ -530,6 +530,38 @@ def _map_icp_pass(video, scans_by_token, init_pose_sets, ref_cloud, label=""):
     return out, f"took {name} (" + "; ".join(report) + ")"
 
 
+def _scan_icp(src, ref, ref_pts, T0, cs, max_iter):
+    """ICP chain of one scan (src, legacy cloud) onto the map `ref` from T0 at correspondence distances cs.
+
+    registration_icp builds a KD-tree of its target on every call, and the target here was the whole block map
+    (10^6 points, ~1 s per build, twice per frame, every frame of every pass and sweep): that was most of the
+    map-ICP wall-clock. The map is cropped to a ball around the scan that holds every point the full-map search
+    could ever pair with: the transformed scan lies within r_max (its farthest point) of the ICP's current origin,
+    a correspondence within max(cs) of that, and the origin within `margin` of T0 -- the final shift is checked
+    against margin / 2 and the chain redone on the full map if it ever exceeded it (a return from beyond the margin
+    inside the 30 iterations is not covered, with sub-metre correspondences it does not happen). Same
+    correspondences => same transforms, fitness and rmse (pn_w2_21: equal to 1e-14, the OpenMP reduction noise
+    the full-map run has against itself). The open3d tensor ICP on CUDA was tried here (2026-11-07) and dropped:
+    3.9 s per frame against 60 ms, with transforms 1.5e-5 m off."""
+    import open3d as o3d
+    margin = float(os.environ.get('MTGS_REG_MAP_ICP_CROP_MARGIN', 5.0))
+    P = np.asarray(src.points)
+    r = float(np.linalg.norm(P, axis=1).max()) + max(cs) + margin if len(P) else 0.0
+    sel = np.flatnonzero(np.linalg.norm(ref_pts - T0[:3, 3], axis=1) < r)
+    tgt = ref.select_by_index(sel) if len(sel) < len(ref_pts) else ref
+    for attempt in range(2):
+        T = T0
+        for c in cs:
+            res = o3d.pipelines.registration.registration_icp(
+                src, tgt, c, T, o3d.pipelines.registration.TransformationEstimationPointToPlane(),
+                o3d.pipelines.registration.ICPConvergenceCriteria(max_iteration=max_iter))
+            T = res.transformation
+        if tgt is ref or np.linalg.norm(T[:3, 3] - T0[:3, 3]) <= margin / 2:
+            break
+        tgt = ref                                 # drifted towards the crop's edge: redo on the full map
+    return T, float(res.fitness), float(res.inlier_rmse)
+
+
 def _map_icp_frames(video, scans_by_token, poses, ref, voxel, max_dt=1.0, max_dyaw_deg=3.0, win=5, tilt=None):
     """Per-frame scan-to-map refinement of `poses` (token -> 4x4) against the
     open3d map `ref`; returns (refined poses, report).
@@ -545,6 +577,7 @@ def _map_icp_frames(video, scans_by_token, poses, ref, voxel, max_dt=1.0, max_dy
     if tilt is None:
         tilt = os.environ.get('MTGS_REG_PASS_TILT', '0') == '1'
     tokens = [info['token'] for info in video['frame_infos'] if info['token'] in poses and info['token'] in scans_by_token]
+    ref_pts = np.asarray(ref.points)                        # for the per-scan crop in _scan_icp
     tilt_rep = ""
     if tilt:
         ego_rv = []
@@ -552,14 +585,9 @@ def _map_icp_frames(video, scans_by_token, poses, ref, voxel, max_dt=1.0, max_dy
             P = scans_by_token[t][:, :3]
             P = P[np.linalg.norm(P[:, :2], axis=1) < 60.0][::2]
             src = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(P)).voxel_down_sample(voxel)
-            T = poses[t]
-            for c in (0.8, 0.3):
-                res = o3d.pipelines.registration.registration_icp(
-                    src, ref, c, T, o3d.pipelines.registration.TransformationEstimationPointToPlane(),
-                    o3d.pipelines.registration.ICPConvergenceCriteria(max_iteration=30))
-                T = res.transformation
+            T, fitness, _ = _scan_icp(src, ref, ref_pts, poses[t], (0.8, 0.3), 30)
             D = T @ np.linalg.inv(poses[t])
-            if res.fitness >= 0.3 and np.linalg.norm(T[:3, 3] - poses[t][:3, 3]) <= max_dt:   # scan-origin displacement, see below
+            if fitness >= 0.3 and np.linalg.norm(T[:3, 3] - poses[t][:3, 3]) <= max_dt:   # scan-origin displacement, see below
                 ego_rv.append(poses[t][:3, :3].T @ _R.from_matrix(D[:3, :3]).as_rotvec(degrees=True))   # roll (x), pitch (y), yaw (z) about the frame's own axes
         if len(ego_rv) >= 10:
             med = np.median(np.array(ego_rv), axis=0); roll, pitch = float(med[0]), float(med[1])
@@ -585,18 +613,13 @@ def _map_icp_frames(video, scans_by_token, poses, ref, voxel, max_dt=1.0, max_dy
         P = scans_by_token[t][:, :3]
         P = P[np.linalg.norm(P[:, :2], axis=1) < 60.0][::2]
         src = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(P)).voxel_down_sample(voxel)
-        T = poses[t]
-        for c in (0.8, 0.3):
-            res = o3d.pipelines.registration.registration_icp(
-                src, ref, c, T, o3d.pipelines.registration.TransformationEstimationPointToPlane(),
-                o3d.pipelines.registration.ICPConvergenceCriteria(max_iteration=30))
-            T = res.transformation
+        T, fitness, _ = _scan_icp(src, ref, ref_pts, poses[t], (0.8, 0.3), 30)
         D = T @ np.linalg.inv(poses[t])                     # correction in the map frame (rotation part used)
         rvec = _R.from_matrix(D[:3, :3]).as_rotvec()
         dp = T[:3, 3] - poses[t][:3, 3]                     # displacement of the scan origin
         dt = float(np.linalg.norm(dp)); drot = float(np.degrees(np.linalg.norm(rvec)))
         dyaw = abs(float(_R.from_matrix(D[:3, :3]).as_euler('zyx', degrees=True)[0]))
-        ok = res.fitness >= 0.3 and dt <= max_dt and drot <= max_rot_deg and dyaw <= max_dyaw_deg
+        ok = fitness >= 0.3 and dt <= max_dt and drot <= max_rot_deg and dyaw <= max_dyaw_deg
         corr.append((rvec, dp) if ok else None); n_ok += ok
     # smooth: replace each correction by the component-wise median of its window
     # (rotation vector and origin displacement), so a single bad ICP frame cannot kink the pass
@@ -690,20 +713,35 @@ def _inconsistent_passes(vt, video_scene_dict, poses, scans_by_token, clouds):
     return bad, ", ".join(rep)
 
 
-def _map_icp_inputs(video_scene_dict, result_poses_dict_aligned, exclude, scans_by_token):
-    """Point map of the aligned (trusted) passes for _map_icp_pass."""
+def _map_icp_inputs(video_scene_dict, result_poses_dict_aligned, exclude, scans_by_token, cache=None):
+    """Point map of the aligned (trusted) passes for _map_icp_pass.
+
+    cache (dict, optional): per-pass world-frame points keyed by the pass's current poses, so a sweep over N passes
+    re-transforms only the pass that moved instead of every scan of every other pass N times. The concatenation is
+    the same array as before (same passes, same order), so the voxelised map and the ICP are unchanged; the voxel
+    grid + normals of the merged map cannot be cached per pass (a voxel's point is the mean over ALL passes)."""
     pts = []
     for vt, v in video_scene_dict.items():
         if vt in exclude:
             continue
-        for info in v['frame_infos'][::2]:
-            t = info['token']
-            if t not in scans_by_token or t not in result_poses_dict_aligned:
-                continue
-            P = scans_by_token[t][:, :3]
-            P = P[np.linalg.norm(P[:, :2], axis=1) < 60.0][::3]
-            pose = result_poses_dict_aligned[t]
-            pts.append((pose[:3, :3] @ P.T).T + pose[:3, 3])
+        toks = [info['token'] for info in v['frame_infos'][::2]
+                if info['token'] in scans_by_token and info['token'] in result_poses_dict_aligned]
+        if not toks:
+            continue
+        key = (vt, np.stack([result_poses_dict_aligned[t] for t in toks]).tobytes())
+        if cache is None or cache.get(vt, (None,))[0] != key:
+            part = []
+            for t in toks:
+                P = scans_by_token[t][:, :3]
+                P = P[np.linalg.norm(P[:, :2], axis=1) < 60.0][::3]
+                pose = result_poses_dict_aligned[t]
+                part.append((pose[:3, :3] @ P.T).T + pose[:3, 3])
+            part = np.concatenate(part)
+            if cache is not None:
+                cache[vt] = (key, part)
+        else:
+            part = cache[vt][1]
+        pts.append(part)
     return np.concatenate(pts) if pts else None
 
 
@@ -1035,6 +1073,7 @@ if __name__ == '__main__':
             _order = sorted(video_scene_dict.keys(),
                             key=lambda vt: -error_dict_aligned.get(vt, {}).get('mean_error', 0.0))
             _pairwise = os.environ.get('MTGS_REG_SWEEP_PAIRWISE', '0') == '1'
+            _parts = {}                    # _map_icp_inputs cache: a pass is re-transformed only after it moved
             for _sw in range(_sweeps):
                 _clouds = {}
                 for vt in _order:
@@ -1048,7 +1087,7 @@ if __name__ == '__main__':
                             continue
                         CONSOLE.log(f"Sweep {_sw + 1}: video {vt.split('-')[-1]} disagrees with {[u.split('-')[-1] for u in _bad]} ({_prep}); registering onto them", style="yellow")
                         _excl = set(video_scene_dict) - set(_bad)
-                    _map = _map_icp_inputs(video_scene_dict, result_poses_dict_aligned, _excl, _scans_by_token)
+                    _map = _map_icp_inputs(video_scene_dict, result_poses_dict_aligned, _excl, _scans_by_token, _parts)
                     if _map is None or len(_map) < 5000:
                         continue
                     _cur = lambda t: result_poses_dict_aligned.get(t)

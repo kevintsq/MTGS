@@ -34,8 +34,20 @@ if __name__ == '__main__':
 
     if os.environ.get('MTGS_SKIP_EVAL') != '1':
         CONSOLE.log("Evaluating background reconstruction model.", style='bold magenta')
-        from nerfstudio.scripts.eval import ComputePSNR
-        ComputePSNR(
-            load_config=nerfstudio_config,
-            output_path=Path(reconstruction_dir) / 'eval_result.json'
-        ).main()
+        import json
+        from nerfstudio.utils.eval_utils import eval_setup
+
+        def _skip_init_points(cfg):   # the checkpoint replaces the initial gaussians: no point-cloud filtering
+            cfg.pipeline.datamanager.dataparser.load_3D_points = False
+            return cfg
+        # nerfstudio's ComputePSNR.main with that one config callback
+        ns_config, pipeline, checkpoint_path, _ = eval_setup(nerfstudio_config, update_config_callback=_skip_init_points)
+        metrics_dict = pipeline.get_average_eval_image_metrics(output_path=None, get_std=True)
+        output_path = Path(reconstruction_dir) / 'eval_result.json'
+        output_path.write_text(json.dumps({
+            "experiment_name": ns_config.experiment_name,
+            "method_name": ns_config.method_name,
+            "checkpoint": str(checkpoint_path),
+            "results": metrics_dict,
+        }, indent=2), "utf8")
+        CONSOLE.print(f"Saved results to: {output_path}")

@@ -401,8 +401,9 @@ class NuplanDataParser(DataParser):
         poses[:, :3, 3] *= self.config.scale_factor
 
         if self.config.load_cam_optim_from is not None:
-            model = torch.load(self.config.load_cam_optim_from, map_location='cpu', weights_only=False)   # own checkpoint; torch>=2.6 weights_only rejects the numpy scalars a mid-run ckpt carries (rh_w2_06 48k, 2026-10-30)
-            pose_adj = model['pipeline'][self.config.cam_optim_key]
+            from mtgs.utils.ckpt_io import load_pipeline_tensor
+            # that one tensor, read once per checkpoint file (mmap); not a full load of the ~8 GB file per split
+            pose_adj = load_pipeline_tensor(self.config.load_cam_optim_from, self.config.cam_optim_key)
             if pose_adj.shape[0] != poses.shape[0]:
                 CONSOLE.log(f"[WARNING] pose_adj shape {pose_adj.shape[0]} does not match poses shape {poses.shape[0]}")
             else:
@@ -430,6 +431,10 @@ class NuplanDataParser(DataParser):
         if split == 'train':
             if self.config.load_3D_points:
                 metadata.update(self._load_3D_points(torch.eye(4), self.config.scale_factor))
+            else:
+                # a checkpoint replaces the initial gaussians anyway (render / eval / export / resume): a token
+                # cloud instead of filtering the merged lidar scans and seeding the model from ~5 M points
+                metadata.update({"points3D_xyz": torch.randn((200, 3)), "points3D_rgb": torch.zeros((200, 3))})
             metadata['instances_info'] = self._generate_instance_infos(video_scene)
             metadata['frame_token2frame_idx'] = {frame_token: frame_idx for frame_idx, frame_token in zip(frame_indices, frame_tokens)}
             metadata['cam_token2cam_idx'] = {cam_token: cam_idx for cam_idx, cam_token in enumerate(cam_tokens)}

@@ -143,11 +143,13 @@ class RigidSubModel(VanillaGaussianSplattingModel):
             trans_cur_frame = self.instance_trans[frame_idx]
             return quat_cur_frame, trans_cur_frame
         else:
-            frame_timestamps = self.dataframe_dict["frame_timestamps"].to(self.device)  # (num_frames, )
+            # frame lookup on the host (timestamps and mask are CPU tensors): per object and frame this used to
+            # upload the timestamps, argmin on the GPU and sync twice to test the mask / equality
+            frame_timestamps = self.dataframe_dict["frame_timestamps"]  # (num_frames, ) CPU
             # Find the two adjacent frames for interpolation
             diffs = timestamp - frame_timestamps
-            prev_frame = torch.argmin(torch.where(diffs >= 0, diffs, float('inf')))
-            next_frame = torch.argmin(torch.where(diffs <= 0, -diffs, float('inf')))
+            prev_frame = int(torch.argmin(torch.where(diffs >= 0, diffs, float('inf'))))
+            next_frame = int(torch.argmin(torch.where(diffs <= 0, -diffs, float('inf'))))
 
             if not self.in_frame_mask[next_frame] or not self.in_frame_mask[prev_frame]:
                 return None, None
@@ -156,8 +158,9 @@ class RigidSubModel(VanillaGaussianSplattingModel):
                 # Timestamp exactly matches a frame, no interpolation needed
                 return self.instance_quats[next_frame], self.instance_trans[next_frame]
 
-            # Calculate interpolation factor
+            # Calculate interpolation factor (same float32 ops as before, then the scalar goes to the device)
             t = (timestamp - frame_timestamps[prev_frame]) / (frame_timestamps[next_frame] - frame_timestamps[prev_frame])
+            t = t.to(self.device, non_blocking=True)
 
             # Interpolate quaternions (using slerp) and translations
             quat_interp = interpolate_quats(self.instance_quats[prev_frame], self.instance_quats[next_frame], t).squeeze()

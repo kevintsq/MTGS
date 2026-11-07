@@ -44,6 +44,17 @@ import os as _os
 _BATCHED_RIGID = _os.environ.get("MTGS_BATCHED_RIGID", "1") != "0"
 from .module.appearance import GSAppearanceModelConfig, GSAppearanceModel
 
+def merge_control_cfg(global_control, model_cfg):
+    """A submodel's control config: the scene-level one overridden by the fields the submodel's own config sets."""
+    default_ctrl_cfg = copy.deepcopy(global_control)
+    class_ctrl_cfg: GaussianSplattingControlConfig = model_cfg.control
+    if class_ctrl_cfg is not None:
+        for attr, value in class_ctrl_cfg.__dict__.items():
+            if value is not None:
+                setattr(default_ctrl_cfg, attr, value)
+    model_cfg.control = default_ctrl_cfg
+    return model_cfg
+
 @dataclass
 class MTGSSceneModelConfig(ModelConfig):
 
@@ -195,17 +206,10 @@ class MTGSSceneModel(Model):
         }
 
     def _update_gaussian_cfg(self, model_cfg):
-        default_ctrl_cfg = copy.deepcopy(self.config.control)
+        return merge_control_cfg(self.config.control, model_cfg)
 
-        class_ctrl_cfg: GaussianSplattingControlConfig = model_cfg.control
-        if class_ctrl_cfg is not None:
-            for attr, value in class_ctrl_cfg.__dict__.items():
-                if value is not None:
-                    setattr(default_ctrl_cfg, attr, value)
-
-        model_cfg.control = default_ctrl_cfg
-
-        return model_cfg
+    # set by the render tool when only rgb is written: no expected-depth / normal channels in the rasterization
+    rgb_only = False
 
     def _init_gaussian_models(self):
         self.gaussian_models = torch.nn.ModuleDict()
@@ -701,10 +705,11 @@ class MTGSSceneModel(Model):
         W, H = int(camera.width.item()), int(camera.height.item())
         background = self.background_color
 
-        if self.config.output_depth_during_training or not self.training:
+        if self.config.output_depth_during_training or (not self.training and not self.rgb_only):
             render_mode = "RGB+ED"
         else:
             render_mode = "RGB"
+        predict_normals = self.config.predict_normals and not (self.rgb_only and not self.training)
 
         if self.config.use_wild_gaussians:
             rgb = torch.clamp(SH2RGB(collected_gaussians["features_dc"]), 0.0, 1.0)
@@ -719,7 +724,7 @@ class MTGSSceneModel(Model):
         else:
             render_colors = collected_gaussians["rgbs"]
 
-        if self.config.predict_normals:
+        if predict_normals:
             normals = self._get_gaussian_camera_space_normals(collected_gaussians, camera)
             render_colors = torch.cat([render_colors, normals], dim=-1)
 
@@ -767,7 +772,7 @@ class MTGSSceneModel(Model):
         else:
             depth_im = None
 
-        if self.config.predict_normals:
+        if predict_normals:
             start_ch_idx = 3
             normals_im = render[..., start_ch_idx:start_ch_idx+3].squeeze(0)
             normals_im = normals_im / normals_im.norm(dim=-1, keepdim=True)

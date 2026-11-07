@@ -4,6 +4,7 @@
 # Copyright (c) OpenDriveLab. All rights reserved.                              #
 #-------------------------------------------------------------------------------#
 import time
+import copy
 import dataclasses
 import os
 import signal
@@ -22,6 +23,7 @@ from nerfstudio.engine.callbacks import TrainingCallbackAttributes
 from nerfstudio.utils import profiler, writer
 from nerfstudio.utils.rich_utils import CONSOLE
 from mtgs.custom_viewer.viewer import Viewer
+from mtgs.utils.ckpt_io import load_ckpt
 
 class CustomOptimizers(Optimizers):
     """Optimizers with batched zero_grad / Adam steps.
@@ -150,7 +152,8 @@ class CustomTrainer(Trainer):
         # background_reconstruction.py resumes from the mirror when it holds a checkpoint.
         self._mirror = Path(os.environ["MTGS_CKPT_MIRROR"]) if os.environ.get("MTGS_CKPT_MIRROR") else None
         self._term = False
-        self._mirror_thread = None
+        self._writer = None        # background thread writing the last checkpoint (local file, then mirror)
+        self._save_error = None    # its failure, raised by the next save so a dead disk still stops the run
         if self._mirror is not None:
             self._mirror.mkdir(parents=True, exist_ok=True)
             for f in self._mirror.glob(".step-*.partial"):   # left by a copy that was killed mid-way
@@ -198,20 +201,83 @@ class CustomTrainer(Trainer):
             d["scalers"] = self.grad_scaler.state_dict()
         return d
 
-    def _mirror_install(self, src: Path, step: int) -> None:
+    @staticmethod
+    def _host_snapshot(obj):
+        """The checkpoint dict with every tensor on the host. CUDA tensors go into pinned buffers by non-blocking
+        copies queued behind the step's kernels (one D2H pass); the writer thread then serialises the local file
+        and the mirror from these buffers, so the training thread never waits for the disk and the mirror is not
+        a read-back of the local file."""
+        if torch.is_tensor(obj):
+            if obj.is_cuda:
+                try:
+                    h = torch.empty_like(obj, device="cpu", pin_memory=True)
+                except RuntimeError:   # no pinned memory left: pageable buffer, blocking copy
+                    h = torch.empty_like(obj, device="cpu")
+                h.copy_(obj, non_blocking=h.is_pinned())
+                return h
+            return obj.clone()
+        if isinstance(obj, dict):
+            return type(obj)((k, CustomTrainer._host_snapshot(v)) for k, v in obj.items())
+        if isinstance(obj, (list, tuple)):
+            return type(obj)(CustomTrainer._host_snapshot(v) for v in obj)
+        return copy.deepcopy(obj)
+
+    @staticmethod
+    def _bf16_moments(host: dict) -> dict:
+        """MTGS_MIRROR_BF16=1: the mirror stores Adam's exp_avg / exp_avg_sq as bf16 (half the mirror bytes); the
+        optimizer casts them back to the parameter dtype on load. Off by default: a run resumed from such a mirror is
+        not bit-identical to an uninterrupted one."""
+        d = dict(host)
+        if "optimizers" in d:
+            d["optimizers"] = {
+                name: {**sd, "state": {i: {k: v.to(torch.bfloat16) if k in ("exp_avg", "exp_avg_sq") else v
+                                           for k, v in st.items()} for i, st in sd["state"].items()}}
+                for name, sd in d["optimizers"].items()}
+        return d
+
+    def _write_checkpoint(self, host: dict, copied: torch.cuda.Event, ckpt_path: Path, step: int) -> None:
+        """Writer thread: local file from the host buffers, then the mirror, then the old local files."""
+        copied.synchronize()   # the D2H copies of the snapshot have landed
+        for attempt in range(5):
+            try:
+                torch.save(host, ckpt_path)
+                break
+            except Exception as e:
+                CONSOLE.log(f"[ERROR] saving checkpoint on attempt {attempt + 1}", style="bold red")
+                CONSOLE.print(e)
+                if attempt == 4:
+                    self._save_error = e
+                    return
+                time.sleep(2 ** attempt)  # Exponential backoff
+        if self._mirror is not None:
+            self._mirror_install(ckpt_path, step, host)
+        if self.config.save_only_latest_checkpoint:
+            # delete every other checkpoint in the checkpoint folder
+            for f in self.checkpoint_dir.glob("*.ckpt"):
+                if f != ckpt_path:
+                    f.unlink()
+
+    def _mirror_install(self, src: Path, step: int, host: dict = None) -> None:
         # src -> mirror/step-<step>.ckpt via a temp name, then drop older mirror checkpoints
         dst = self._mirror / f"step-{step:09d}.ckpt"
         tmp = self._mirror / f".step-{step:09d}.partial"
         if src != tmp:
-            shutil.copyfile(src, tmp)
+            if host is not None and os.environ.get("MTGS_MIRROR_BF16") == "1":
+                torch.save(self._bf16_moments(host), tmp)
+            elif os.stat(src).st_dev == os.stat(self._mirror).st_dev:
+                os.link(src, tmp)   # same filesystem: one inode, nothing written twice
+            elif host is not None:
+                torch.save(host, tmp)   # from the host buffers, not a read-back of the local file
+            else:
+                shutil.copyfile(src, tmp)
         os.replace(tmp, dst)
         for f in self._mirror.glob("step-*.ckpt"):
             if f != dst:
                 f.unlink()
 
     def _preempt_save_and_exit(self, step: int) -> None:
-        if self._mirror_thread is not None:
-            self._mirror_thread.join()
+        if self._writer is not None:
+            self._writer.join()
         t0 = time.time()
         tmp = self._mirror / f".step-{step:09d}.partial"
         torch.save(self._ckpt_dict(step, completed=False), tmp)
@@ -378,47 +444,21 @@ class CustomTrainer(Trainer):
             self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
         # save the checkpoint
         ckpt_path: Path = self.checkpoint_dir / f"step-{step:09d}.ckpt"
-        ckpt_dict = {
-            "step": step,
-            "pipeline": self.pipeline.module.state_dict()  # type: ignore
-            if hasattr(self.pipeline, "module")
-            else self.pipeline.state_dict(),
-            "optimizers": {k: v.state_dict() for (k, v) in self.optimizers.optimizers.items()},
-            "schedulers": {k: v.state_dict() for (k, v) in self.optimizers.schedulers.items()},
-            "scalers": self.grad_scaler.state_dict(),
-        }
-        if self.training_state == "completed":
-            ckpt_dict.pop("optimizers")
-            ckpt_dict.pop("schedulers")
-            ckpt_dict.pop("scalers")
-
-        max_retries = 5
-        for attempt in range(max_retries):
-            try:
-                torch.save(ckpt_dict, ckpt_path)
-                break
-            except Exception as e:
-                CONSOLE.log(f"[ERROR] saving checkpoint on attempt {attempt + 1}", style="bold red")
-                CONSOLE.print(e)
-                if attempt < max_retries - 1:
-                    time.sleep(2 ** attempt)  # Exponential backoff
-                else:
-                    raise e
-
-        if self._mirror is not None:   # copy to persistent storage in the background (the next save waits for it)
-            if self._mirror_thread is not None:
-                self._mirror_thread.join()
-            self._mirror_thread = threading.Thread(target=self._mirror_install, args=(ckpt_path, step), daemon=False)
-            self._mirror_thread.start()
-            if self.training_state == "completed":
-                self._mirror_thread.join()
-
-        # possibly delete old checkpoints
-        if self.config.save_only_latest_checkpoint:
-            # delete every other checkpoint in the checkpoint folder
-            for f in self.checkpoint_dir.glob("*.ckpt"):
-                if f != ckpt_path:
-                    f.unlink()
+        completed = self.training_state == "completed"
+        if self._writer is not None:   # the previous save (local file and mirror) must be on disk first
+            self._writer.join()
+        if self._save_error is not None:
+            raise self._save_error
+        # one D2H pass into pinned host buffers; the writer thread waits on the event, not the training thread
+        host = self._host_snapshot(self._ckpt_dict(step, completed))
+        copied = torch.cuda.Event()
+        copied.record()
+        self._writer = threading.Thread(target=self._write_checkpoint, args=(host, copied, ckpt_path, step), daemon=False)
+        self._writer.start()
+        if completed:   # the final file: the stages after training need it, nothing left to overlap with
+            self._writer.join()
+            if self._save_error is not None:
+                raise self._save_error
 
     def _load_checkpoint(self) -> None:
         """Helper function to load pipeline and optimizer from prespecified checkpoint"""
@@ -432,11 +472,11 @@ class CustomTrainer(Trainer):
                 load_step = sorted(int(x[x.find("-") + 1 : x.find(".")]) for x in os.listdir(load_dir))[-1]
             load_path: Path = load_dir / f"step-{load_step:09d}.ckpt"
             assert load_path.exists(), f"Checkpoint {load_path} does not exist"
-            loaded_state = torch.load(load_path, map_location="cpu", weights_only=False)   # our own checkpoint (holds numpy scalars)
+            loaded_state = load_ckpt(load_path)   # mmap: copied file -> GPU, no full host copy first
         elif load_checkpoint is not None:
             assert load_checkpoint.exists(), f"Checkpoint {load_checkpoint} does not exist"
             load_path = load_checkpoint
-            loaded_state = torch.load(load_path, map_location="cpu", weights_only=False)   # our own checkpoint (holds numpy scalars)
+            loaded_state = load_ckpt(load_path)
         else:
             CONSOLE.print("No Nerfstudio checkpoint to load, so training from scratch.")
             return

@@ -443,6 +443,12 @@ class CustomTrainer(Trainer):
         # load the checkpoints for pipeline, optimizers, and gradient scalar
         self._start_step = loaded_state["step"] + 1
         self.pipeline.load_pipeline(loaded_state["pipeline"], loaded_state["step"])
+        # VanillaGaussianSplattingModel.load_state_dict replaces every gauss_params Parameter object (new point
+        # count), but the optimizers were built in setup() from the OLD objects: a resumed run stepped dead tensors
+        # until the next densification re-linked them, and past stop_split_at never -- pn_v2_04 (2026-11-07,
+        # resumed at step 60000) trained its gaussians for zero steps, loss flat for 60k steps. Rebuild the
+        # optimizers from the live parameters before loading their state.
+        self.optimizers = self.setup_optimizers()
         if "optimizers" in loaded_state:
             self.optimizers.load_optimizers(loaded_state["optimizers"])
         if "schedulers" in loaded_state and self.config.load_scheduler:

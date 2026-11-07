@@ -5,7 +5,7 @@
 #-------------------------------------------------------------------------------#
 import math
 from dataclasses import dataclass, field
-from typing import Optional, Type
+from typing import Type
 from typing_extensions import Literal
 
 import torch
@@ -122,42 +122,7 @@ class SkyboxGaussianSplattingModel(MultiColorGaussianSplattingModel):
             return super(MultiColorGaussianSplattingModel, self).get_rgbs(camera_to_worlds)
         return super().get_rgbs(camera_to_worlds, traversal_id)
 
-    def split_properties(self, split_mask, samps):
-        if self.config.mono_sky:
-            return super(MultiColorGaussianSplattingModel, self).split_properties(split_mask, samps)
-        return super().split_properties(split_mask, samps)
-
-    def cull_gaussians(self, extra_cull_mask: Optional[torch.Tensor] = None):
-        """
-        This function deletes gaussians with under a certain opacity threshold
-        extra_cull_mask: a mask indicates extra gaussians to cull besides existing culling criterion
-        """
-        n_bef = self.num_points
-
-        # cull transparent ones
-        culls = (torch.sigmoid(self.opacities) < self.ctrl_config.cull_alpha_thresh).squeeze()
-
-
-        if extra_cull_mask is not None:
-            culls = culls | extra_cull_mask
-            n_bef -= torch.sum(extra_cull_mask).item()
-
-        if self.step > self.ctrl_config.refine_every * self.ctrl_config.reset_alpha_every:
-            # cull huge ones
-            skybox_mask = self.means.norm(dim=-1) > (self.config.skybox_radius / 10.)
-            cull_scale_thresh = torch.where(skybox_mask, self.config.skybox_scale_factor, 1.) * self.ctrl_config.cull_scale_thresh
-            toobigs = (torch.exp(self.scales).max(dim=-1).values > cull_scale_thresh).squeeze()
-
-            if self.step < self.ctrl_config.stop_screen_size_at:
-                # cull big screen space
-                assert self.max_2Dsize is not None
-                cull_screen_size = self.ctrl_config.cull_screen_size
-                toobigs_vs = (self.max_2Dsize > cull_screen_size).squeeze()
-                toobigs = toobigs | toobigs_vs
-
-            culls = culls | toobigs
-
-        for name, param in self.gauss_params.items():
-            self.gauss_params[name] = torch.nn.Parameter(param[~culls])
-
-        return culls
+    def cull_scale_thresh(self, means):
+        """Skybox gaussians (beyond a tenth of the skybox radius) may be skybox_scale_factor times larger."""
+        skybox_mask = means.norm(dim=-1) > (self.config.skybox_radius / 10.)
+        return torch.where(skybox_mask, self.config.skybox_scale_factor, 1.) * self.ctrl_config.cull_scale_thresh

@@ -138,16 +138,6 @@ class MultiColorGaussianSplattingModel(VanillaGaussianSplattingModel):
             return_dict["velocities"] = torch.zeros_like(return_dict["means"])
         return return_dict
 
-    def split_properties(self, split_mask, samps):
-        new_features_rest = self.features_rest[split_mask].repeat(samps, 1, 1, 1) if self.config.multi_feature_rest \
-            else self.features_rest[split_mask].repeat(samps, 1, 1)
-        return {
-            "features_dc": self.split_features_dc(split_mask, samps),
-            "features_rest": new_features_rest,
-            "opacities": self.opacities[split_mask].repeat(samps, 1),
-            "features_adapters": self.features_adapters[split_mask].repeat(samps, 1, 1)
-        }
-
     def load_state_dict(self, dict, **kwargs):
         if "gauss_params.features_adapters" in dict and dict['gauss_params.features_adapters'].shape[1] != len(self.travel_mapping):
             if self.config.eval_mode == "mean":

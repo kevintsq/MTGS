@@ -3,6 +3,7 @@
 # Source code: https://github.com/OpenDriveLab/MTGS                             #
 # Copyright (c) OpenDriveLab. All rights reserved.                              #
 #-------------------------------------------------------------------------------#
+import math
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Type
 
@@ -414,61 +415,58 @@ class VanillaGaussianSplattingModel(torch.nn.Module):
         # Exclude the point itself from the result and return
         return distances[:, 1:].astype(np.float32), indices[:, 1:].astype(np.float32)
 
-    def remove_from_optim(self, optimizer, deleted_mask, new_params):
-        """removes the deleted_mask from the optimizer provided"""
-        assert len(new_params) == 1
-        # assert isinstance(optimizer, torch.optim.Adam), "Only works with Adam"
+    def _rebuild_gaussians(self, optimizers: Optimizers, new_chunks, keep):
+        """Replaces every gaussian parameter and its Adam state by the rows `keep` of the virtual
+        concatenation [current params] + new_chunks (the split and dup rows: dicts name -> tensor),
+        one tensor at a time: a final-size tensor is allocated, the kept rows are index_select'ed
+        straight into it, the new rows are filled (zeros for the Adam moments) and the old tensor is
+        freed before the next one. Peak = the old plus ONE new copy of the current tensor. The former
+        cat + mask-index sequence held old and new copies of param, exp_avg and exp_avg_sq at once
+        (pn_gapC_010 OOMed at 90 GB in remove_from_optim: features_rest [N,T,15,3], N=6.5M).
+        Row order is unchanged: kept old rows, then kept split rows, then kept dup rows."""
+        sizes = [self.num_points] + [c["means"].shape[0] for c in new_chunks]
+        offsets = [0]
+        for n in sizes:
+            offsets.append(offsets[-1] + n)
+        keep_idx = torch.nonzero(keep).squeeze(1)  # the host sync of this refine: the final size
+        ends = torch.searchsorted(keep_idx, torch.tensor(offsets[1:], device=keep_idx.device)).tolist()
+        starts = [0] + ends[:-1]
+        local_idx = [keep_idx[s:e] - o for s, e, o in zip(starts, ends, offsets)]  # kept rows, per chunk
+        n_final = ends[-1]
 
-        param = optimizer.param_groups[0]["params"][0]
-        param_state = optimizer.state[param]
-        del optimizer.state[param]
+        def gather(name, old, zero_new):
+            out = torch.empty((n_final,) + old.shape[1:], dtype=old.dtype, device=old.device)
+            torch.index_select(old, 0, local_idx[0], out=out[:ends[0]])
+            if zero_new:
+                out[ends[0]:].zero_()
+            else:
+                for chunk, s, e, idx in zip(new_chunks, starts[1:], ends[1:], local_idx[1:]):
+                    torch.index_select(chunk.pop(name), 0, idx, out=out[s:e])  # pop: the chunk's copy dies here
+            return out
 
-        # Modify the state directly without deleting and reassigning.
-        if "exp_avg" in param_state:
-            param_state["exp_avg"] = param_state["exp_avg"][~deleted_mask]
-            param_state["exp_avg_sq"] = param_state["exp_avg_sq"][~deleted_mask]
-
-        # Update the parameter in the optimizer's param group.
-        del optimizer.param_groups[0]["params"][0]
-        del optimizer.param_groups[0]["params"]
-        optimizer.param_groups[0]["params"] = new_params
-        optimizer.state[new_params[0]] = param_state
-
-    def remove_from_all_optim(self, optimizers, deleted_mask):
-        param_groups = self.get_gaussian_param_groups()
-        for group, param in param_groups.items():
-            self.remove_from_optim(optimizers.optimizers[group], deleted_mask, param)
-        torch.cuda.empty_cache()
-
-    def dup_in_optim(self, optimizer, dup_mask, new_params, n=2):
-        """adds the parameters to the optimizer"""
-        param = optimizer.param_groups[0]["params"][0]
-        param_state = optimizer.state[param]
-        if "exp_avg" in param_state:
-            repeat_dims = (n,) + tuple(1 for _ in range(param_state["exp_avg"].dim() - 1))
-            param_state["exp_avg"] = torch.cat(
-                [
-                    param_state["exp_avg"],
-                    torch.zeros_like(param_state["exp_avg"][dup_mask.squeeze()]).repeat(*repeat_dims),
-                ],
-                dim=0,
-            )
-            param_state["exp_avg_sq"] = torch.cat(
-                [
-                    param_state["exp_avg_sq"],
-                    torch.zeros_like(param_state["exp_avg_sq"][dup_mask.squeeze()]).repeat(*repeat_dims),
-                ],
-                dim=0,
-            )
-        del optimizer.state[param]
-        optimizer.state[new_params[0]] = param_state
-        optimizer.param_groups[0]["params"] = new_params
-        del param
-
-    def dup_in_all_optim(self, optimizers, dup_mask, n):
-        param_groups = self.get_gaussian_param_groups()
-        for group, param in param_groups.items():
-            self.dup_in_optim(optimizers.optimizers[group], dup_mask, param, n)
+        # parameter name -> optimizer name (comprehensions: no stray reference to an old parameter)
+        names = {id(p): name for name, p in self.gauss_params.items()}
+        groups = {names[id(p)]: group for group, (p,) in self.get_gaussian_param_groups().items() if id(p) in names}
+        for name in list(self.gauss_params.keys()):
+            old = self.gauss_params[name]
+            new = torch.nn.Parameter(gather(name, old.data, zero_new=False))
+            self.gauss_params[name] = new
+            group = groups.get(name)
+            if group is None:
+                del old
+                continue
+            optim = optimizers.optimizers[group]
+            state = optim.state.pop(optim.param_groups[0]["params"][0], {})
+            optim.param_groups[0]["params"] = [new]
+            optim.state[new] = state
+            # nerfstudio's Optimizers keeps its own [param] list (for grad clipping); never updated before,
+            # it pinned the INITIAL parameters for the whole training (features_rest alone: GBs)
+            if group in getattr(optimizers, "parameters", {}):
+                optimizers.parameters[group] = [new]
+            del old  # the last reference to the old parameter: freed before its Adam moments are rebuilt
+            for key in ("exp_avg", "exp_avg_sq"):
+                if key in state:
+                    state[key] = gather(name, state[key], zero_new=True)  # new rows start with zero moments
 
     def after_train(self, step: int):
         assert step == self.step
@@ -507,6 +505,10 @@ class VanillaGaussianSplattingModel(torch.nn.Module):
             if self.num_points <= 0:
                 return
             reset_interval = self.ctrl_config.reset_alpha_every * self.ctrl_config.refine_every
+            counts = {}  # GPU scalars for the verbose log, read back once at the end
+            new_chunks = []
+            extra_cull = None
+            n_old = n_before = self.num_points
             if self.step < self.ctrl_config.stop_split_at:
                 # then we densify
                 if self.config.verbose:
@@ -515,9 +517,8 @@ class VanillaGaussianSplattingModel(torch.nn.Module):
                 assert self.xys_grad_norm is not None and self.vis_counts is not None and self.max_2Dsize is not None
                 # avg_grad_norm = (self.xys_grad_norm / self.vis_counts) * 0.5 * max(self.last_size[0], self.last_size[1])
                 avg_grad_norm = self.xys_grad_norm / self.vis_counts
-
                 if self.config.verbose:
-                    CONSOLE.log(f"avg_grad_norm: {avg_grad_norm.mean().item()}")
+                    counts["avg_grad_norm"] = avg_grad_norm.mean()
 
                 high_grads = (avg_grad_norm > self.ctrl_config.densify_grad_thresh).reshape(-1)
 
@@ -528,63 +529,44 @@ class VanillaGaussianSplattingModel(torch.nn.Module):
                     splits |= (self.max_2Dsize > self.ctrl_config.split_screen_size).reshape(-1)
 
                 nsamps = self.ctrl_config.n_split_samples
-                split_params = self.split_gaussians(splits, nsamps)
+                split_idx = torch.nonzero(splits).squeeze(1)  # host sync: the number of split rows
+                new_chunks.append(self.split_gaussians(split_idx, nsamps))
 
+                # (unchanged) the dup test sees the scales split_gaussians has just shrunk
                 dups = (self.scales.exp().max(dim=-1).values <= self.ctrl_config.densify_size_thresh).reshape(-1)
                 dups &= high_grads
-                dup_params = self.dup_gaussians(dups)
-                for name, param in self.gauss_params.items():
-                    self.gauss_params[name] = torch.nn.Parameter(
-                        torch.cat([param.detach(), split_params[name], dup_params[name]], dim=0)
-                    )
-
-                # append zeros to the max_2Dsize tensor
-                self.max_2Dsize = torch.cat(
-                    [
-                        self.max_2Dsize,
-                        torch.zeros_like(split_params["scales"][:, 0]),
-                        torch.zeros_like(dup_params["scales"][:, 0]),
-                    ],
-                    dim=0,
-                )
-
-                split_idcs = torch.where(splits)[0]
-                self.dup_in_all_optim(optimizers, split_idcs, nsamps)
-
-                dup_idcs = torch.where(dups)[0]
-                self.dup_in_all_optim(optimizers, dup_idcs, 1)
+                dup_idx = torch.nonzero(dups).squeeze(1)
+                new_chunks.append(self.dup_gaussians(dup_idx))
 
                 # After a guassian is split into two new gaussians, the original one should also be pruned.
-                splits_mask = torch.cat(
-                    (
-                        splits,
-                        torch.zeros(
-                            nsamps * splits.sum() + dups.sum(),
-                            device=self.device,
-                            dtype=torch.bool,
-                        ),
-                    )
-                )
-
-                deleted_mask = self.cull_gaussians(splits_mask)
+                extra_cull = splits
+                n_before -= split_idx.numel()
+                rebuild = True
             elif self.step >= self.ctrl_config.stop_split_at and self.ctrl_config.continue_cull_post_densification:
-                deleted_mask = self.cull_gaussians()
+                rebuild = True
             else:
                 # if we donot allow culling post refinement, no more gaussians will be pruned.
-                deleted_mask = None
+                rebuild = False
 
-            if deleted_mask is not None:
-                self.remove_from_all_optim(optimizers, deleted_mask)
+            if rebuild:
+                # cull mask over the virtual layout [old rows, split rows, dup rows]; the new rows carry
+                # no screen-size statistics (the old code appended zeros to max_2Dsize for them)
+                if self.step < self.ctrl_config.stop_screen_size_at:
+                    assert self.max_2Dsize is not None
+                culls = [self.cull_mask(self.gauss_params, self.max_2Dsize, counts)]
+                if extra_cull is not None:
+                    culls[0] |= extra_cull
+                culls += [self.cull_mask(chunk, None, counts) for chunk in new_chunks]
+                n_before += sum(c["means"].shape[0] for c in new_chunks)
+                self._rebuild_gaussians(optimizers, new_chunks, ~torch.cat(culls))
 
             if self.step < self.ctrl_config.stop_split_at and self.step % reset_interval == self.ctrl_config.refine_every:
                 if self.config.verbose:
                     CONSOLE.log(f"Reset opacity at step {self.step}")
                 # Reset value is set to be twice of the cull_alpha_thresh
                 reset_value = self.ctrl_config.cull_alpha_thresh * 2.0
-                self.opacities.data = torch.clamp(
-                    self.opacities.data,
-                    max=torch.logit(torch.tensor(reset_value, device=self.device)).item(),
-                )
+                # math.log: same float32 bound as torch.logit(...).item() without the GPU round trip; in place
+                self.opacities.data.clamp_(max=math.log(reset_value / (1.0 - reset_value)))
                 # reset the exp of optimizer
                 gaussian_param_groups = self.get_gaussian_param_groups()
                 for name, param in gaussian_param_groups.items():
@@ -592,141 +574,120 @@ class VanillaGaussianSplattingModel(torch.nn.Module):
                         optim = optimizers.optimizers[name]
                         param = optim.param_groups[0]["params"][0]
                         param_state = optim.state[param]
-                        param_state["exp_avg"] = torch.zeros_like(param_state["exp_avg"])
-                        param_state["exp_avg_sq"] = torch.zeros_like(param_state["exp_avg_sq"])
+                        for key in ("exp_avg", "exp_avg_sq"):
+                            if key in param_state:
+                                param_state[key].zero_()  # in place: no second copy
                         break
+
+            if self.config.verbose and rebuild:
+                keys = list(counts.keys())
+                read = dict(zip(keys, torch.stack([counts[k].float() for k in keys]).tolist()))  # one sync
+                if extra_cull is not None:
+                    n_split, n_dup = split_idx.numel(), dup_idx.numel()
+                    CONSOLE.log(f"avg_grad_norm: {read['avg_grad_norm']}")
+                    CONSOLE.log(f"Splitting {n_split / n_old} gaussians: {n_split}/{n_old}")
+                    CONSOLE.log(f"Duplicating {n_dup / n_old} gaussians: {n_dup}/{n_old}")
+                CONSOLE.log(
+                    f"Culled {n_before - self.num_points} gaussians "
+                    f"({int(read.get('below_alpha', 0))} below alpha thresh, {int(read.get('toobigs', 0))}"
+                    f"({int(read.get('toobigs_ws', 0))}, {int(read.get('toobigs_vs', 0))}) too bigs, {self.num_points} remaining)"
+                )
 
             self.xys_grad_norm = None
             self.vis_counts = None
             self.max_2Dsize = None
 
-    def cull_gaussians(self, extra_cull_mask: Optional[torch.Tensor] = None):
+    def cull_scale_thresh(self, means):
+        """World-space scale above which a gaussian is culled, per gaussian (subclasses change the far rule)."""
+        # Temporal fix for far background gaussians.
+        # Do not cull far background gaussians.
+        far_mask = means.norm(dim=-1) > self.ctrl_config.far_background_distance_thresh
+        return (
+            torch.where(
+                far_mask,
+                self.ctrl_config.far_background_cull_scale_factor,
+                1.0,
+            )
+            * self.ctrl_config.cull_scale_thresh
+        )
+
+    def cull_mask(self, params, max_2Dsize, counts):
         """
-        This function deletes gaussians with under a certain opacity threshold
-        extra_cull_mask: a mask indicates extra gaussians to cull besides existing culling criterion
+        Mask of the rows of `params` (a mapping name -> tensor) to delete: the ones under the opacity
+        threshold and, after the first opacity reset, the huge ones in world space and (until
+        stop_screen_size_at) in screen space. max_2Dsize None: rows without screen statistics.
+        The counts for the verbose log are summed into `counts` as GPU scalars: no host sync here.
         """
-        n_bef = self.num_points
         # cull transparent ones
-        culls = (torch.sigmoid(self.opacities) < self.ctrl_config.cull_alpha_thresh).reshape(-1)
-        below_alpha_count = torch.sum(culls).item()
-        toobigs_count = 0
-        toobigs_ws_count = 0
-        toobigs_vs_count = 0
-        if extra_cull_mask is not None:
-            culls = culls | extra_cull_mask
-            n_bef -= torch.sum(extra_cull_mask).item()
+        culls = (torch.sigmoid(params["opacities"]) < self.ctrl_config.cull_alpha_thresh).reshape(-1)
+        counts["below_alpha"] = counts.get("below_alpha", 0) + culls.sum()
 
         if self.step > self.ctrl_config.refine_every * self.ctrl_config.reset_alpha_every:
-
-            # Temporal fix for far background gaussians.
-            # Do not cull far background gaussians.
-            far_mask = self.means.norm(dim=-1) > self.ctrl_config.far_background_distance_thresh
-            cull_scale_thresh = (
-                torch.where(
-                    far_mask,
-                    self.ctrl_config.far_background_cull_scale_factor,
-                    1.0,
-                )
-                * self.ctrl_config.cull_scale_thresh
-            )
-
             # cull huge ones
-            toobigs = (torch.exp(self.scales).max(dim=-1).values > cull_scale_thresh).reshape(-1)
-            toobigs_ws_count = torch.sum(toobigs).item()
-            if self.step < self.ctrl_config.stop_screen_size_at:
+            toobigs = (torch.exp(params["scales"]).max(dim=-1).values > self.cull_scale_thresh(params["means"])).reshape(-1)
+            counts["toobigs_ws"] = counts.get("toobigs_ws", 0) + toobigs.sum()
+            if self.step < self.ctrl_config.stop_screen_size_at and max_2Dsize is not None:
                 # cull big screen space
-                assert self.max_2Dsize is not None
-                toobigs_vs = (self.max_2Dsize > self.ctrl_config.cull_screen_size).reshape(-1)
-                toobigs_vs_count = torch.sum(toobigs_vs).item()
-                toobigs = toobigs | toobigs_vs
+                toobigs_vs = (max_2Dsize > self.ctrl_config.cull_screen_size).reshape(-1)
+                counts["toobigs_vs"] = counts.get("toobigs_vs", 0) + toobigs_vs.sum()
+                toobigs |= toobigs_vs
 
-            culls = culls | toobigs
-            toobigs_count = torch.sum(toobigs).item()
-        for name, param in self.gauss_params.items():
-            self.gauss_params[name] = torch.nn.Parameter(param[~culls])
-
-        if self.config.verbose:
-            CONSOLE.log(
-                f"Culled {n_bef - self.num_points} gaussians "
-                f"({below_alpha_count} below alpha thresh, {toobigs_count}({toobigs_ws_count}, {toobigs_vs_count}) too bigs, {self.num_points} remaining)"
-            )
-
+            culls |= toobigs
+            counts["toobigs"] = counts.get("toobigs", 0) + toobigs.sum()
         return culls
 
-    def split_features_dc(self, split_mask, samps):
-        return self.features_dc[split_mask].repeat(samps, 1)
-
-    def split_properties(self, split_mask, samps):
-        return {
-            "features_dc": self.split_features_dc(split_mask, samps),
-            "features_rest": self.features_rest[split_mask].repeat(samps, 1, 1),
-            "opacities": self.opacities[split_mask].repeat(samps, 1),
-        }
-
-    def split_gaussians(self, split_mask, samps):
+    def split_gaussians(self, split_idx, samps):
         """
         This function splits gaussians that are too large
+        split_idx: long index of the gaussians to split; returns `samps` new rows per gaussian,
+        sample-major ([all, all, ...]: the order of the former mask index + repeat(samps, 1))
         """
-        n_splits = split_mask.sum().item()
-        if self.config.verbose:
-            CONSOLE.log(f"Splitting {split_mask.sum().item()/self.num_points} gaussians: {n_splits}/{self.num_points}")
+        n_splits = split_idx.numel()
+        # one index tensor instead of ~12 boolean-mask indexings (each a nonzero + host sync)
+        idx = split_idx.repeat(samps)
         centered_samples = torch.randn((samps * n_splits, 3), device=self.device)  # Nx3 of axis-aligned scales
         scaled_samples = (
-            torch.exp(self.scales[split_mask].repeat(samps, 1)) * centered_samples
+            torch.exp(self.scales.index_select(0, idx)) * centered_samples
         )  # how these scales are rotated
-        quats = self.quats[split_mask] / self.quats[split_mask].norm(dim=-1, keepdim=True)  # normalize them first
-        rots = quat_to_rotmat(quats.repeat(samps, 1))  # how these scales are rotated
+        quats = self.quats.index_select(0, idx)
+        quats = quats / quats.norm(dim=-1, keepdim=True)  # normalize them first
+        rots = quat_to_rotmat(quats)  # how these scales are rotated
         rotated_samples = torch.bmm(rots, scaled_samples[..., None]).squeeze(-1)
-        new_means = rotated_samples + self.means[split_mask].repeat(samps, 1)
-        # step 2 & 3, sample new colors, new opacities, and other properties
-        new_properties = self.split_properties(split_mask, samps)
+        new_means = rotated_samples + self.means.index_select(0, idx)
         # step 4, sample new scales
         size_fac = 1.6
-        new_scales = torch.log(torch.exp(self.gauss_params["scales"][split_mask]) / size_fac).repeat(samps, 1)
-        self.scales[split_mask] = torch.log(torch.exp(self.scales[split_mask]) / size_fac)
-        if self.scale_dim == 3:    
-            # step 5, sample new quats
-            new_quats = self.quats[split_mask].repeat(samps, 1)
-            out = {
-                "means": new_means,
-                **new_properties,
-                "scales": new_scales,
-                "quats": new_quats,
-            }
-        else:
-            out = {
-                "means": new_means,
-                **new_properties,
-                "scales": new_scales,
-            }
+        new_scales = torch.log(torch.exp(self.gauss_params["scales"].index_select(0, idx)) / size_fac)
+        self.scales[split_idx] = torch.log(torch.exp(self.scales[split_idx]) / size_fac)
+        out = {"means": new_means, "scales": new_scales}
+        # step 2 & 3, every other property (colours, opacities, quats, per-traversal features, any rank) is copied
         for name, param in self.gauss_params.items():
             if name not in out:
-                out[name] = param[split_mask].repeat(samps, 1)
+                out[name] = param.index_select(0, idx)
         return out
 
-    def dup_gaussians(self, dup_mask):
+    def dup_gaussians(self, dup_idx):
         """
         This function duplicates gaussians that are too small
+        dup_idx: long index of the gaussians to duplicate
         """
-        n_dups = dup_mask.sum().item()
-        if self.config.verbose:
-            CONSOLE.log(f"Duplicating {dup_mask.sum().item()/self.num_points} gaussians: {n_dups}/{self.num_points}")
+        n_dups = dup_idx.numel()
         new_dups = {}
         for name, param in self.gauss_params.items():
 
             if self.ctrl_config.clone_sample_means and name == 'means':
                 centered_samples = torch.randn((n_dups, 3), device=self.device)  # Nx3 of axis-aligned scales
                 scaled_samples = (
-                    torch.exp(self.scales[dup_mask]) * centered_samples
+                    torch.exp(self.scales.index_select(0, dup_idx)) * centered_samples
                 )  # how these scales are rotated
-                quats = self.quats[dup_mask] / self.quats[dup_mask].norm(dim=-1, keepdim=True)  # normalize them first
+                quats = self.quats.index_select(0, dup_idx)
+                quats = quats / quats.norm(dim=-1, keepdim=True)  # normalize them first
                 rots = quat_to_rotmat(quats)  # how these scales are rotated
                 rotated_samples = torch.bmm(rots, scaled_samples[..., None]).squeeze(-1)
-                new_means = rotated_samples + self.means[dup_mask]
+                new_means = rotated_samples + self.means.index_select(0, dup_idx)
                 new_dups[name] = new_means
                 continue
 
-            new_dups[name] = param[dup_mask]
+            new_dups[name] = param.index_select(0, dup_idx)
         return new_dups
 
     def get_training_callbacks(

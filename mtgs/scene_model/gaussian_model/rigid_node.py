@@ -390,11 +390,6 @@ class RigidSubModel(VanillaGaussianSplattingModel):
 
         super().load_state_dict(dict, **kwargs)
 
-    def split_features_dc(self, split_mask, samps):
-        if self.config.fourier_features_dim is None:
-            return self.features_dc[split_mask].repeat(samps, 1)
-        return self.features_dc[split_mask].repeat(samps, 1, 1)
-    
     def translate(self, translate_vector: Tensor):
         assert translate_vector.shape == (3,)
         new_means = self.means + translate_vector

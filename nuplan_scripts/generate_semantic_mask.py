@@ -47,13 +47,24 @@ class _CamMaskDataset(torch.utils.data.Dataset):
     def __getitem__(self, idx):
         dp, mask_path = self.items[idx]
         image = Image.open(os.path.join(NUPLAN_SENSOR_ROOT, dp))
-        pixel = self.processor(images=image, return_tensors="pt").pixel_values[0]
+        # raw uint8 HWC: 6 MB per image across the worker queue instead of the 25 MB normalised float32 map
+        # (the processor's rescale + normalise, identical arithmetic, runs on the GPU in _normalize)
+        pixel = torch.from_numpy(np.asarray(image))
         return pixel, mask_path, (image.height, image.width)
 
 
 def _collate(batch):
     pixels = torch.stack([b[0] for b in batch])
     return pixels, [b[1] for b in batch], [b[2] for b in batch]
+
+
+def _normalize(pixels, processor):
+    """[B,H,W,3] uint8 on the device -> [B,3,H,W] float32, bit for bit what Mask2FormerImageProcessor(do_resize=False)
+    produces: float64 * rescale_factor, cast to float32, then (x - mean) / std in float32."""
+    x = (pixels.permute(0, 3, 1, 2).double() * processor.rescale_factor).float()
+    mean = torch.tensor(processor.image_mean, dtype=torch.float32, device=x.device).view(1, 3, 1, 1)
+    std = torch.tensor(processor.image_std, dtype=torch.float32, device=x.device).view(1, 3, 1, 1)
+    return (x - mean) / std
 
 
 if __name__ == '__main__':
@@ -102,12 +113,13 @@ if __name__ == '__main__':
         with tqdm(total=len(dataset), ncols=120,
                   desc=f"Generating semantic masks (bs={args.batch_size}, fp16)") as pbar:
             for pixels, mask_paths, sizes in loader:
-                pixels = pixels.to(distributed_state.device, non_blocking=True)
+                pixels = _normalize(pixels.to(distributed_state.device, non_blocking=True), processor)
                 with torch.no_grad(), torch.autocast("cuda", dtype=torch.float16):
                     outputs = model(pixels)
                 seg_maps = processor.post_process_semantic_segmentation(outputs, target_sizes=sizes)
                 for seg, mask_path in zip(seg_maps, mask_paths):
-                    writer.submit(_write_mask, seg.cpu().numpy().astype(np.uint8), mask_path)
+                    # uint8 on the GPU before the copy: 2 MB per map instead of the 16 MB int64 argmax
+                    writer.submit(_write_mask, seg.to(torch.uint8).cpu().numpy(), mask_path)
                 pbar.update(len(mask_paths) * distributed_state.num_processes)
 
     writer.shutdown(wait=True)

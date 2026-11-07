@@ -1405,7 +1405,7 @@ class MTGSSceneModel(Model):
                     and type(model).after_train in (VanillaGaussianSplattingModel.after_train, RigidSubModel.after_train)
                     and not model.frozen and model.step < model.ctrl_config.stop_split_at
                     and not (isinstance(model, RigidSubModel)
-                             and (model.frame_idx is None or not model.in_frame_mask[model.frame_idx]))):
+                             and (model.frame_idx is None or not model.in_frame(model.frame_idx)))):
                 batched.append((model, index))
         if not batched:
             return

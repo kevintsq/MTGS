@@ -472,6 +472,8 @@ class VanillaGaussianSplattingModel(torch.nn.Module):
 
     def after_train(self, step: int):
         assert step == self.step
+        if getattr(self, "_stats_step", None) == step:   # accumulated by MTGSSceneModel._update_submodel_statistics_batched
+            return
         if self.frozen:
             return
         # to save some training time, we no longer need to update those stats post refinement

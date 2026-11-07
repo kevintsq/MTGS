@@ -1259,7 +1259,24 @@ class MTGSSceneModel(Model):
 
         for model_name, model in self.gaussian_models.items():
             cbs.extend(model.get_training_callbacks(training_callback_attributes))
+        # One cache flush per refine, after every submodel's refinement_after (it was one flush per submodel
+        # inside remove_from_all_optim: hundreds per refine with the rigid objects, each a device sync and,
+        # with expandable_segments, an unmap + remap of the freed segments).
+        cbs.append(
+            TrainingCallback(
+                [TrainingCallbackLocation.AFTER_TRAIN_ITERATION],
+                self.release_cached_memory,
+                update_every_num_iters=self.config.control.refine_every,
+            )
+        )
         return cbs
+
+    def release_cached_memory(self, step):
+        ctrl = self.config.control
+        if ctrl.densify_from_iter < step < ctrl.stop_split_at or (
+            step >= ctrl.stop_split_at and ctrl.continue_cull_post_densification
+        ):
+            torch.cuda.empty_cache()
 
     def step_cb(self, step):
         self.step = step

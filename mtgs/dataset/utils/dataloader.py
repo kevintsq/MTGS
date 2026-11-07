@@ -16,6 +16,54 @@ import torch.multiprocessing as mp
 from nerfstudio.utils.rich_utils import CONSOLE
 
 
+class PinnedUploader:
+    """Moves one cached sample (data dict + Cameras) to the device without a stream sync.
+
+    A .to(device) from pageable memory does a cudaStreamSynchronize per tensor, draining the GPU queue;
+    the model did that for the image, mask, depth and lidar depth (several times each) every step, and
+    the whole image cache cannot simply be pinned (page-locking tens of GB, 1.5-2x with the allocator's
+    power-of-two buckets). Each tensor is memcpy'd into a pinned staging buffer and uploaded with
+    non_blocking=True; the buffers rotate over a few slots and a slot is reused only once the event
+    recorded after its uploads has completed (checked with query(), so no sync in the normal case).
+    The cache keeps its host tensors: the returned dict is a new one."""
+
+    def __init__(self, device, slots: int = 3):
+        self.device = torch.device(device)
+        self.slots = [[{}, None] for _ in range(slots)]
+        self.next = 0
+
+    def upload(self, data: dict, camera):
+        if self.device.type != "cuda":
+            return data, camera.to(self.device)
+        slot = self.slots[self.next]
+        self.next = (self.next + 1) % len(self.slots)
+        bufs, event = slot
+        if event is not None and not event.query():
+            event.synchronize()
+
+        def up(key, t):
+            if t.device.type == "cuda":
+                return t
+            k = (key, tuple(t.shape), t.dtype)
+            buf = bufs.get(k)
+            if buf is None:
+                buf = bufs[k] = torch.empty(t.shape, dtype=t.dtype, pin_memory=True)
+            buf.copy_(t)
+            return buf.to(self.device, non_blocking=True)
+
+        out = {k: up(k, v) if torch.is_tensor(v) else v for k, v in data.items()}
+        counter = [0]
+
+        def cam_fn(t):   # fields are visited in a fixed order, so the counter identifies the buffer
+            counter[0] += 1
+            return up(("camera", counter[0]), t)
+
+        camera = camera._apply_fn_to_fields(cam_fn)
+        slot[1] = torch.cuda.Event()
+        slot[1].record()
+        return out, camera
+
+
 class FixedIndicesPseudoDataloader:
     def __init__(self, datamanager):
         self.datamanager = datamanager
@@ -24,8 +72,7 @@ class FixedIndicesPseudoDataloader:
     def __iter__(self):
         for idx in range(len(self)):
             data, camera = self.datamanager.cached_eval(idx)
-            data["image"] = data["image"].to(self.datamanager.device)
-            camera = camera.to(self.datamanager.device)
+            camera, data = self.datamanager.upload(data, camera)
             yield camera, data
 
     def __len__(self):

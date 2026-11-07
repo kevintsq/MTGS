@@ -22,7 +22,7 @@ from nerfstudio.utils.misc import get_orig_class
 from nerfstudio.utils.rich_utils import CONSOLE
 
 from .custom_dataset import CustomInputDataset
-from .utils.dataloader import AsyncDataLoader, FixedIndicesPseudoDataloader, OnDemandDataLoader, PrefetchDataLoader
+from .utils.dataloader import AsyncDataLoader, FixedIndicesPseudoDataloader, OnDemandDataLoader, PinnedUploader, PrefetchDataLoader
 from .utils.sampler import CameraSampler, MultiTraversalBalancedSampler
 
 @dataclass
@@ -93,6 +93,7 @@ class CustomFullImageDatamanager(FullImageDatamanager, Generic[TDataset]):
     ):
         self.config = config
         self.device = device
+        self._uploader = PinnedUploader(device)
         self.world_size = world_size
         self.local_rank = local_rank
         self.sampler = None
@@ -268,8 +269,14 @@ class CustomFullImageDatamanager(FullImageDatamanager, Generic[TDataset]):
         )
 
         self.release_memory(step)
-        data["image"] = data["image"].to(self.device)
-        camera = camera.to(self.device)
+        return self.upload(data, camera)
+
+    def upload(self, data: Dict, camera: Cameras) -> Tuple[Cameras, Dict]:
+        """The whole sample to the device in one go (pinned staging, non-blocking): the model used to
+        re-upload the mask / depth / lidar depth from pageable memory at every use, each a stream sync.
+        The image moved here used to be written back into the cache, which silently migrated the entire
+        image cache to the GPU over the first epoch; the cache now keeps its host tensors."""
+        camera, data = self._uploader.upload(data, camera)[::-1]
         return camera, data
 
     def next_eval(self, step: int) -> Tuple[Cameras, Dict]:
@@ -278,9 +285,7 @@ class CustomFullImageDatamanager(FullImageDatamanager, Generic[TDataset]):
         Returns a Camera instead of raybundle"""
         image_idx = self.eval_sampler.get_next_image_idx()
         data, camera = self.cached_eval(image_idx)
-        data["image"] = data["image"].to(self.device)
-        camera = camera.to(self.device)
-        return camera, data
+        return self.upload(data, camera)
 
     def next_eval_image(self, step: int) -> Tuple[Cameras, Dict]:
         """Returns the next evaluation batch

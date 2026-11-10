@@ -91,10 +91,6 @@ class CustomOptimizers(Optimizers):
         Args:
             step: the current step
         """
-        if not self._batched:
-            for param_group_name, scheduler in self.schedulers.items():
-                scheduler.step()
-            return
         # ~2500 LambdaLR schedulers, but only a handful of distinct (config, lr_init)
         # pairs: the multiplier depends on nothing else. Step one scheduler per pair and
         # hand its learning rates to the others -- the same values LambdaLR would set.

@@ -19,6 +19,12 @@ if __name__ == '__main__':
 
     data_root = video_scene.data_root
 
+    # MTGS_KEEP_PREP=1: keep the whole prep tree of this block (masks, depth, registration, colmap, point clouds),
+    # e.g. to inspect what a training was fed. Tens of GB per block: set it per block, not in a recipe.
+    if os.environ.get('MTGS_KEEP_PREP') == '1':
+        print(f"[clean] MTGS_KEEP_PREP=1: prep tree of {config.road_block_name} kept")
+        raise SystemExit(0)
+
     folders_to_remove = [
         "masks",
         "depth",

@@ -146,7 +146,6 @@ def run_da3_multiview(video_scene, video_scene_dict, undistort_mode, max_range, 
                 streams[(vt, cam_name)].append((ci.get('timestamp', fi['timestamp']), fi, ci))
 
     total = sum(len(s) for s in streams.values())
-    lidar_scale = os.environ.get('MTGS_DA3_LIDAR_SCALE', '1') == '1'
     scale_tol = float(os.environ.get('MTGS_DA3_SCALE_TOL', '0.15'))
     ratios = []; n_scaled_windows = 0
     loaders = ThreadPoolExecutor(max_workers=int(os.environ.get('MTGS_DA3_LOADERS', 8)))
@@ -157,10 +156,9 @@ def run_da3_multiview(video_scene, video_scene_dict, undistort_mode, max_range, 
         (H, W), (x, y, w, h) = size, roi
         img = np.zeros((H, W), np.uint16)
         img[y:y + h, x:x + w] = packed
-        if depth_sky.enabled():
-            sky = depth_sky.sky_mask(video_scene, cam_info, undistort_mode)
-            if sky is not None and sky.shape == img.shape:
-                img[sky] = 0                      # sky is not a surface: invalid for the depth losses
+        sky = depth_sky.sky_mask(video_scene, cam_info, undistort_mode)
+        if sky is not None and sky.shape == img.shape:
+            img[sky] = 0                      # sky is not a surface: invalid for the depth losses
         os.makedirs(os.path.dirname(path), exist_ok=True)
         cv2.imwrite(path, img)
 
@@ -202,21 +200,20 @@ def run_da3_multiview(video_scene, video_scene_dict, undistort_mode, max_range, 
                 # whole window comes out 5-10x too close (pn_w2_02: 119 of 3336 maps, max 3-8 m where lidar sees 80 m;
                 # the depth loss then drove one camera's pose to NaN and the model with it). The lidar median ratio
                 # per window fixes the scale; windows without lidar coverage are left as they are.
-                if lidar_scale:
-                    (x, y, w, h) = loaded[idx[0]][4]
-                    full = _upsample(depth, h, w)
-                    rs = []
-                    for k, i in enumerate(idx):
-                        r = _lidar_ratio(seq[i][1], w2c[i], loaded[i][2], (x, y, w, h), full[k], lidar_cache)
-                        if r is not None:
-                            rs.append(r)
-                    if rs:
-                        rw = float(np.exp(np.median(np.log(torch.cat(rs).cpu().numpy()))))
-                        n_scaled_windows += 1 if abs(np.log(rw)) > np.log(1.0 + scale_tol) else 0
-                        ratios.append(rw)
-                        if abs(np.log(rw)) > np.log(1.0 + scale_tol):
-                            depth = depth * rw
-                            print(f'[dense_depth_da3] {key[1]} window {s0}: lidar/DA3 scale {rw:.2f} -> rescaled', flush=True)
+                (x, y, w, h) = loaded[idx[0]][4]
+                full = _upsample(depth, h, w)
+                rs = []
+                for k, i in enumerate(idx):
+                    r = _lidar_ratio(seq[i][1], w2c[i], loaded[i][2], (x, y, w, h), full[k], lidar_cache)
+                    if r is not None:
+                        rs.append(r)
+                if rs:
+                    rw = float(np.exp(np.median(np.log(torch.cat(rs).cpu().numpy()))))
+                    n_scaled_windows += 1 if abs(np.log(rw)) > np.log(1.0 + scale_tol) else 0
+                    ratios.append(rw)
+                    if abs(np.log(rw)) > np.log(1.0 + scale_tol):
+                        depth = depth * rw
+                        print(f'[dense_depth_da3] {key[1]} window {s0}: lidar/DA3 scale {rw:.2f} -> rescaled', flush=True)
                 c = s0 + (len(idx) - 1) / 2.0
                 for k, i in enumerate(idx):
                     if abs(i - c) < best_off[i]:
@@ -233,7 +230,7 @@ def run_da3_multiview(video_scene, video_scene_dict, undistort_mode, max_range, 
                 lidar_caches.pop(key[0], None)          # last stream of this video: free its sweeps
             pbar.update(n)
     loaders.shutdown(wait=True); writer.shutdown(wait=True)
-    if lidar_scale and ratios:
+    if ratios:
         r = np.array(ratios)
         print(f'[dense_depth_da3] lidar scale check: {len(r)} windows, median ratio {np.median(r):.3f}, '
               f'p5 {np.percentile(r, 5):.2f}, p95 {np.percentile(r, 95):.2f}, rescaled {n_scaled_windows} '

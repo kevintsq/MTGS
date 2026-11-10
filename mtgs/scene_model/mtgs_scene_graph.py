@@ -41,7 +41,6 @@ from .gaussian_model.rigid_node import RigidSubModel, rigid_batch_key, batched_r
 from .gaussian_model.utils import quat_to_rotmat, SH2RGB
 
 import os as _os
-_BATCHED_RIGID = _os.environ.get("MTGS_BATCHED_RIGID", "1") != "0"
 from .module.appearance import GSAppearanceModelConfig, GSAppearanceModel
 
 def merge_control_cfg(global_control, model_cfg):
@@ -458,8 +457,8 @@ class MTGSSceneModel(Model):
             visible_tokens = self.gaussian_models.keys()
 
         # Consecutive rigid objects are evaluated as one batch (see
-        # batched_rigid_gaussians); MTGS_BATCHED_RIGID=0 restores the per-object calls.
-        batch_rigid = _BATCHED_RIGID and self.training
+        # batched_rigid_gaussians) while training.
+        batch_rigid = self.training
         run, run_key = [], None
 
         def flush_run():

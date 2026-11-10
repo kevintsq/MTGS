@@ -264,7 +264,7 @@ if __name__ == '__main__':
         x, y, w, h = roi
         depth_image = np.zeros((raw_height, raw_width), dtype=np.uint16)
         depth_image[y:y+h, x:x+w] = packed
-        if cam_info is not None and depth_sky.enabled():
+        if cam_info is not None:
             sky = depth_sky.sky_mask(video_scene, cam_info, args.undistort_mode)
             if sky is not None and sky.shape == depth_image.shape:
                 depth_image[sky] = 0              # sky is not a surface: invalid for the depth losses

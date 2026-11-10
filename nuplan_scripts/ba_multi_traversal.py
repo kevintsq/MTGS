@@ -667,8 +667,6 @@ def align_model(video_scene: VideoScene, video_scene_dict, colmap_path, thresh=1
                     # the training data, which cost more than the alignment gained.
                     # Keep them on their INS poses instead -- the BA frame is anchored
                     # to INS by the Sim3 (residual ~0.11m), so mixing is benign.
-                    if os.environ.get('MTGS_JOINT_KEEP_UNREGISTERED', '1') != '1':
-                        cam_info['valid'] = False
                     continue
 
                 raw_cam_T[token] = cam2global[:3, 3]
@@ -904,7 +902,7 @@ def align_model(video_scene: VideoScene, video_scene_dict, colmap_path, thresh=1
                 info['lidar2global'] = pose @ info['lidar2ego']
                 n_upd += 1
         CONSOLE.log(f'[Align Colmap] wrote BA ego poses for {n_upd} frames')
-        if os.environ.get('MTGS_JOINT_SFM') == '1' and os.environ.get('MTGS_SFM_DROP_UNREGISTERED', '1') == '1':
+        if os.environ.get('MTGS_JOINT_SFM') == '1':
             # a frame without any SfM camera keeps its metric ego pose, which can be metres off the
             # SfM frame: its lidar would stack as a ghost copy. Skip such frames; drop a pass that
             # SfM barely registered (nr_20 model 2 holds no image of pass 22).

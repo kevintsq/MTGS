@@ -73,12 +73,9 @@ def run_point_triangulator(
 
     try:
         _run_colmap(colmap_feature_extractor_args, colmap_path, check=True)
-        # The July reconstructions ran without this rewrite (colmap's own rigs were
-        # left in place); MTGS_NORMALIZE_RIGS=0 reproduces that for comparison.
-        if os.environ.get("MTGS_NORMALIZE_RIGS", "1") == "1":
-            from nuplan_scripts.utils.colmap_utils.bundle_adjustment import _normalize_rigs
-            _normalize_rigs(f"{colmap_path}/database.db")
-        print(f"[rigs] normalize={os.environ.get('MTGS_NORMALIZE_RIGS', '1')}", flush=True)
+        # (the July reconstructions ran without this rewrite: colmap's own rigs were left in place)
+        from nuplan_scripts.utils.colmap_utils.bundle_adjustment import _normalize_rigs
+        _normalize_rigs(f"{colmap_path}/database.db")
     except subprocess.CalledProcessError as e:
         print(f"Error executing colmap feature_extractor: {e}")
         sys.exit(1)

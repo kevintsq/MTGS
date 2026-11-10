@@ -35,20 +35,16 @@ class CustomOptimizers(Optimizers):
     the same hyper-parameters are stepped with ONE fused Adam call on the optimizers'
     own state tensors -- the same kernel and the same math as stepping them one by one.
     Groups with a grad clip, or any call while the GradScaler is enabled, take the
-    original per-optimizer path. MTGS_BATCHED_OPTIM=0 disables the batching."""
-
-    _batched = os.environ.get("MTGS_BATCHED_OPTIM", "1") != "0"
+    original per-optimizer path."""
 
     def zero_grad_some(self, param_groups) -> None:
-        if not self._batched:
-            return super().zero_grad_some(param_groups)
         for name in param_groups:
             for pg in self.optimizers[name].param_groups:
                 for p in pg["params"]:
                     p.grad = None
 
     def optimizer_scaler_step_some(self, grad_scaler, param_groups) -> None:
-        if not self._batched or grad_scaler.is_enabled():
+        if grad_scaler.is_enabled():
             return super().optimizer_scaler_step_some(grad_scaler, param_groups)
         fallback, buckets = [], {}
         for name in param_groups:

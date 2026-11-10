@@ -8,7 +8,6 @@ masks/raw/sky/<image>.png (default since 2026-11-09; the cityscapes sky class 10
 masks/raw/cityscape/<image>.png otherwise), in RAW image space; it is undistorted here
 exactly like the image the depth model saw (nearest neighbour, same ROI), so its pixels
 line up with the depth PNG (ROI pasted back into the full frame at the same place).
-MTGS_DEPTH_SKY_MASK=0 disables it.
 """
 import os
 
@@ -19,10 +18,6 @@ from nuplan_scripts.utils.camera_utils import undistort_image_with_cam_info
 from nuplan_scripts.utils.constants import cityscape_label
 
 SKY = cityscape_label['sky']
-
-
-def enabled():
-    return os.environ.get('MTGS_DEPTH_SKY_MASK', '1') == '1'
 
 
 _FALLBACK_SAID = set()

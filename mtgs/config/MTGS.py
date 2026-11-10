@@ -14,8 +14,8 @@ class FusedAdamOptimizerConfig(AdamOptimizerConfig):
     """Adam with the fused CUDA kernel: one kernel per param group instead of
     python-side multi-tensor loops (~27% of train-loop self time with the
     dozen-plus param groups MTGS uses). Numerics differ only at float-noise
-    level. Disable via MTGS_NO_FUSED_ADAM=1."""
-    fused: bool = os.environ.get('MTGS_NO_FUSED_ADAM', '0') != '1'
+    level."""
+    fused: bool = True
 from nerfstudio.engine.schedulers import ExponentialDecaySchedulerConfig
 from nerfstudio.plugins.types import MethodSpecification
 from nerfstudio.cameras.camera_optimizers import CameraOptimizerConfig

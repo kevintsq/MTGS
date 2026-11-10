@@ -924,12 +924,11 @@ if __name__ == '__main__':
                 or mean_heading_error > are_gate):
             bad_videos.append(video_token)
 
-    # Height harmonisation (MTGS_REG_Z_HARMONIZE=0 disables): bring every pass
-    # onto the height of the passes registered around it before the height QA.
-    if os.environ.get('MTGS_REG_Z_HARMONIZE', '1') == '1':
-        _applied = _harmonize_z(video_scene_dict, result_poses_dict_aligned)
-        for vt, off in _applied.items():
-            CONSOLE.log(f"Traversal {vt.split('-')[-1]}: height corrected by {-off:+.2f} m onto the other passes.", style="yellow")
+    # Height harmonisation: bring every pass onto the height of the passes registered
+    # around it before the height QA.
+    _applied = _harmonize_z(video_scene_dict, result_poses_dict_aligned)
+    for vt, off in _applied.items():
+        CONSOLE.log(f"Traversal {vt.split('-')[-1]}: height corrected by {-off:+.2f} m onto the other passes.", style="yellow")
     # Height QA: the BEV metrics above cannot see a pass that ICP settled 1-3 m
     # above or below the others (fk_loc_0185 trav 20 +3.3 m, fp_gapC_010 trav 18
     # +1.0 m passed EPE/ATE/ARE and trained a second road layer).
@@ -1036,12 +1035,12 @@ if __name__ == '__main__':
             if len(video_scene_dict) == 0:
                 raise ValueError("All videos have bad registration result.")
 
-        # GPS-pass consolidation (MTGS_REG_GPS_MAPICP, default on; 2026-10-30, w2_02 / w2_06 / v2_07 / nb_18: 4-6
+        # GPS-pass consolidation (2026-10-30, w2_02 / w2_06 / v2_07 / nb_18: 4-6
         # passes left on raw GPS poses, offset from each other by the GPS error -> visible doubling). Every pass
         # that is still on GPS poses is registered by map ICP (INS start, trajectory gate, per-frame refinement)
         # onto the passes already trusted, largest first; a newly registered pass joins the reference. When NO pass
         # is trusted, the pinned (own) pass, else the longest, is taken as the reference on its GPS poses.
-        if _scans_by_token and gps_videos and os.environ.get('MTGS_REG_GPS_MAPICP', '1') == '1':
+        if _scans_by_token and gps_videos:
             _live = [vt for vt in video_scene_dict if vt in gps_videos]
             _trusted = {vt for vt in video_scene_dict if vt not in gps_videos}
             if not _trusted and len(_live) > 1:

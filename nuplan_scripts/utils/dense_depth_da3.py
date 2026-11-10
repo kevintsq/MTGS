@@ -71,6 +71,15 @@ def _load(video_scene, cam_info, undistort_mode):
     return np.ascontiguousarray(rgb), K, (H, W), (x, y, w, h)
 
 
+def _lens_sig(cam_info):
+    """the intrinsics + distortion undistort_image_with_cam_info will use for this camera, as a sortable key"""
+    if 'colmap_param' in cam_info and os.environ.get('MTGS_USE_COLMAP_INTRINSICS', '1') != '0':
+        K, d = cam_info['colmap_param']['cam_intrinsic'], cam_info['colmap_param']['distortion']
+    else:
+        K, d = cam_info['cam_intrinsic'], cam_info['distortion']
+    return tuple(np.round(np.concatenate([np.asarray(K, float).ravel(), np.asarray(d, float).ravel()]), 6).tolist())
+
+
 def _prep_frame(video_scene, frame_info, cam_info, undistort_mode, processor, lidar_cache):
     """Everything model.inference does to one image before the forward, once (it redid it in every window):
     the undistorted crop goes through DA3's InputProcessor._process_one (resize, /14 rounding, normalisation,
@@ -110,7 +119,8 @@ def _div_like_numpy(depth_t, scale):
 
 def _forward_window(model, imgs, exts, ixts, ref_view_strategy):
     """model.inference(image, extrinsics, intrinsics, align_to_input_ext_scale=True) on preprocessed GPU inputs,
-    returning the metric depth [N, h, w] float32 on the GPU instead of a CPU Prediction."""
+    returning the metric depth [N, h, w] float32 on the GPU instead of a CPU Prediction, and whether its scale is
+    metric (False: the pose alignment was degenerate and the depth is still in DA3's own scale)."""
     ex_t = torch.from_numpy(np.asarray(exts)).float().to(imgs.device, non_blocking=True)[None]
     in_t = torch.from_numpy(np.asarray(ixts)).float().to(imgs.device, non_blocking=True)[None]
     ex_t_norm = model._normalize_extrinsics(ex_t.clone())
@@ -119,8 +129,13 @@ def _forward_window(model, imgs, exts, ixts, ref_view_strategy):
     from depth_anything_3.utils.pose_align import align_poses_umeyama
     pred_ext = raw['extrinsics'].squeeze(0).cpu().numpy()
     ext_np = np.asarray(exts, dtype=np.float32)
-    _, _, scale, _ = align_poses_umeyama(pred_ext, ext_np, ransac=len(ext_np) >= 10, return_aligned=True, random_state=42)
-    return _div_like_numpy(depth, scale)
+    try:
+        _, _, scale, _ = align_poses_umeyama(pred_ext, ext_np, ransac=len(ext_np) >= 10, return_aligned=True, random_state=42)
+    except Exception:
+        # degenerate Sim3 (a 1-2 frame stream: the few cameras of a pass the BA left unregistered): no pose scale,
+        # the caller takes the lidar's
+        return depth, False
+    return _div_like_numpy(depth, scale), True
 
 
 def _upsample(depth, h, w):
@@ -137,13 +152,16 @@ def run_da3_multiview(video_scene, video_scene_dict, undistort_mode, max_range, 
     model = DepthAnything3.from_pretrained(model_id).to(device='cuda')
     print(f'[dense_depth_da3] {model_id}, window {Wn}, stride {St}')
 
-    streams = defaultdict(list)            # (video, cam) -> [(timestamp, frame_info, cam_info)]
+    # (video, cam, lens) -> [(timestamp, frame_info, cam_info)]. The lens is part of the key: a camera the BA did
+    # not register has no colmap_param and is undistorted with the calibration, so its crop has another size than
+    # its registered neighbours' and one window could not be stacked (ru_loc_0195, 2026-11-10: 266 vs 252 rows).
+    streams = defaultdict(list)
     for vt, v in video_scene_dict.items():
         for fi in v['frame_infos']:
             if fi.get('skipped', False):
                 continue
             for cam_name, ci in fi['cams'].items():
-                streams[(vt, cam_name)].append((ci.get('timestamp', fi['timestamp']), fi, ci))
+                streams[(vt, cam_name, _lens_sig(ci))].append((ci.get('timestamp', fi['timestamp']), fi, ci))
 
     total = sum(len(s) for s in streams.values())
     scale_tol = float(os.environ.get('MTGS_DA3_SCALE_TOL', '0.15'))
@@ -193,8 +211,8 @@ def run_da3_multiview(video_scene, video_scene_dict, undistort_mode, max_range, 
                         img_t, K_p, K, size, roi = futs[i].result()
                         loaded[i] = (img_t.to('cuda', non_blocking=True), K_p, K, size, roi)
                 imgs = torch.stack([loaded[i][0] for i in idx])
-                depth = _forward_window(model, imgs, [w2c[i] for i in idx], [loaded[i][1] for i in idx],
-                                        'saddle_balanced')
+                depth, metric = _forward_window(model, imgs, [w2c[i] for i in idx], [loaded[i][1] for i in idx],
+                                                'saddle_balanced')
                 # Scale check against the lidar (2026-11-05): align_to_input_ext_scale trusts DA3's own relative
                 # poses; on side cameras with little structure (and in near-static windows) they are wrong and the
                 # whole window comes out 5-10x too close (pn_w2_02: 119 of 3336 maps, max 3-8 m where lidar sees 80 m;
@@ -211,9 +229,13 @@ def run_da3_multiview(video_scene, video_scene_dict, undistort_mode, max_range, 
                     rw = float(np.exp(np.median(np.log(torch.cat(rs).cpu().numpy()))))
                     n_scaled_windows += 1 if abs(np.log(rw)) > np.log(1.0 + scale_tol) else 0
                     ratios.append(rw)
-                    if abs(np.log(rw)) > np.log(1.0 + scale_tol):
+                    if not metric:
+                        depth = depth * rw
+                    elif abs(np.log(rw)) > np.log(1.0 + scale_tol):
                         depth = depth * rw
                         print(f'[dense_depth_da3] {key[1]} window {s0}: lidar/DA3 scale {rw:.2f} -> rescaled', flush=True)
+                elif not metric:
+                    depth = torch.zeros_like(depth)         # no pose scale and no lidar: invalid, not a guessed scale
                 c = s0 + (len(idx) - 1) / 2.0
                 for k, i in enumerate(idx):
                     if abs(i - c) < best_off[i]:

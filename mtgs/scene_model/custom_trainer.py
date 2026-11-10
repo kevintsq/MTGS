@@ -285,6 +285,8 @@ class CustomTrainer(Trainer):
     # `nsys profile --capture-range=cudaProfilerApi`.
     _prof = tuple(int(x) for x in os.environ["MTGS_PROFILE_STEPS"].split(":")) if os.environ.get("MTGS_PROFILE_STEPS") else None
 
+    _loss_every = int(os.environ.get("MTGS_LOSS_LOG_EVERY", "1000"))
+
     def _install_nan_debug(self):
         """MTGS_DEBUG_NAN=1: log the loss dict and camera of the step whose gradient first goes non-finite.
         (pn_w2_02 2026-11-05: camera_optimizer.pose_adjustment of one image turned NaN at step ~4000 while every
@@ -334,6 +336,11 @@ class CustomTrainer(Trainer):
             warnings.simplefilter("always")
             torch.cuda.set_sync_debug_mode(1)
         out = super().train_iteration(step)
+        # The config runs without an event writer and the console writer tracks no loss, so the
+        # loss table is printed here (one GPU sync per MTGS_LOSS_LOG_EVERY steps; 0 = off).
+        if self._loss_every and step % self._loss_every == 0:
+            terms = " ".join(f"{k}={float(v):.4g}" for k, v in out[1].items())
+            print(f"[loss] step {step} total={float(out[0]):.4g} {terms}", flush=True)
         if self._sync_debug is not None and step == self._sync_debug + 3:
             torch.cuda.set_sync_debug_mode(0)
         return out

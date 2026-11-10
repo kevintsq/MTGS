@@ -190,18 +190,21 @@ def _prune_db_to_pair_list(db_path, pairs_txt):
 
 def _drop_far_from_prior(colmap_path, model_dir, max_err_m, colmap_exe, scale=1.0):
     """Delete images whose reconstructed centre is more than max_err_m metres from their prior (pose_prior mode)."""
-    import sqlite3, pycolmap
-    r = pycolmap.Reconstruction(model_dir)
+    # no pycolmap here: its GPU build needs libcudart at import, which the civo stage environment lacks -- pn_w2_16 died
+    # at this line after every 30 h mapping (2026-11-09/10); the centres come from images.bin directly
+    import sqlite3
+    from nuplan_scripts.utils.colmap_utils.read_write_model import read_images_binary, qvec2rotmat
+    centres = {i: -qvec2rotmat(im.qvec).T @ im.tvec for i, im in read_images_binary(os.path.join(model_dir, "images.bin")).items()}
     db = sqlite3.connect(f"{colmap_path}/database.db")
     cols = [c[1] for c in db.execute("pragma table_info(pose_priors)")]
     key = "image_id" if "image_id" in cols else "corr_data_id"      # COLMAP 4.2 vs 4.3 schema
     pri = {i: np.frombuffer(p, dtype=np.float64) for i, p in db.execute(f"select {key}, position from pose_priors")}
     db.close()
     max_err = max_err_m * scale
-    err = {i: np.linalg.norm(np.asarray(r.images[i].projection_center()) - pri[i]) for i in r.images if i in pri}
+    err = {i: np.linalg.norm(c - pri[i]) for i, c in centres.items() if i in pri}
     bad = [i for i, e in err.items() if e > max_err]
     e_m = np.array(list(err.values())) / scale if err else np.zeros(1)
-    print(f"[sfm] {len(bad)} of {len(r.images)} images > {max_err_m} m from their prior "
+    print(f"[sfm] {len(bad)} of {len(centres)} images > {max_err_m} m from their prior "
           f"(median {np.median(e_m):.3f} m, p90 {np.percentile(e_m, 90):.3f} m)", flush=True)
     if not bad:
         return

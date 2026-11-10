@@ -589,6 +589,45 @@ def create_sparse_colmap_model(video_scene: VideoScene, video_scene_dict, colmap
     return video_scene_dict
 
 
+def _rigidity_gate(frame_infos, images_aligned, rigid_m, video_token=''):
+    """Mark SfM cameras that left their frame's rigid rig as invalid; returns how many.
+
+    The 8 cameras of a frame are rigid. Unconstrained pure SfM misplaces a few of them (nr_20 model 2: 162/2992
+    images 0.5-39 m off where the rest of their frame puts them); a bend of the whole model only shifts the frame.
+    A camera is dropped when it leaves the frame's median offset from the metric poses by more than rigid_m --
+    measured against what that camera does in the rest of its pass: with refined intrinsics a camera that looks
+    along the road sits a constant 0.2-0.6 m off its calibrated place in the solution (focal length traded against
+    the position along the optical axis), and the plain test threw a whole camera away for it (pn_w2_08, 2026-11-10:
+    CAM_L0 dropped in 648 of 658 frames of all six passes, the 10 survivors 0.40-0.48 m off; CAM_F0 lost a third;
+    the block has no front-left view)."""
+    devs = []                                   # (info, cam, offset from the frame median, in the ego frame)
+    for info in frame_infos:
+        ego2global = np.asarray(info['ego2global'])
+        dev = {}
+        for cam in info['cams']:
+            ci_ = info['cams'][cam]
+            if ci_['token'] in images_aligned:
+                c2e_ = np.eye(4); c2e_[:3, :3] = Quaternion(ci_['sensor2ego_rotation']).rotation_matrix
+                c2e_[:3, 3] = ci_['sensor2ego_translation']
+                dev[cam] = images_aligned[ci_['token']]['sensor2global_translation'] - (ego2global @ c2e_)[:3, 3]
+        if len(dev) >= 3:
+            off_ = np.median(np.stack(list(dev.values())), axis=0)
+            for cam, d_ in dev.items():
+                devs.append((info, cam, ego2global[:3, :3].T @ (d_ - off_)))
+    sys_off = {}
+    for cam in sorted({c for _, c, _ in devs}):
+        q = np.stack([d for _, c, d in devs if c == cam])
+        sys_off[cam] = np.median(q, axis=0) if len(q) >= 5 else np.zeros(3)
+        if np.linalg.norm(sys_off[cam]) > 0.3:
+            CONSOLE.log(f'[sfm align] {video_token} {cam}: constant offset {np.linalg.norm(sys_off[cam]):.2f} m from the calibrated '
+                        f'rig ({np.round(sys_off[cam], 2).tolist()} in the ego frame), kept; outliers are judged around it')
+    n = 0
+    for info, cam, d_ in devs:
+        if np.linalg.norm(d_ - sys_off[cam]) > rigid_m:
+            info['cams'][cam]['valid'] = False; n += 1
+    return n
+
+
 def align_model(video_scene: VideoScene, video_scene_dict, colmap_path, thresh=1.0):
     cameras, images, points3D = read_model(f'{colmap_path}/sfm_model/0', ext='.bin')
 
@@ -813,25 +852,10 @@ def align_model(video_scene: VideoScene, video_scene_dict, colmap_path, thresh=1
     for video_token in video_scene_dict:
         frame_infos = video_scene_dict[video_token]['frame_infos']
         frame_infos = [info for info in frame_infos if not info.get('skipped', False)]
+        if rigid_m > 0:
+            n_ = _rigidity_gate(frame_infos, images_aligned, rigid_m, video_token); invalid_count += n_; n_rigid += n_
         for info in frame_infos:
             ego2global = info['ego2global']
-            if rigid_m > 0:
-                # The 8 cameras of a frame are rigid. Unconstrained pure SfM misplaces a few of them
-                # (nr_20 model 2: 162/2992 images 0.5-39 m off where the rest of their frame puts
-                # them); a bend of the whole model only shifts the frame. Drop cameras that leave
-                # the frame's median offset from the metric poses by more than rigid_m.
-                dev = {}
-                for cam in info['cams']:
-                    ci_ = info['cams'][cam]
-                    if ci_['token'] in images_aligned:
-                        c2e_ = np.eye(4); c2e_[:3, :3] = Quaternion(ci_['sensor2ego_rotation']).rotation_matrix
-                        c2e_[:3, 3] = ci_['sensor2ego_translation']
-                        dev[cam] = images_aligned[ci_['token']]['sensor2global_translation'] - (ego2global @ c2e_)[:3, 3]
-                if len(dev) >= 3:
-                    off_ = np.median(np.stack(list(dev.values())), axis=0)
-                    for cam, d_ in dev.items():
-                        if np.linalg.norm(d_ - off_) > rigid_m:
-                            info['cams'][cam]['valid'] = False; invalid_count += 1; n_rigid += 1
             for cam in info['cams']:
                 cam_info = info['cams'][cam]
                 token = cam_info['token']

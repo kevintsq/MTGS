@@ -32,6 +32,26 @@ if __name__ == '__main__':
     # colmap/: whitelist-checked per model dir (ba_multi_traversal.safe_rmtree_colmap); the other folders are
     # pipeline-only trees. A refusal here is deliberate (2026-11-04: experiments living next to the pipeline's files).
     from nuplan_scripts.ba_multi_traversal import safe_rmtree_colmap
+    # The SfM RESULT outlives the clean-up (2026-11-10: ps_loc_0191's 20 h COLMAP solution was gone when a far-building
+    # ghost had to be traced back to it): the model folders of every colmap/<video> tree (sparse_model, sfm_model,
+    # sfm_model_raw: cameras / images / points3D, MBs) and its name_to_token.json move to <block>/colmap_models/<video>/.
+    # The bulk (database, images, masks, depth ...) is deleted as before.
+    colmap_root = os.path.join(data_root, config.road_block_name, "colmap")
+    keep_root = os.path.join(data_root, config.road_block_name, "colmap_models")
+    if os.path.isdir(colmap_root):
+        for sub in sorted(os.listdir(colmap_root)):
+            for name in ("sparse_model", "sfm_model", "sfm_model_raw", "name_to_token.json"):
+                src = os.path.join(colmap_root, sub, name)
+                if not os.path.exists(src) or (os.path.isdir(src) and not any(fs for _, _, fs in os.walk(src))):
+                    continue
+                dst = os.path.join(keep_root, sub, name)
+                os.makedirs(os.path.dirname(dst), exist_ok=True)
+                if os.path.exists(dst):
+                    shutil.rmtree(dst) if os.path.isdir(dst) else os.remove(dst)
+                shutil.move(src, dst)
+        if os.path.isdir(keep_root):
+            print(f"[clean] SfM models kept in {keep_root}: {sorted(os.listdir(keep_root))}")
+
     for folder in folders_to_remove:
         dir_path = os.path.join(data_root, config.road_block_name, folder)
         if not os.path.exists(dir_path):

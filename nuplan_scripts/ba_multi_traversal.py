@@ -895,7 +895,7 @@ def align_model(video_scene: VideoScene, video_scene_dict, colmap_path, thresh=1
 
     if os.environ.get('MTGS_JOINT_WRITE_EGO') == '1':
         from scipy.spatial.transform import Rotation as _Rot
-        n_upd = 0
+        n_upd = 0; written = set()
         for video_token in video_scene_dict:
             for info in video_scene_dict[video_token]['frame_infos']:
                 if info.get('skipped', False):
@@ -924,7 +924,7 @@ def align_model(video_scene: VideoScene, video_scene_dict, colmap_path, thresh=1
                 info['ego2global_translation'] = pose[:3, 3]
                 info['ego2global_rotation'] = Quaternion(matrix=pose[:3, :3], atol=1e-6)
                 info['lidar2global'] = pose @ info['lidar2ego']
-                n_upd += 1
+                n_upd += 1; written.add(id(info))
         CONSOLE.log(f'[Align Colmap] wrote BA ego poses for {n_upd} frames')
         if os.environ.get('MTGS_JOINT_SFM') == '1':
             # a frame without any SfM camera keeps its metric ego pose, which can be metres off the
@@ -941,6 +941,12 @@ def align_model(video_scene: VideoScene, video_scene_dict, colmap_path, thresh=1
                         f['skipped'] = 'sfm_unregistered'; n_skip += 1
             CONSOLE.log(f'[sfm align] skipped {n_skip} frames without SfM cameras; dropped passes '
                         f'{[v_.rsplit("-", 1)[1] for v_ in dropped]}')
+        # every frame the SfM solution did not touch (standing ego, no SfM camera, out of region) continues the SfM
+        # frames next to it in time instead of keeping the pose of the stage before (see ego_pose_carry)
+        from nuplan_scripts.utils.ego_pose_carry import carry_ego_correction
+        n_carry = sum(carry_ego_correction(v_['frame_infos'], lambda f_: id(f_) in written, lambda f_: id(f_) not in written)
+                      for v_ in video_scene_dict.values())
+        CONSOLE.log(f'[Align Colmap] {n_carry} frames outside the SfM solution continue the SfM ego poses next to them')
     CONSOLE.log(f'[Align Colmap] for {os.path.basename(colmap_path)}')
     CONSOLE.log(f'[Align Colmap] invalid count = {invalid_count}, total = {len(images_out)}')
     CONSOLE.log(f'[Align Colmap] error = {np.mean(errors):.3f}')

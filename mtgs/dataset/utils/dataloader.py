@@ -44,12 +44,16 @@ class PinnedUploader:
         def up(key, t):
             if t.device.type == "cuda":
                 return t
-            k = (key, tuple(t.shape), t.dtype)
+            # one flat buffer per (key, dtype) and slot, grown to the largest sample seen and used through a view:
+            # keyed by shape as well, every per-traversal undistorted lens size got its own pinned block (about 1000
+            # blocks / 5 GB of page-locked host memory per training on pn_w2_09, never freed)
+            k = (key, t.dtype); n = t.numel()
             buf = bufs.get(k)
-            if buf is None:
-                buf = bufs[k] = torch.empty(t.shape, dtype=t.dtype, pin_memory=True)
-            buf.copy_(t)
-            return buf.to(self.device, non_blocking=True)
+            if buf is None or buf.numel() < n:   # this slot's previous uploads have completed (event above)
+                buf = bufs[k] = torch.empty(n, dtype=t.dtype, pin_memory=True)
+            view = buf[:n].view(t.shape)
+            view.copy_(t)
+            return view.to(self.device, non_blocking=True)
 
         out = {k: up(k, v) if torch.is_tensor(v) else v for k, v in data.items()}
         counter = [0]

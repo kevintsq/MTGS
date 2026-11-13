@@ -5,6 +5,7 @@
 #-------------------------------------------------------------------------------#
 import time
 import copy
+import gc
 import dataclasses
 import os
 import signal
@@ -116,6 +117,19 @@ class CustomOptimizers(Optimizers):
             for pg, lr in zip(s.optimizer.param_groups, lead):
                 pg["lr"] = lr
             s._last_lr = list(lead)
+
+
+def _release_pinned_cache():
+    """Return the freed pinned blocks of the previous checkpoint snapshot to the system. PyTorch's pinned host
+    allocator caches freed blocks (rounded up to powers of two) and never releases them; the gaussian count grows
+    between saves, so every save needed larger blocks and the old ones stayed: 48 GB of page-locked host memory
+    on pn_w2_09 (2026-11-13; trainings went from ~8 MB to ~20 MB of host RAM per camera image). Called once the
+    writer thread is done with the snapshot, so at most one snapshot is held at a time."""
+    empty = getattr(torch._C, "_host_emptyCache", None)
+    if empty is not None:
+        gc.collect()
+        empty()
+
 
 @dataclass
 class CustomTrainerConfig(TrainerConfig):
@@ -446,6 +460,8 @@ class CustomTrainer(Trainer):
         completed = self.training_state == "completed"
         if self._writer is not None:   # the previous save (local file and mirror) must be on disk first
             self._writer.join()
+            self._writer = None
+            _release_pinned_cache()
         if self._save_error is not None:
             raise self._save_error
         # one D2H pass into pinned host buffers; the writer thread waits on the event, not the training thread
@@ -456,6 +472,8 @@ class CustomTrainer(Trainer):
         self._writer.start()
         if completed:   # the final file: the stages after training need it, nothing left to overlap with
             self._writer.join()
+            self._writer = None
+            _release_pinned_cache()
             if self._save_error is not None:
                 raise self._save_error
 

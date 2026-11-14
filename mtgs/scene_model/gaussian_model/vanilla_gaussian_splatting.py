@@ -26,6 +26,106 @@ from nerfstudio.configs.base_config import InstantiateConfig, PrintableConfig
 from nerfstudio.utils.rich_utils import CONSOLE
 
 from .utils import num_sh_bases, random_quat_tensor, matrix_to_quaternion, rotate_vector_to_vector, RGB2SH, quat_to_rotmat
+import os as _os
+
+# EXPERIMENT exp/density-1113 (not deployed): density-control variants for the BACKGROUND model, default off.
+#   MTGS_DENSITY_MODE=decay        Revising Densification (Rota Bulo et al., ECCV 2024, arXiv 2404.06109; no official code): no hard
+#                                  opacity reset; every refinement while densifying lowers each opacity by MTGS_DENSITY_DECAY (0.001)
+#   MTGS_DENSITY_MODE=decay_pixgs  decay + Pixel-GS (Zhang et al., ECCV 2024; official github.com/zhengzhang01/Pixel-GS @05c9d55,
+#                                  gaussian_model.add_densification_stats): view gradients averaged weighted by the pixels each
+#                                  gaussian covers (sum |g|*pix / sum pix); pix approximated by pi*r^2 of gsplat's radius (the official
+#                                  rasterizer counts contributing pixels); its depth factor min(1,(d/(0.37*extent))^2) is NOT used
+#   MTGS_DENSITY_MODE=mcmc         3DGS-MCMC (Kheradmand et al., NeurIPS 2024; gsplat 1.4.0 strategy/mcmc.py + strategy/ops.py): dead
+#                                  (opacity <= 0.005) gaussians relocated to opacity-sampled live ones, 5 % growth per refinement up to
+#                                  MTGS_MCMC_CAP, position noise every step (lr * 5e5), opacity / scale L1 regularisers 0.01; no reset,
+#                                  no split / clone / cull heuristics
+DENSITY_MODE = _os.environ.get("MTGS_DENSITY_MODE", "")
+DENSITY_DECAY = float(_os.environ.get("MTGS_DENSITY_DECAY", "0.001"))
+MCMC_CAP = int(_os.environ.get("MTGS_MCMC_CAP", "2400000"))
+# MTGS_DENSITY_CAP=N (0 = off): gaussian budget for the gradient-driven modes (A / decay / decay_pixgs): a refinement may add at
+# most N - current gaussians, spent on the highest average gradients (budgeted densification; culled gaussians free budget).
+DENSITY_CAP = int(_os.environ.get("MTGS_DENSITY_CAP", "0"))
+MCMC_NOISE_LR = float(_os.environ.get("MTGS_MCMC_NOISE_LR", "5e5"))
+MCMC_MIN_OPACITY = 0.005
+# 2026-11-14 fixes found by the validation on pn_w2_02 / pw_w2_19 (the converter's occupancy grid ran out of memory, 54 % of the
+# budget was dead at the end, blobs in the sky):
+#   MTGS_MCMC_STOP_FRAC (0.85)        relocation / growth run until this fraction of the schedule (was stop_split_at = 50 %); the
+#                                     refinements after it, and always the last one of the run, only REMOVE dead / invalid
+#                                     gaussians, so a checkpoint holds live ones.  1 = relocate to the end and cull once.
+#   MTGS_MCMC_NOISE_MAX_SIGMA (1.0)   the position noise is covariance x noise, i.e. it grows with scale^2: a barely alive 20 m
+#                                     gaussian jumped ~200 m per step and random-walked up to 29 km (1,849 km in pw_w2_19).  The
+#                                     displacement of a step is clamped to this many of the gaussian's own largest sigma (0 = off).
+#   MTGS_MCMC_BOUND_M (1000)          scene bound [m from the origin] = the configured skybox radius: background gaussians beyond it
+#                                     get no noise and count as dead (0 = off).  The gradient recipe ends with 3 / 84 background
+#                                     gaussians beyond 1 km (pn_w2_02 / pw_w2_19), MCMC had 889 / 6,649: a second, semi-transparent
+#                                     sky layer in front of the skybox; the skybox under it learns saturated colours that show as
+#                                     blue blobs where the layer is thin.  (Not derived from the init points: those end at ~290 m
+#                                     in pn_w2_02 while real far buildings are reconstructed out to ~1 km, and reach 2.1 km in
+#                                     pw_w2_19 because of a few strays.)
+#   MTGS_MCMC_SCALE_CULL (far)        far = gaussians larger than the recipe's far scale limit (cull_scale_thresh x
+#                                     far_background_cull_scale_factor = 20 m) count as dead; recipe = the full rule incl. 0.5 m
+#                                     within 100 m (3 % of the live gaussians of an MCMC model break it); off.
+MCMC_STOP_FRAC = float(_os.environ.get("MTGS_MCMC_STOP_FRAC", "0.85"))
+MCMC_NOISE_MAX_SIGMA = float(_os.environ.get("MTGS_MCMC_NOISE_MAX_SIGMA", "1.0"))
+# MTGS_MCMC_CLEANUP: each = every refinement after the relocation phase removes the dead / invalid gaussians; final = only the last
+# refinement of the run does (dead gaussians keep random-walking until then, as in gsplat).
+MCMC_CLEANUP = _os.environ.get("MTGS_MCMC_CLEANUP", "each")
+MCMC_BOUND_M = float(_os.environ.get("MTGS_MCMC_BOUND_M", "1000"))
+MCMC_SCALE_CULL = _os.environ.get("MTGS_MCMC_SCALE_CULL", "far")
+
+
+def _density_on(model) -> bool:
+    return bool(DENSITY_MODE) and getattr(model, "model_name", "") == "background"
+
+
+# MTGS_MCMC_SAMPLE=grad (experiment 2026-11-13): MCMC draws relocation / growth sources with probability opacity x (pixel-weighted
+# average screen gradient / its median) ** MTGS_MCMC_GRAD_POW instead of opacity alone, so weakly reconstructed regions (few large
+# gaussians, low opacity, high error) are not starved by the opacity-proportional draw (blurry far side-street in pn_w2_02 f38 R0).
+MCMC_SAMPLE = _os.environ.get("MTGS_MCMC_SAMPLE", "opacity")
+MCMC_GRAD_POW = float(_os.environ.get("MTGS_MCMC_GRAD_POW", "1.0"))
+
+
+# EXPERIMENT 2026-11-13 (rare regions: the far side-street of pn_w2_02 f38 CAM_R0 is seen unoccluded by 22 of 6,188 images and is
+# blurry at those very training views): the background model keeps a long-term per-gaussian CONTRIBUTION frequency
+# f_g = (steps with a non-zero screen-space gradient) / (steps alive); a frustum hit is not enough, the region sits in ~1,900
+# frusta but is occluded in most.  Relocated / added MCMC gaussians inherit the counters of their source.  Used by
+#   MTGS_VIEW_SAMPLE=cover   coverage-aware view sampling (dataset/utils/sampler.py): image score = mean over its contributing
+#                            gaussians of (rarity - 1), rarity = clamp(f_ref / f_g, 1, MTGS_COVER_CAP)
+#   MTGS_VIS_LR=1            the Adam step of a contributing gaussian is multiplied by clamp((f_ref / f_g) ** MTGS_VIS_LR_BETA, 1,
+#                            MTGS_VIS_LR_MAX) (mtgs_scene_graph._vis_lr_extra)
+#   MTGS_COVER_STATS=1       counters only.   f_ref = the MTGS_COVER_REF_Q quantile of f_g (median), refreshed every 500 steps.
+# Nothing is used before MTGS_COVER_START steps (frequencies need ~1.5 epochs).  Supported with MTGS_DENSITY_MODE=mcmc only (the
+# split / dup / cull path does not carry the counters; they restart on a size change).
+COVER_VIEW = _os.environ.get("MTGS_VIEW_SAMPLE", "") == "cover"
+VIS_LR = _os.environ.get("MTGS_VIS_LR", "0") == "1"
+COVER_ON = COVER_VIEW or VIS_LR or _os.environ.get("MTGS_COVER_STATS", "0") == "1"
+COVER_START = int(_os.environ.get("MTGS_COVER_START", "9000"))
+COVER_CAP = float(_os.environ.get("MTGS_COVER_CAP", "8"))
+COVER_REF_Q = float(_os.environ.get("MTGS_COVER_REF_Q", "0.5"))
+VIS_LR_BETA = float(_os.environ.get("MTGS_VIS_LR_BETA", "1.0"))
+VIS_LR_MAX = float(_os.environ.get("MTGS_VIS_LR_MAX", "4"))
+# A contribution counts only when the gaussian is resolved (projected radius >= MTGS_COVER_MIN_RADIUS px at the training
+# resolution): offline on the full-length MCMC 2.4 M model the weak region's gaussians contribute to 209 images (median 493 for
+# all), the images that see it rank at the 74-95th percentile of the image score with any radius and at the 90-96th with >= 4 px.
+COVER_MIN_RADIUS = float(_os.environ.get("MTGS_COVER_MIN_RADIUS", "4"))
+COVER_DUMP = _os.environ.get("MTGS_COVER_DUMP", "")
+COVER_LOG_EVERY = int(_os.environ.get("MTGS_COVER_LOG_EVERY", "10000"))   # multiple of 500
+_COVER_LAST = int(_os.environ.get("MTGS_MAX_ITERS", "0")) - 1
+
+
+def _pixgs_on(model) -> bool:
+    """Pixel-GS weighted gradient statistics: mode decay_pixgs, or MCMC with gradient-aware sampling."""
+    return _density_on(model) and (DENSITY_MODE == "decay_pixgs" or (DENSITY_MODE == "mcmc" and MCMC_SAMPLE == "grad"))
+
+
+def _pix_weight(radii, image_area=None):
+    """Pixel-GS pixel count per view, approximated by the area of gsplat's bounding radius (0 where not visible)."""
+    r = radii.float()
+    w = math.pi * r * r
+    if image_area is not None:
+        w = w.clamp(max=float(image_area))
+    return w
+
 
 @dataclass
 class GaussianSplattingControlConfig(PrintableConfig):
@@ -470,6 +570,8 @@ class VanillaGaussianSplattingModel(torch.nn.Module):
 
     def after_train(self, step: int):
         assert step == self.step
+        if DENSITY_MODE == "mcmc" and _density_on(self) and getattr(self, "_mcmc_optimizers", None) is not None and not self.frozen:
+            self._mcmc_inject_noise()
         if getattr(self, "_stats_step", None) == step:   # accumulated by MTGSSceneModel._update_submodel_statistics_batched
             return
         if self.frozen:
@@ -488,8 +590,13 @@ class VanillaGaussianSplattingModel(torch.nn.Module):
                 self.xys_grad_norm = torch.zeros(self.num_points, device=self.device, dtype=torch.float32)
                 self.vis_counts = torch.ones(self.num_points, device=self.device, dtype=torch.float32)
             assert self.vis_counts is not None
-            self.vis_counts += visible_mask
-            self.xys_grad_norm += torch.where(visible_mask, self.xys_grad, 0.0)
+            if _pixgs_on(self):   # Pixel-GS: sum |g| * pix / sum pix
+                w = torch.where(visible_mask, _pix_weight(self.radii.reshape(-1)), 0.0)
+                self.vis_counts += w
+                self.xys_grad_norm += torch.where(visible_mask, self.xys_grad, 0.0) * w
+            else:
+                self.vis_counts += visible_mask
+                self.xys_grad_norm += torch.where(visible_mask, self.xys_grad, 0.0)
 
             # update the max screen size, as number of pixels
             if self.max_2Dsize is None:
@@ -502,6 +609,19 @@ class VanillaGaussianSplattingModel(torch.nn.Module):
         if self.frozen:
             return
         if self.step <= self.ctrl_config.densify_from_iter:
+            return
+        if DENSITY_MODE == "mcmc" and _density_on(self):
+            self._mcmc_optimizers = optimizers
+            if self.num_points > 0:
+                # the last refinement of the run always cleans up (MTGS_MCMC_STOP_FRAC=1: relocation to the very end, one cull)
+                last = MCMC_STOP_FRAC > 0 and self.step + self.ctrl_config.refine_every >= self._mcmc_total_steps()
+                if self.step < self._mcmc_stop_step() and not last:
+                    self._mcmc_refine(optimizers)
+                elif MCMC_STOP_FRAC > 0 and (last or MCMC_CLEANUP == "each"):
+                    self._mcmc_cleanup(optimizers)
+            self.xys_grad_norm = None
+            self.vis_counts = None
+            self.max_2Dsize = None
             return
         with torch.no_grad():
             if self.num_points <= 0:
@@ -523,6 +643,17 @@ class VanillaGaussianSplattingModel(torch.nn.Module):
                     counts["avg_grad_norm"] = avg_grad_norm.mean()
 
                 high_grads = (avg_grad_norm > self.ctrl_config.densify_grad_thresh).reshape(-1)
+                if DENSITY_CAP > 0 and self.model_name == "background":
+                    budget = max(0, DENSITY_CAP - self.num_points)
+                    if self.step < self.ctrl_config.stop_screen_size_at:   # screen-size splits (below) are not gradient-driven: they come out of the budget first
+                        budget = max(0, budget - int((self.max_2Dsize > self.ctrl_config.split_screen_size).sum()))
+                    hg = torch.nonzero(high_grads).squeeze(1)
+                    if hg.numel() > budget:
+                        high_grads = torch.zeros_like(high_grads)
+                        if budget > 0:
+                            high_grads[hg[torch.topk(avg_grad_norm.reshape(-1)[hg], budget).indices]] = True
+                        if self.step % (10 * self.ctrl_config.refine_every) == 0:
+                            CONSOLE.log(f"[cap {self.model_name}] step {self.step}: {hg.numel()} candidates, budget {budget}, n {self.num_points}")
 
                 splits = (self.scales.exp().max(dim=-1).values > self.ctrl_config.densify_size_thresh).reshape(-1)
                 splits &= high_grads
@@ -562,7 +693,11 @@ class VanillaGaussianSplattingModel(torch.nn.Module):
                 n_before += sum(c["means"].shape[0] for c in new_chunks)
                 self._rebuild_gaussians(optimizers, new_chunks, ~torch.cat(culls))
 
-            if self.step < self.ctrl_config.stop_split_at and self.step % reset_interval == self.ctrl_config.refine_every:
+            if DENSITY_MODE in ("decay", "decay_pixgs") and _density_on(self):
+                if self.step < self.ctrl_config.stop_split_at:   # Revising Densification: small decay instead of the hard reset
+                    op = torch.sigmoid(self.opacities.data) - DENSITY_DECAY
+                    self.opacities.data.copy_(torch.logit(op.clamp(min=1e-6, max=1.0 - 1e-6)))
+            elif self.step < self.ctrl_config.stop_split_at and self.step % reset_interval == self.ctrl_config.refine_every:
                 if self.config.verbose:
                     CONSOLE.log(f"Reset opacity at step {self.step}")
                 # Reset value is set to be twice of the cull_alpha_thresh
@@ -598,6 +733,214 @@ class VanillaGaussianSplattingModel(torch.nn.Module):
             self.xys_grad_norm = None
             self.vis_counts = None
             self.max_2Dsize = None
+
+    # ---- 3DGS-MCMC (experiment): ported from gsplat 1.4.0 strategy/ops.py relocate / sample_add / inject_noise_to_position
+    # ---- contribution-frequency counters (experiment, see COVER_* above)
+    @torch.no_grad()
+    def _cover_update(self, grad_norm, radii, step):
+        """one training step: grad_norm / radii [N] = screen-space gradient norm and projected radius of this model's gaussians.
+        Returns the contribution mask."""
+        n = grad_norm.shape[0]; dev = grad_norm.device
+        if getattr(self, "_cov_cnt", None) is None or self._cov_cnt.shape[0] != n:
+            if getattr(self, "_cov_cnt", None) is not None:
+                CONSOLE.log(f"[cover {self.model_name}] step {step}: {self._cov_cnt.shape[0]} -> {n} gaussians, counters restarted")
+            self._cov_cnt = torch.zeros(n, device=dev, dtype=torch.float32)
+            self._cov_age = torch.zeros(n, device=dev, dtype=torch.float32)
+            self._cov_ref = torch.full((), 1e-3, device=dev)
+        c = (grad_norm > 0) & (radii >= COVER_MIN_RADIUS)
+        self._cov_cnt += c
+        self._cov_age += 1
+        if step % 500 == 0:   # reference frequency over a subsample of the gaussians old enough to judge
+            idx = torch.randint(0, n, (min(n, 400000),), device=dev)
+            f = self._cov_cnt[idx] / self._cov_age[idx].clamp_min(1)
+            # the reference is the quantile over LIVE gaussians: MCMC leaves dead ones (opacity <= MCMC_MIN_OPACITY) in the model once
+            # relocation stops (41 % of the 2.4 M at the end of the 11-13 run), and they would drag the reference down
+            live = torch.sigmoid(self.opacities.detach().flatten()[idx]) > MCMC_MIN_OPACITY
+            f = torch.where((self._cov_age[idx] >= 0.5 * COVER_START) & live, f, torch.nan)
+            ref = torch.nanquantile(f, COVER_REF_Q)
+            self._cov_ref = torch.where(torch.isfinite(ref) & (ref > 0), ref, self._cov_ref)
+            if step % COVER_LOG_EVERY == 0:   # log: one sync per 10k steps
+                q = torch.nanquantile(f, torch.tensor([0.05, 0.25, 0.5, 0.75, 0.95], device=dev))
+                print(f"[cover {self.model_name}] step {step}: f_g p5/25/50/75/95 {[round(float(x), 5) for x in q]} ref {float(self._cov_ref):.5f}", flush=True)   # print: rich eats the [tag] and wraps
+        if COVER_DUMP and (step == _COVER_LAST or (step > 0 and step % 20000 == 0)):
+            torch.save({"step": step, "cnt": self._cov_cnt, "age": self._cov_age, "ref": self._cov_ref, "means": self.means.detach()}, COVER_DUMP)
+        return c
+
+    def _cover_ratio(self):
+        """f_ref / f_g per gaussian (1 for gaussians too young to judge); a gaussian that never contributed counts as half a hit."""
+        r = self._cov_ref * self._cov_age / self._cov_cnt.clamp_min(0.5)
+        return torch.where(self._cov_age >= 0.5 * COVER_START, r, 1.0)
+
+    def _cover_rarity(self):
+        return self._cover_ratio().clamp(1.0, COVER_CAP)
+
+    def _cover_step_scale(self):
+        return self._cover_ratio().clamp_min(1.0).pow(VIS_LR_BETA).clamp(max=VIS_LR_MAX)
+
+    def _mcmc_groups(self, optimizers):
+        names = {id(p): name for name, p in self.gauss_params.items()}
+        return {names[id(p)]: group for group, (p,) in self.get_gaussian_param_groups().items() if id(p) in names}
+
+    def _mcmc_update(self, optimizers, param_fn, state_fn):
+        """gsplat's _update_param_with_optimizer for MTGS's named groups (+ nerfstudio's Optimizers.parameters list)."""
+        groups = self._mcmc_groups(optimizers)
+        for name in list(self.gauss_params.keys()):
+            old = self.gauss_params[name]
+            new = torch.nn.Parameter(param_fn(name, old.data))
+            self.gauss_params[name] = new
+            group = groups.get(name)
+            if group is None:
+                continue
+            optim = optimizers.optimizers[group]
+            st = optim.state.pop(optim.param_groups[0]["params"][0], {})
+            for key in list(st.keys()):
+                if key != "step":
+                    st[key] = state_fn(key, st[key])
+            optim.param_groups[0]["params"] = [new]
+            optim.state[new] = st
+            if group in getattr(optimizers, "parameters", {}):
+                optimizers.parameters[group] = [new]
+
+    def _mcmc_total_steps(self):
+        return int(_os.environ.get("MTGS_MAX_ITERS", "0")) or 2 * self.ctrl_config.stop_split_at
+
+    def _mcmc_stop_step(self):
+        if MCMC_STOP_FRAC <= 0:
+            return self.ctrl_config.stop_split_at
+        return int(MCMC_STOP_FRAC * self._mcmc_total_steps())
+
+    def _mcmc_bound(self):
+        """Scene bound [m from the origin] of the background model (None = no bound)."""
+        return MCMC_BOUND_M if MCMC_BOUND_M > 0 else None
+
+    @torch.no_grad()
+    def _mcmc_invalid(self):
+        """Gaussians MCMC must not keep: beyond the scene bound, or larger than the recipe's scale-cull rule."""
+        m = self.means.detach()
+        bad = torch.zeros(m.shape[0], dtype=torch.bool, device=m.device)
+        bound = self._mcmc_bound()
+        if bound is not None:
+            bad |= ~(m.norm(dim=-1) <= bound)   # also catches non-finite positions
+        if MCMC_SCALE_CULL == "recipe":
+            bad |= torch.exp(self.scales.detach()).amax(dim=-1) > self.cull_scale_thresh(m).reshape(-1)
+        elif MCMC_SCALE_CULL == "far":
+            bad |= torch.exp(self.scales.detach()).amax(dim=-1) > self.ctrl_config.cull_scale_thresh * self.ctrl_config.far_background_cull_scale_factor
+        return bad
+
+    @torch.no_grad()
+    def _mcmc_cleanup(self, optimizers):
+        """After the relocation phase: drop dead / invalid gaussians (rows and their Adam moments) instead of relocating them."""
+        opac = torch.sigmoid(self.opacities.detach()).flatten()
+        drop = (opac <= MCMC_MIN_OPACITY) | self._mcmc_invalid()
+        n_drop = int(drop.sum())
+        if n_drop == 0:
+            return
+        keep = ~drop
+        n_before = self.num_points
+        self._mcmc_update(optimizers, lambda name, p: p[keep], lambda key, v: v[keep])
+        if getattr(self, "_cov_cnt", None) is not None and self._cov_cnt.shape[0] == n_before:
+            self._cov_cnt = self._cov_cnt[keep]; self._cov_age = self._cov_age[keep]
+        CONSOLE.log(f"[mcmc {self.model_name}] step {self.step}: cleanup removed {n_drop} dead / invalid gaussians, {self.num_points} left")
+
+    @torch.no_grad()
+    def _mcmc_refine(self, optimizers):
+        from gsplat.relocation import compute_relocation
+        if not hasattr(self, "_mcmc_binoms"):
+            n_max = 51
+            b = torch.zeros((n_max, n_max))
+            for n in range(n_max):
+                for k in range(n + 1):
+                    b[n, k] = math.comb(n, k)
+            self._mcmc_binoms = b.to(self.device)
+        eps = torch.finfo(torch.float32).eps
+
+        def sample(probs, n):
+            return torch.multinomial(probs, n, replacement=True)
+
+        # relocate dead gaussians (gsplat ops.relocate)
+        opac = torch.sigmoid(self.opacities.detach()).flatten()
+        invalid = self._mcmc_invalid()
+        dead = (opac <= MCMC_MIN_OPACITY) | invalid
+        if self.step % (10 * self.ctrl_config.refine_every) == 0:
+            CONSOLE.log(f"[mcmc {self.model_name}] step {self.step}: {int(dead.sum())} dead of {opac.shape[0]}, of them {int(invalid.sum())} out of bound / oversized")
+        dead_idx = dead.nonzero(as_tuple=True)[0]; alive_idx = (~dead).nonzero(as_tuple=True)[0]
+        n_dead = int(dead_idx.numel())
+        gw = None   # gradient weight of the draw (None = opacity only, as gsplat)
+        if MCMC_SAMPLE == "grad" and self.xys_grad_norm is not None and self.vis_counts is not None and self.xys_grad_norm.shape[0] == opac.shape[0]:
+            g = (self.xys_grad_norm / self.vis_counts).flatten()
+            seen = g > 0
+            if bool(seen.any()):
+                gw = (g / g[seen].median().clamp_min(1e-12)).clamp(0.1, 10.0) ** MCMC_GRAD_POW
+        if MCMC_SAMPLE == "grad" and self.step % (10 * self.ctrl_config.refine_every) == 0:
+            CONSOLE.log(f"[mcmc-grad {self.model_name}] step {self.step}: " + ("NO gradient statistics, opacity draw" if gw is None else
+                        f"weight p10/50/90 {[round(float(x), 2) for x in gw.quantile(torch.tensor([0.1, 0.5, 0.9], device=gw.device))]}"))
+        if n_dead > 0 and alive_idx.numel() > 0:
+            src = alive_idx[sample(opac[alive_idx] if gw is None else opac[alive_idx] * gw[alive_idx], n_dead)]
+            new_op, new_sc = compute_relocation(opacities=opac[src], scales=torch.exp(self.scales.detach())[src],
+                                                ratios=torch.bincount(src)[src] + 1, binoms=self._mcmc_binoms)
+            new_op = new_op.clamp(max=1.0 - eps, min=MCMC_MIN_OPACITY)
+
+            def pf(name, p):
+                if name == "opacities":
+                    p[src] = torch.logit(new_op).reshape(p[src].shape)
+                elif name == "scales":
+                    p[src] = torch.log(new_sc)
+                p[dead_idx] = p[src]
+                return p
+
+            def sf(key, v):
+                v[src] = 0
+                return v
+            self._mcmc_update(optimizers, pf, sf)
+            if getattr(self, "_cov_cnt", None) is not None and self._cov_cnt.shape[0] == opac.shape[0]:   # relocated rows inherit the source's counters
+                self._cov_cnt[dead_idx] = self._cov_cnt[src]; self._cov_age[dead_idx] = self._cov_age[src]
+        # add new gaussians (gsplat ops.sample_add), 5 % per refinement up to the cap
+        n_cur = self.num_points
+        n_add = max(0, min(MCMC_CAP, int(1.05 * n_cur)) - n_cur)
+        if n_add > 0:
+            opac = torch.sigmoid(self.opacities.detach()).flatten()
+            opac = torch.where(self._mcmc_invalid(), torch.zeros_like(opac), opac)   # never grow from an invalid gaussian
+            src = sample(opac if gw is None else opac * gw, n_add)   # gw: statistics of the gaussians before this refinement (relocated rows keep their own)
+            new_op, new_sc = compute_relocation(opacities=opac[src], scales=torch.exp(self.scales.detach())[src],
+                                                ratios=torch.bincount(src)[src] + 1, binoms=self._mcmc_binoms)
+            new_op = new_op.clamp(max=1.0 - eps, min=MCMC_MIN_OPACITY)
+
+            def pf2(name, p):
+                if name == "opacities":
+                    p[src] = torch.logit(new_op).reshape(p[src].shape)
+                elif name == "scales":
+                    p[src] = torch.log(new_sc)
+                return torch.cat([p, p[src]])
+
+            def sf2(key, v):
+                return torch.cat([v, torch.zeros((n_add,) + v.shape[1:], dtype=v.dtype, device=v.device)])
+            self._mcmc_update(optimizers, pf2, sf2)
+            if getattr(self, "_cov_cnt", None) is not None and self._cov_cnt.shape[0] == n_cur:
+                self._cov_cnt = torch.cat([self._cov_cnt, self._cov_cnt[src]]); self._cov_age = torch.cat([self._cov_age, self._cov_age[src]])
+        if self.config.verbose:
+            CONSOLE.log(f"[mcmc {self.model_name}] step {self.step}: relocated {n_dead}, added {n_add}, now {self.num_points}")
+
+    @torch.no_grad()
+    def _mcmc_inject_noise(self):
+        from gsplat import quat_scale_to_covar_preci
+        groups = self._mcmc_groups(self._mcmc_optimizers)
+        g = groups.get("means")
+        if g is None:
+            return
+        lr = self._mcmc_optimizers.optimizers[g].param_groups[0]["lr"]
+        opac = torch.sigmoid(self.opacities.detach()).flatten()
+        q = self.quats.detach(); q = q / q.norm(dim=-1, keepdim=True)
+        covars, _ = quat_scale_to_covar_preci(q, torch.exp(self.scales.detach()), compute_covar=True, compute_preci=False, triu=False)
+        k, x0 = 100.0, 0.995
+        noise = torch.randn_like(self.means) * (1.0 / (1.0 + torch.exp(-k * ((1.0 - opac) - x0)))).unsqueeze(-1) * (lr * MCMC_NOISE_LR)
+        disp = torch.einsum("bij,bj->bi", covars, noise)
+        if MCMC_NOISE_MAX_SIGMA > 0:   # at most this many own sigmas per step (the raw step grows with scale^2)
+            lim = MCMC_NOISE_MAX_SIGMA * torch.exp(self.scales.detach()).amax(dim=-1, keepdim=True)
+            disp = disp * (lim / disp.norm(dim=-1, keepdim=True).clamp_min(1e-12)).clamp(max=1.0)
+        bound = self._mcmc_bound()
+        if bound is not None:          # nothing beyond the scene bound moves further out
+            disp = torch.where((self.means.detach().norm(dim=-1, keepdim=True) <= bound), disp, torch.zeros_like(disp))
+        self.means.data.add_(disp)
 
     def cull_scale_thresh(self, means):
         """World-space scale above which a gaussian is culled, per gaussian (subclasses change the far rule)."""

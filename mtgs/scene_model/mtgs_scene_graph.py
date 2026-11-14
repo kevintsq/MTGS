@@ -25,6 +25,7 @@ except ImportError:
 from nerfstudio.cameras.cameras import Cameras
 from nerfstudio.data.scene_box import OrientedBox
 from nerfstudio.engine.callbacks import TrainingCallback, TrainingCallbackAttributes, TrainingCallbackLocation
+import mtgs.scene_model.gaussian_model.vanilla_gaussian_splatting as _vgs   # experiment switches (COVER_*, VIS_LR)
 
 from nerfstudio.models.base_model import Model, ModelConfig
 from nerfstudio.utils.rich_utils import CONSOLE
@@ -1099,6 +1100,23 @@ class MTGSSceneModel(Model):
                 scale_reg = scale_reg.mean() * self.config.sharp_shape_reg_lambda
                 loss_dict["Sharp Shape Reg Loss"] = scale_reg
 
+        from mtgs.scene_model.gaussian_model.vanilla_gaussian_splatting import DENSITY_MODE as _DM
+        if self.training and _DM == "mcmc" and "background" in self.gaussian_models:   # 3DGS-MCMC regularisers (gsplat simple_trainer)
+            bg = self.gaussian_models["background"]
+            _env = __import__("os").environ
+            op_term = torch.sigmoid(bg.opacities).squeeze(-1)
+            sc_term = torch.exp(bg.scales).mean(dim=-1)
+            sl = (getattr(self, "_model_slices", None) or {}).get("background")
+            if _env.get("MTGS_MCMC_REG_VISIBLE", "0") == "1" and sl is not None:
+                # driving blocks: a gaussian is in view for a few % of the steps; a regulariser on every gaussian every
+                # step drives the unseen ones transparent (11-13 run: opacity median 0.005).  Penalise only what this
+                # step renders, same per-gaussian weight as the gsplat mean (sum / N).
+                vis = (outputs["radii"].reshape(-1)[sl[0]:sl[1]] > 0)[:op_term.shape[0]].float()
+                op_term = op_term * vis; sc_term = sc_term * vis
+            n = max(op_term.shape[0], 1)
+            loss_dict["MCMC Opacity Reg"] = float(_env.get("MTGS_MCMC_OPACITY_REG", "0.01")) * op_term.sum() / n
+            loss_dict["MCMC Scale Reg"] = float(_env.get("MTGS_MCMC_SCALE_REG", "0.01")) * sc_term.sum() / n   # gsplat 0.01 is in normalised units: metres -> 0.01 / scene_scale
+
         if self.training:
             # Add loss from camera optimizer
             self.camera_optimizer.get_loss_dict(loss_dict)
@@ -1285,6 +1303,8 @@ class MTGSSceneModel(Model):
         if trainer is not None:   # get_metrics_dict computes the train metrics only on the steps the trainer logs
             self._steps_per_log = trainer.config.logging.steps_per_log
         self._freeze_zero_lr_params(getattr(training_callback_attributes, "optimizers", None))
+        if _vgs.VIS_LR and getattr(training_callback_attributes, "optimizers", None) is not None:
+            self._install_vis_lr(training_callback_attributes.optimizers)
 
         cbs.append(
             TrainingCallback(
@@ -1312,6 +1332,50 @@ class MTGSSceneModel(Model):
             )
         )
         return cbs
+
+    # ---- experiment MTGS_VIS_LR=1: visibility-frequency step scaling (see vanilla_gaussian_splatting COVER_*)
+    VIS_LR_PARAMS = ("means", "scales", "quats", "opacities", "features_dc")
+
+    def _install_vis_lr(self, optimizers):
+        """Runs right after the optimizer step (before the schedulers and the MCMC noise): the Adam step just taken is
+        re-derived from the optimizer state and added (s_g - 1) more times to the gaussians that contributed to this
+        image, so their step is s_g x Adam's. (Scaling the gradient would do nothing: Adam is scale-invariant.)"""
+        orig = optimizers.optimizer_scaler_step_some
+
+        def stepped(grad_scaler, param_groups):
+            orig(grad_scaler, param_groups)
+            self._vis_lr_extra(optimizers)
+        optimizers.optimizer_scaler_step_some = stepped
+        print(f"[vis-lr] installed: beta {_vgs.VIS_LR_BETA} max {_vgs.VIS_LR_MAX} start {_vgs.COVER_START} params {self.VIS_LR_PARAMS}", flush=True)
+
+    @torch.no_grad()
+    def _vis_lr_extra(self, optimizers):
+        bg = self.gaussian_models["background"] if "background" in self.gaussian_models else None
+        span = (getattr(self, "_model_slices", None) or {}).get("background")
+        if (bg is None or span is None or getattr(bg, "_cov_cnt", None) is None or self.step < _vgs.COVER_START
+                or getattr(self, "xys", None) is None or self.xys.grad is None):
+            return
+        g = (self.xys.absgrad if bg.config.control.use_abs_grad else self.xys.grad)[0, span[0]:span[1]]
+        if g.shape[0] != bg._cov_cnt.shape[0]:
+            return
+        scale = bg._cover_step_scale()
+        contrib = (g.detach().abs().sum(-1) > 0) & (self.radii[0, span[0]:span[1]] >= _vgs.COVER_MIN_RADIUS)   # same rule as the counters
+        mult = torch.where(contrib, scale - 1.0, 0.0)   # 0 for common / non-contributing gaussians
+        groups = bg._mcmc_groups(optimizers)
+        for name in self.VIS_LR_PARAMS:
+            p = bg.gauss_params[name] if name in bg.gauss_params else None; group = groups.get(name)
+            if p is None or group is None or not p.requires_grad:
+                continue
+            opt = optimizers.optimizers[group]; st = opt.state.get(p)
+            if not st or "exp_avg" not in st:
+                continue
+            pg = opt.param_groups[0]; b1, b2 = pg["betas"]; t = st["step"]
+            delta = st["exp_avg"] / (st["exp_avg_sq"].sqrt() / (1 - b2 ** t) ** 0.5 + pg["eps"]) * (-pg["lr"] / (1 - b1 ** t))
+            p.data.add_(delta * mult.view(-1, *([1] * (p.dim() - 1))))
+        if self.step % _vgs.COVER_LOG_EVERY == 0:   # log: one sync per 10k steps
+            act = mult > 0
+            print(f"[vis-lr] step {self.step}: {int(act.sum())} of {int(contrib.sum())} contributing gaussians scaled, "
+                  f"mean scale of the scaled {float((mult[act] + 1).mean()) if bool(act.any()) else 1.0:.2f}", flush=True)
 
     def release_cached_memory(self, step):
         ctrl = self.config.control
@@ -1422,6 +1486,11 @@ class MTGSSceneModel(Model):
                 continue
             index = slice(*span)
             model.update_statistics(xys_grad=grad_norm(model.config.control.use_abs_grad)[index], radii=radii[index])
+            if _vgs.COVER_ON and model_name == "background" and not model.frozen:   # experiment: contribution frequency (rare regions)
+                contrib = model._cover_update(grad_norm(model.config.control.use_abs_grad)[index], radii[index], step)
+                if _vgs.COVER_VIEW and step >= _vgs.COVER_START:
+                    from mtgs.dataset.utils import sampler as _view_sampler
+                    _view_sampler.report(((model._cover_rarity() - 1.0) * contrib).sum() / contrib.sum().clamp_min(1))
             if (type(model).update_statistics is VanillaGaussianSplattingModel.update_statistics
                     and type(model).after_train in (VanillaGaussianSplattingModel.after_train, RigidSubModel.after_train)
                     and not model.frozen and model.step < model.ctrl_config.stop_split_at
@@ -1435,7 +1504,20 @@ class MTGSSceneModel(Model):
         radii_f = radii.float()
         grad_masked = {k: torch.where(visible, v, 0.0) for k, v in grad_norms.items()}
         vis_counts, grad_acc, max_sizes, vis_src, grad_src, radii_src = [], [], [], [], [], []
+        from mtgs.scene_model.gaussian_model.vanilla_gaussian_splatting import _pixgs_on, _pix_weight
         for model, index in batched:
+            if _pixgs_on(model):   # Pixel-GS weighted accumulation for the background
+                if model.xys_grad_norm is None:
+                    model.xys_grad_norm = torch.zeros(model.num_points, device=radii.device, dtype=torch.float32)
+                    model.vis_counts = torch.ones(model.num_points, device=radii.device, dtype=torch.float32)
+                if model.max_2Dsize is None:
+                    model.max_2Dsize = torch.zeros(index.stop - index.start, device=radii.device, dtype=torch.float32)
+                w = torch.where(visible[index], _pix_weight(radii_f[index]), 0.0)
+                model.vis_counts += w
+                model.xys_grad_norm += grad_masked[model.config.control.use_abs_grad][index] * w
+                model.max_2Dsize = torch.maximum(model.max_2Dsize, radii_f[index])
+                model._stats_step = step
+                continue
             if model.xys_grad_norm is None:
                 model.xys_grad_norm = torch.zeros(model.num_points, device=radii.device, dtype=torch.float32)
                 model.vis_counts = torch.ones(model.num_points, device=radii.device, dtype=torch.float32)

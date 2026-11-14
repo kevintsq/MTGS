@@ -4,6 +4,7 @@
 # Copyright (c) OpenDriveLab. All rights reserved.                              #
 #-------------------------------------------------------------------------------#
 from __future__ import annotations
+import os
 
 from dataclasses import dataclass, field
 from functools import cached_property
@@ -165,6 +166,9 @@ class CustomFullImageDatamanager(FullImageDatamanager, Generic[TDataset]):
             self.train_sampler = MultiTraversalBalancedSampler(self.train_dataset)
         else:
             self.train_sampler = CameraSampler(self.train_dataset)
+        if os.environ.get("MTGS_VIEW_SAMPLE", "") == "cover":   # experiment: coverage-aware view sampling (utils/sampler.py)
+            from .utils import sampler as _sampler
+            self.train_sampler = _sampler.ACTIVE = _sampler.CoverAwareSampler(self.train_sampler, len(self.train_dataset))
 
         self.eval_sampler = CameraSampler(self.eval_dataset, in_order=True)
         self._fixed_indices_eval_dataloader = FixedIndicesPseudoDataloader(self)

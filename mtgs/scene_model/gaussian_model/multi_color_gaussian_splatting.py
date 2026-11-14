@@ -46,6 +46,11 @@ class MultiColorGaussianSplattingModel(VanillaGaussianSplattingModel):
         self.nearest_train_travel_of_eval = nearest_train_travel_of_eval
 
     def populate_modules(self, points_3d=None, num_traversals=None, **kwargs):
+        # EXPERIMENT 2026-11-13 (many-pass blocks): MTGS_SHARED_REST=1 keeps ONE set of high-order SH for all traversals (per-traversal
+        # colour = the DC adapter only), so the colour memory no longer grows with the number of passes (N x T x 15 x 3 floats).
+        if __import__("os").environ.get("MTGS_SHARED_REST") == "1" and self.config.multi_feature_rest:
+            self.config.multi_feature_rest = False
+            print(f"[shared-rest] {getattr(self, 'model_name', '?')}: multi_feature_rest off", flush=True)
         super().populate_modules(points_3d, **kwargs)
         if num_traversals is None:
             return

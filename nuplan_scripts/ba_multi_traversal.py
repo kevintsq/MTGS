@@ -952,6 +952,23 @@ def align_model(video_scene: VideoScene, video_scene_dict, colmap_path, thresh=1
     CONSOLE.log(f'[Align Colmap] error = {np.mean(errors):.3f}')
     return video_scene_dict
 
+def _ba_input_pickle(video_scene):
+    """The vsd this stage starts from: the one the stages before it wrote. video_scene_dict.pkl links to the latest
+    stage's output, so when ba_stack runs AGAIN on a block that went further (a retrain after the clean-up), the link
+    points to its own output (_colmap) or stack_RGB_point_cloud's (_final): the cameras would carry the previous run's
+    validity / COLMAP poses and, with MTGS_JOINT_WRITE_EGO, ego poses already moved into the SfM frame, which the new
+    alignment would then align a second time. Take the registration's output instead (else filtered / raw)."""
+    link = video_scene.pickle_path
+    later = {os.path.basename(video_scene.pickle_path_colmap), os.path.basename(video_scene.pickle_path_final)}
+    if os.path.islink(link) and os.path.basename(os.readlink(link)) in later:
+        for p in (video_scene.pickle_path_registered, video_scene.pickle_path_filtered, video_scene.pickle_path_raw):
+            if os.path.exists(p):
+                CONSOLE.log(f'\\[ba input] {os.path.basename(link)} links to {os.readlink(link)} (a later stage); '
+                            f'starting from {os.path.basename(p)}')
+                return p
+    return link
+
+
 def split_threads(weights, total_threads, min_threads=2):
     """Apportion total_threads across concurrently-running tasks, in proportion to weights.
 
@@ -1039,7 +1056,7 @@ if __name__ == "__main__":
     # 1. load config and video scene dict
     config: RoadBlockConfig = load_config(args.config)
     video_scene = VideoScene(config)
-    all_video_scene_dict = video_scene.load_pickle(video_scene.pickle_path)
+    all_video_scene_dict = video_scene.load_pickle(_ba_input_pickle(video_scene))
 
     # copy ego mask to sub data root
     copy_ego_masks(video_scene)

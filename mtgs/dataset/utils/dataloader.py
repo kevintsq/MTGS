@@ -217,7 +217,7 @@ class PrefetchDataLoader:
         self.pending = {}                       # idx -> Future of a decode in flight
         self.upcoming = set()                   # predicted next indices: never evicted
         self.pool = _Pool(max_workers=max(1, int(self.datamanager.config.num_workers) or 4), thread_name_prefix="mtgs_cache")
-        self.stats = dict(hit=0, wait=0, miss=0)
+        self.stats = dict(hit=0, wait=0, miss=0, wait_s=0.0, miss_s=0.0)
         CONSOLE.log(f"Image cache capped at {self.cache_max} of {len(self.dataset)} samples (MTGS_CACHE_MAX_IMAGES): "
                     "decoded ahead of the sampler instead of prefetching everything")
 
@@ -279,10 +279,21 @@ class PrefetchDataLoader:
             data = self.cache.get(idx)
             if data is not None:
                 self.cache.move_to_end(idx); self.stats["hit"] += 1
+                self._report()
                 return data
             fut = self.pending.get(idx)
+        import time as _t
+        t0 = _t.perf_counter()
         if fut is not None:
-            self.stats["wait"] += 1
-            return fut.result()
-        self.stats["miss"] += 1
-        return self._decode(idx)
+            data = fut.result(); self.stats["wait"] += 1; self.stats["wait_s"] += _t.perf_counter() - t0
+        else:
+            data = self._decode(idx); self.stats["miss"] += 1; self.stats["miss_s"] += _t.perf_counter() - t0
+        self._report()
+        return data
+
+    def _report(self):
+        """Every 2000 samples: how often the training thread waited (wait = decode in flight, miss = not predicted)."""
+        st = self.stats; n = st["hit"] + st["wait"] + st["miss"]
+        if n % 2000 == 0:
+            CONSOLE.log(f"[image cache] {n} samples: resident {st['hit']}, waited {st['wait']} ({st['wait_s']:.1f} s), "
+                        f"decoded on the spot {st['miss']} ({st['miss_s']:.1f} s)")

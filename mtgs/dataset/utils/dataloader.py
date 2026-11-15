@@ -193,7 +193,54 @@ class PrefetchDataLoader:
         self.datamanager = datamanager
         self.scale_factor = scale_factor
         self.cache = {}
-        self._prefetch()
+        # MTGS_CACHE_MAX_IMAGES=N > 0 (2026-11-15): at most N decoded samples stay resident instead of every training
+        # image (12k images of a merged block = ~100 GB of host RAM before the model). Samples come from the same
+        # _load_data, so every returned sample is byte-identical to the unbounded cache; only when they are decoded
+        # changes. The training sampler's next draws are predicted without consuming its random state (peek) and
+        # decoded ahead by a thread pool (hint), so the GPU normally finds the sample resident. Unset / 0 = the
+        # original prefetch of everything.
+        self.cache_max = int(os.environ.get('MTGS_CACHE_MAX_IMAGES', '0') or 0)
+        if self.cache_max > 0 and self.cache_max < len(dataset):
+            self._init_capped()
+        else:
+            self.cache_max = 0
+            self._prefetch()
+
+    def _init_capped(self):
+        from concurrent.futures import ThreadPoolExecutor as _Pool
+        self.cache = OrderedDict()
+        self.lock = threading.Lock()
+        self.pending = {}                       # idx -> Future of a decode in flight
+        self.upcoming = set()                   # predicted next indices: never evicted
+        self.pool = _Pool(max_workers=max(1, int(self.datamanager.config.num_workers) or 4), thread_name_prefix="mtgs_cache")
+        self.stats = dict(hit=0, wait=0, miss=0)
+        CONSOLE.log(f"Image cache capped at {self.cache_max} of {len(self.dataset)} samples (MTGS_CACHE_MAX_IMAGES): "
+                    "decoded ahead of the sampler instead of prefetching everything")
+
+    def _store(self, idx, data):
+        with self.lock:
+            self.pending.pop(idx, None)
+            self.cache[idx] = data
+            self.cache.move_to_end(idx)
+            while len(self.cache) > self.cache_max:
+                victim = next((k for k in self.cache if k not in self.upcoming), None)
+                if victim is None or victim == idx:
+                    break
+                del self.cache[victim]
+        return data
+
+    def _decode(self, idx):
+        return self._store(idx, self.datamanager._load_data(self.dataset, idx, scale_factor=self.scale_factor))
+
+    def hint(self, indices):
+        """The indices the sampler will most likely ask for next (sampler.peek): decode them in the background."""
+        if not self.cache_max:
+            return
+        with self.lock:
+            self.upcoming = set(indices)
+            todo = [i for i in indices if i not in self.cache and i not in self.pending]
+            for i in todo:
+                self.pending[i] = self.pool.submit(self._decode, i)
     
     def _prefetch(self):
         def fetch_data(idx):
@@ -222,4 +269,16 @@ class PrefetchDataLoader:
                 self.cache[idx] = batch
 
     def get_cache(self, idx):
-        return self.cache[idx]
+        if not self.cache_max:
+            return self.cache[idx]
+        with self.lock:
+            data = self.cache.get(idx)
+            if data is not None:
+                self.cache.move_to_end(idx); self.stats["hit"] += 1
+                return data
+            fut = self.pending.get(idx)
+        if fut is not None:
+            self.stats["wait"] += 1
+            return fut.result()
+        self.stats["miss"] += 1
+        return self._decode(idx)

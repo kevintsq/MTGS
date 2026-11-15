@@ -26,6 +26,9 @@ from .custom_dataset import CustomInputDataset
 from .utils.dataloader import AsyncDataLoader, FixedIndicesPseudoDataloader, OnDemandDataLoader, PinnedUploader, PrefetchDataLoader
 from .utils.sampler import CameraSampler, MultiTraversalBalancedSampler
 
+# MTGS_CACHE_MAX_IMAGES (utils/dataloader.PrefetchDataLoader): how many of the sampler's next draws are decoded ahead
+CACHE_LOOKAHEAD = int(os.environ.get("MTGS_CACHE_LOOKAHEAD", "32"))
+
 @dataclass
 class CustomFullImageDatamanagerConfig(FullImageDatamanagerConfig):
     _target: Type = field(default_factory=lambda: CustomFullImageDatamanager[CustomInputDataset])
@@ -267,6 +270,9 @@ class CustomFullImageDatamanager(FullImageDatamanager, Generic[TDataset]):
 
         Returns a Camera instead of raybundle"""
         image_idx = self.train_sampler.get_next_image_idx()
+        loader = self.train_dataloaders[self.get_scale_factor_idx(step)]
+        if getattr(loader, "cache_max", 0) and hasattr(self.train_sampler, "peek"):   # capped image cache: decode ahead
+            loader.hint([image_idx] + self.train_sampler.peek(CACHE_LOOKAHEAD))
 
         data, camera = self.cached_train(
             image_idx, scale_factor_idx=self.get_scale_factor_idx(step)

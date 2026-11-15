@@ -25,12 +25,51 @@ from nuplan_scripts.utils.camera_utils import undistort_maps
 
 
 def adjust_brightness(image, factor):
+    if _FAST_LOAD:
+        return _adjust_brightness_lut(image, factor)
     image_hsv = cv2.cvtColor(image, cv2.COLOR_RGB2HSV).astype(np.float64)
     image_hsv[..., 2] = (image_hsv[..., 2] * factor)
     image_hsv[..., 2] = np.clip(image_hsv[..., 2], 0, 255)
     image_hsv = image_hsv.astype(np.uint8)
     image = cv2.cvtColor(image_hsv, cv2.COLOR_HSV2RGB)
     return image
+
+
+# Reloads of training samples (MTGS_CACHE_MAX_IMAGES > 0, utils/dataloader.PrefetchDataLoader) make the per-sample load a
+# per-step cost; these paths return BYTE-IDENTICAL arrays and are used only then (the unbounded prefetch is untouched):
+# adjust_brightness through a 256-entry table (the same float64 multiply / clip / truncation per V value; H and S went
+# through an exact uint8 -> float64 -> uint8 round trip), JPEG decode with cv2 when a start-up check finds it equal to PIL
+# on this machine's libraries, the static ego mask and the parsed lidar sweep (shared by the 8 cameras of a frame) kept.
+_FAST_LOAD = int(os.environ.get("MTGS_CACHE_MAX_IMAGES", "0") or 0) > 0 and os.environ.get("MTGS_FAST_LOAD", "1") != "0"   # MTGS_FAST_LOAD=0: A/B
+_CV2_JPEG = None            # None = not checked yet, then True / False
+_EGO_MASKS: Dict = {}
+_LIDAR_POINTS: Dict = {}
+
+
+def _adjust_brightness_lut(image, factor):
+    hsv = cv2.cvtColor(image, cv2.COLOR_RGB2HSV)
+    lut = np.clip(np.arange(256, dtype=np.float64) * factor, 0, 255).astype(np.uint8)
+    hsv[..., 2] = lut[hsv[..., 2]]
+    return cv2.cvtColor(hsv, cv2.COLOR_HSV2RGB)
+
+
+def _decode_jpeg_cv2(path, check_paths):
+    """RGB uint8 of a JPEG with cv2, or None when cv2 does not reproduce PIL here (checked once on a few images)."""
+    global _CV2_JPEG
+    if _CV2_JPEG is None:
+        try:
+            ok = True
+            for q in check_paths:
+                b = cv2.imread(str(q), cv2.IMREAD_COLOR)
+                ok = ok and b is not None and np.array_equal(np.array(Image.open(q), dtype="uint8"), b[..., ::-1])
+            _CV2_JPEG = ok
+        except Exception:
+            _CV2_JPEG = False
+        CONSOLE.log(f"JPEG decode for sample reloads: {'cv2 (identical to PIL on the check images)' if _CV2_JPEG else 'PIL (cv2 differs here)'}")
+    if not _CV2_JPEG:
+        return None
+    b = cv2.imread(str(path), cv2.IMREAD_COLOR)
+    return None if b is None else np.ascontiguousarray(b[..., ::-1])
 
 class CustomInputDataset(InputDataset):
 
@@ -83,8 +122,13 @@ class CustomInputDataset(InputDataset):
             image_idx: The image index in the dataset.
         """
         image_filename = self._dataparser_outputs.image_filenames[image_idx]
-        pil_image = Image.open(image_filename)
-        image = np.array(pil_image, dtype="uint8")  # shape is (h, w) or (h, w, 3 or 4)
+        image = None
+        if _FAST_LOAD and str(image_filename).lower().endswith((".jpg", ".jpeg")):
+            fns = self._dataparser_outputs.image_filenames
+            image = _decode_jpeg_cv2(image_filename, [fns[i] for i in range(0, len(fns), max(1, len(fns) // 8))][:8])
+        if image is None:
+            pil_image = Image.open(image_filename)
+            image = np.array(pil_image, dtype="uint8")  # shape is (h, w) or (h, w, 3 or 4)
         if len(image.shape) == 2:
             image = image[:, :, None].repeat(3, axis=2)
 
@@ -149,6 +193,18 @@ class CustomInputDataset(InputDataset):
         return return_dict
 
     def _get_ego_mask(self, image_idx: int):
+        if _FAST_LOAD:
+            K, D = self._dataparser_outputs.undistort_params[image_idx] if self.undistort_images else (np.zeros(0), np.zeros(0))
+            key = (str(self._dataparser_outputs.ego_mask_filenames[image_idx]), bool(self.undistort_images), str(self.undistort_images),
+                   np.asarray(K).tobytes(), np.asarray(D).tobytes())
+            m = _EGO_MASKS.get(key)
+            if m is None:
+                m = _EGO_MASKS[key] = self._get_ego_mask_uncached(image_idx)
+                m.setflags(write=False)
+            return m
+        return self._get_ego_mask_uncached(image_idx)
+
+    def _get_ego_mask_uncached(self, image_idx: int):
         ego_mask = cv2.imread(self._dataparser_outputs.ego_mask_filenames[image_idx], cv2.IMREAD_GRAYSCALE) != 0
         valid_mask = np.logical_not(ego_mask).astype(np.uint8) * 255
         if self.undistort_images:
@@ -187,7 +243,13 @@ class CustomInputDataset(InputDataset):
         K = camera.get_intrinsics_matrices().numpy()
 
         if points is None:
-            points = load_lidar(lidar_filename)
+            if _FAST_LOAD:
+                points = _LIDAR_POINTS.get(str(lidar_filename))
+                if points is None:
+                    points = _LIDAR_POINTS[str(lidar_filename)] = load_lidar(lidar_filename)
+                    points.setflags(write=False)
+            else:
+                points = load_lidar(lidar_filename)
 
         points = np.concatenate([points, np.ones((points.shape[0], 1))], axis=1)
         point_cam = (points @ lidar2cam.T)[:, :3]

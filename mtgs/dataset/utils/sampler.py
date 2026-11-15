@@ -62,6 +62,12 @@ class CoverAwareSampler:
             self.dump()
         return idx
 
+    def peek(self, k):
+        """Only while mining cannot start within the window (mining draws depend on scores not reported yet)."""
+        if self.score is not None and self.k + k > self.start:
+            return []
+        return self.base.peek(k) if hasattr(self.base, "peek") else []
+
     def report(self, value):
         if self.last is None:
             return
@@ -81,12 +87,28 @@ class CoverAwareSampler:
         except Exception as e:   # never take the training down for a log
             print(f"[view-cover] dump failed: {e}", flush=True)
 
+def _peek(sampler, k, state_attrs):
+    """The next k indices `sampler` will return, without changing it or python's random state (the training's only
+    other user of `random` is the in-order eval sampler, which draws nothing): for decoding samples ahead."""
+    import copy
+    rnd = random.getstate(); saved = {a: copy.deepcopy(getattr(sampler, a)) for a in state_attrs}
+    try:
+        return [sampler.get_next_image_idx() for _ in range(k)]
+    finally:
+        for a, v in saved.items():
+            setattr(sampler, a, v)
+        random.setstate(rnd)
+
+
 class CameraSampler:
     
     def __init__(self, dataset, in_order: bool = False):
         self.dataset = dataset
         self.unseen_cameras = [i for i in range(len(self.dataset))]
         self.in_order = in_order
+
+    def peek(self, k):
+        return _peek(self, k, ("unseen_cameras",))
 
     def get_next_image_idx(self) -> int:
 
@@ -118,6 +140,9 @@ class MultiTraversalBalancedSampler:
         self.unseen_per_traversal_images = {
             traversal: self.traversal_indices[traversal].copy() for traversal in self.traversals
         }
+
+    def peek(self, k):
+        return _peek(self, k, ("unseen_traversals", "unseen_per_traversal_images"))
 
     def get_next_traversal(self):
         traversal = self.unseen_traversals.pop(random.randint(0, len(self.unseen_traversals) - 1))

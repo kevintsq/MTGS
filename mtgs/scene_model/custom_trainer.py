@@ -242,7 +242,17 @@ class CustomTrainer(Trainer):
         return d
 
     def _write_checkpoint(self, host: dict, copied: torch.cuda.Event, ckpt_path: Path, step: int) -> None:
-        """Writer thread: local file from the host buffers, then the mirror, then the old local files."""
+        """Writer thread: local file from the host buffers, then the mirror, then the old local files; then the
+        snapshot's pinned buffers go back to the system at once (2026-11-15: they stayed cached until the NEXT save,
+        i.e. a whole parameter + Adam copy on the host for the rest of the training: +28 GB of RSS for 4.8 M
+        gaussians on pn_w2_02, ~6 KB per gaussian)."""
+        try:
+            self._write_checkpoint_files(host, copied, ckpt_path, step)
+        finally:
+            host.clear()   # the last references to the pinned tensors (save_checkpoint's frame has returned)
+            _release_pinned_cache()
+
+    def _write_checkpoint_files(self, host: dict, copied: torch.cuda.Event, ckpt_path: Path, step: int) -> None:
         copied.synchronize()   # the D2H copies of the snapshot have landed
         for attempt in range(5):
             try:

@@ -628,8 +628,10 @@ def _rigidity_gate(frame_infos, images_aligned, rigid_m, video_token=''):
     return n
 
 
-def align_model(video_scene: VideoScene, video_scene_dict, colmap_path, thresh=1.0):
-    cameras, images, points3D = read_model(f'{colmap_path}/sfm_model/0', ext='.bin')
+def align_model(video_scene: VideoScene, video_scene_dict, colmap_path, thresh=1.0, model=None, name_map=None):
+    # model / name_map: a kept solution (sfm_reuse.py) instead of the one just computed in colmap_path; the point
+    # cloud is still named after colmap_path's model (sfm_point_cloud/<joint|video>.pcd)
+    cameras, images, points3D = read_model(model or f'{colmap_path}/sfm_model/0', ext='.bin')
 
     # read points3D
     points3D_new = {}
@@ -661,7 +663,7 @@ def align_model(video_scene: VideoScene, video_scene_dict, colmap_path, thresh=1
 
     # read image
     images_out = {}
-    _nm = f'{colmap_path}/name_to_token.json'
+    _nm = name_map or f'{colmap_path}/name_to_token.json'
     import json as _json
     _name_map = _json.load(open(_nm)) if os.path.exists(_nm) else {}
     for img in images.values():
@@ -1061,9 +1063,30 @@ if __name__ == "__main__":
     # copy ego mask to sub data root
     copy_ego_masks(video_scene)
 
+    from nuplan_scripts.utils.colmap_utils import sfm_reuse
+    from rich.markup import escape   # log lines start with [...], which rich would take for markup and drop
     colmap_paths = []
     colmap_publish = []
     single_video_scene_dicts = []
+    reuse_of = {}          # colmap path -> (model dir, name_to_token path) of a kept solution taken instead of COLMAP
+    sfm_keys = {}          # colmap path -> input key of the solution (written with the model for later reuse)
+
+    def _reuse(colmap_path, colmap_nfs_path, vsd):
+        """A kept solution for exactly these inputs (sfm_reuse.py): mark the cameras as the build did and skip COLMAP."""
+        name = os.path.basename(colmap_nfs_path)
+        key = sfm_keys[colmap_path] = sfm_reuse.compute_key(video_scene, vsd, config.use_colmap_ba)
+        r = sfm_reuse.find(video_scene, colmap_nfs_path, name, key, vsd, log=lambda m: CONSOLE.log(escape(m)))
+        if r is None:
+            return False
+        model, name_map, invalid, src = r
+        sfm_reuse.mark_valid(vsd, invalid, name_map)
+        reuse_of[colmap_path] = (model, name_map)
+        CONSOLE.log(f'\\[sfm reuse] {name}: COLMAP solution reused from {model} (key {key["sha256"][:12]}, '
+                    f'{key["images"]} input cameras); no model build, no COLMAP')
+        if invalid is None or os.path.realpath(src) != os.path.realpath(sfm_reuse.keep_dir(video_scene, name)):
+            CONSOLE.log(f'\\[sfm reuse] {name}: kept keyed in {sfm_reuse.adopt(video_scene, src, name, key, vsd)}')
+        return True
+
     # Joint mode: one colmap model over every traversal, so bundle adjustment enforces
     # cross-traversal consistency photometrically (pairs are pose-proximity based over
     # the whole dict, so cross-video matches come for free). Per-video mode ties each
@@ -1072,13 +1095,17 @@ if __name__ == "__main__":
         colmap_path = os.path.join(video_scene.colmap_path, 'joint')
         colmap_path, colmap_nfs_path = _colmap_workdir(colmap_path)
         colmap_publish.append((colmap_path, colmap_nfs_path))
+        if _reuse(colmap_path, colmap_nfs_path, all_video_scene_dict):
+            pass
         # a finished model from an earlier attempt makes both expensive steps moot
-        if _restore_published(colmap_path, colmap_nfs_path):
+        elif _restore_published(colmap_path, colmap_nfs_path):
             skip_create_model = True
             skip_colmap_ba = True
             CONSOLE.log('[colmap] reusing the archived joint model; '
                         'skipping model build and bundle adjustment')
-        if not skip_create_model:
+        if colmap_path in reuse_of:
+            pass
+        elif not skip_create_model:
             create_colmap_model(video_scene, all_video_scene_dict, colmap_path)
         else:
             CONSOLE.log('Skipping create colmap model for joint')
@@ -1094,16 +1121,19 @@ if __name__ == "__main__":
         colmap_path = os.path.join(video_scene.colmap_path, video_token)
         colmap_path, colmap_nfs_path = _colmap_workdir(colmap_path)
         colmap_publish.append((colmap_path, colmap_nfs_path))
-        if not skip_create_model:
+        if _reuse(colmap_path, colmap_nfs_path, video_scene_dict):
+            pass
+        elif not skip_create_model:
             create_colmap_model(video_scene, video_scene_dict, colmap_path)
         else:
             CONSOLE.log(f'Skipping craete colmap model for {video_token}')
         colmap_paths.append(colmap_path)
         single_video_scene_dicts.append(video_scene_dict)
 
-    # 3. run colmap for each video scene
-    if not skip_colmap_ba:
-        num_tasks = len(colmap_paths)
+    # 3. run colmap for each video scene (not for the ones whose solution is reused)
+    run_idx = [i for i, p in enumerate(colmap_paths) if p not in reuse_of]
+    if not skip_colmap_ba and run_idx:
+        num_tasks = len(run_idx)
         # Respect the SLURM allocation: cpu_count() reports the NODE's cores,
         # oversubscribing the cgroup by an order of magnitude on shared nodes.
         # MTGS_CPU_BUDGET caps the budget on shared boxes (e.g. manco, where trainers
@@ -1130,11 +1160,11 @@ if __name__ == "__main__":
         # Frame count is the weight (images = frames x cams, cams is per-rig
         # constant within a block), and it is available whether or not the colmap
         # models were just built.
-        weights = [VideoScene.count_total_frames(vsd) for vsd in single_video_scene_dicts]
+        weights = [VideoScene.count_total_frames(single_video_scene_dicts[i]) for i in run_idx]
         # Longest-processing-time first: when there are more traversals than pool
         # slots, starting the big ones first keeps the tail short.
         order = sorted(range(num_tasks), key=lambda i: -weights[i])
-        ordered_paths = [colmap_paths[i] for i in order]
+        ordered_paths = [colmap_paths[run_idx[i]] for i in order]
 
         if num_tasks <= pool_size:
             # Every traversal runs concurrently, so give each a share of the cores
@@ -1165,13 +1195,20 @@ if __name__ == "__main__":
             exit(1)
 
         CONSOLE.log('All colmap done')
-    else:
+        # keep every solution just computed, keyed, for a later retrain (sfm_reuse.py)
+        for i in run_idx:
+            kept = sfm_reuse.save(video_scene, colmap_paths[i], os.path.basename(colmap_publish[i][1]),
+                                  sfm_keys[colmap_paths[i]], single_video_scene_dicts[i])
+            if kept:
+                CONSOLE.log(f'\\[sfm reuse] solution of {os.path.basename(colmap_publish[i][1])} kept in {kept}')
+    elif run_idx:
         CONSOLE.log('Skipping colmap')
 
     # 4. merge all the models
     video_scene_dict_new = {}
     for video_scene_dict, colmap_path in zip(single_video_scene_dicts, colmap_paths):
-        video_scene_dict = align_model(video_scene, video_scene_dict, colmap_path)
+        model, name_map = reuse_of.get(colmap_path, (None, None))
+        video_scene_dict = align_model(video_scene, video_scene_dict, colmap_path, model=model, name_map=name_map)
         video_scene_dict_new.update(video_scene_dict)
 
     # Exporting a combined sparse model is a debugging aid, but it rebuilds the

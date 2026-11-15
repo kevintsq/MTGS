@@ -65,7 +65,8 @@ def _decode_jpeg_cv2(path, check_paths):
             _CV2_JPEG = ok
         except Exception:
             _CV2_JPEG = False
-        CONSOLE.log(f"JPEG decode for sample reloads: {'cv2 (identical to PIL on the check images)' if _CV2_JPEG else 'PIL (cv2 differs here)'}")
+        print(f"[image cache] JPEG decode for sample reloads: {'cv2 (identical to PIL on the check images)' if _CV2_JPEG else 'PIL (cv2 differs here)'}",
+              flush=True)   # print, not CONSOLE.log: rich draws from python's global random (see utils/dataloader._init_capped)
     if not _CV2_JPEG:
         return None
     b = cv2.imread(str(path), cv2.IMREAD_COLOR)

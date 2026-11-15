@@ -218,8 +218,10 @@ class PrefetchDataLoader:
         self.upcoming = set()                   # predicted next indices: never evicted
         self.pool = _Pool(max_workers=max(1, int(self.datamanager.config.num_workers) or 4), thread_name_prefix="mtgs_cache")
         self.stats = dict(hit=0, wait=0, miss=0, wait_s=0.0, miss_s=0.0)
-        CONSOLE.log(f"Image cache capped at {self.cache_max} of {len(self.dataset)} samples (MTGS_CACHE_MAX_IMAGES): "
-                    "decoded ahead of the sampler instead of prefetching everything")
+        # print, not CONSOLE.log: rich draws from python's global random for every styled render (Style ids), and the
+        # training sampler draws its images from that same state -- an extra console line changes the image order
+        print(f"[image cache] capped at {self.cache_max} of {len(self.dataset)} samples (MTGS_CACHE_MAX_IMAGES): "
+              "decoded ahead of the sampler instead of prefetching everything", flush=True)
 
     def _store(self, idx, data):
         with self.lock:
@@ -295,5 +297,5 @@ class PrefetchDataLoader:
         """Every 2000 samples: how often the training thread waited (wait = decode in flight, miss = not predicted)."""
         st = self.stats; n = st["hit"] + st["wait"] + st["miss"]
         if n % 2000 == 0:
-            CONSOLE.log(f"[image cache] {n} samples: resident {st['hit']}, waited {st['wait']} ({st['wait_s']:.1f} s), "
-                        f"decoded on the spot {st['miss']} ({st['miss_s']:.1f} s)")
+            print(f"[image cache] {n} samples: resident {st['hit']}, waited {st['wait']} ({st['wait_s']:.1f} s), "
+                  f"decoded on the spot {st['miss']} ({st['miss_s']:.1f} s)", flush=True)   # print: see _init_capped

@@ -74,7 +74,11 @@ class FixedIndicesPseudoDataloader:
         self.cached_func = self.datamanager.cached_train if self.datamanager.same_train_eval else self.datamanager.cached_eval
 
     def __iter__(self):
+        loader = getattr(self.datamanager, "eval_dataloader", None)
+        ahead = getattr(loader, "cache_max", 0) and hasattr(loader, "hint")
         for idx in range(len(self)):
+            if ahead:   # capped image cache: the evaluation over all images is in order, decode the next ones ahead
+                loader.hint(list(range(idx, min(idx + 32, len(self)))))
             data, camera = self.datamanager.cached_eval(idx)
             camera, data = self.datamanager.upload(data, camera)
             yield camera, data

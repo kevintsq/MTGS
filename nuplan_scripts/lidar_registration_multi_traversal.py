@@ -1311,10 +1311,29 @@ if __name__ == '__main__':
         if _scans_by_token and gps_videos:
             _live = [vt for vt in video_scene_dict if vt in gps_videos]
             _trusted = {vt for vt in video_scene_dict if vt not in gps_videos}
-            if not _trusted and len(_live) > 1:
+            if not _trusted and _live:
                 _root = sorted(_live, key=lambda vt: (not _is_pinned(video_scene_dict[vt]), -len(video_scene_dict[vt]['frame_infos'])))[0]
                 _trusted.add(_root); _live.remove(_root)
-                say(f"No ICP-registered pass to anchor to: video {_root.split('-')[-1]} (GPS poses) is the reference", style="yellow")
+                # The reference (a single-pass block's only pass included) must not stay on raw INS poses: 9 served passes
+                # in 8 blocks (all five single-pass st_ blocks, fp_bx_08, ...) did, an INS altitude glitch became a 0.96 m
+                # bump of the camera against the model (st_e756), and a single GPS pass never even reached the old
+                # 'len(_live) > 1' branch (no map to consolidate onto -> left as is). It is refined on its own lidar: two
+                # rounds of per-frame map ICP onto the accumulation of its own scans; the INS keeps the absolute frame.
+                import open3d as o3d
+                _v = video_scene_dict[_root]; _vox = float(os.environ.get('MTGS_REG_MAP_ICP_VOXEL', 0.3))
+                _pr = {i['token']: result_poses_dict_aligned[i['token']] for i in _v['frame_infos'] if i['token'] in result_poses_dict_aligned}
+                _rep = "no scans"
+                for _ in range(2):
+                    _pts = _pass_accumulation(_v, _scans_by_token, _pr)
+                    if _pts is None or len(_pts) < 5000:
+                        break
+                    _ref = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(_pts)).voxel_down_sample(_vox)
+                    _ref.estimate_normals(o3d.geometry.KDTreeSearchParamHybrid(radius=_vox * 4, max_nn=30))
+                    _pr, _rep = _map_icp_frames(_v, _scans_by_token, _pr, _ref, _vox)
+                _d = [float(np.linalg.norm(_pr[t][:3, 3] - result_poses_dict_aligned[t][:3, 3])) for t in _pr]
+                result_poses_dict_aligned.update(_pr)
+                say(f"No ICP-registered pass to anchor to: video {_root.split('-')[-1]} (GPS poses) is the reference, refined "
+                    f"on its own lidar (moved median {np.median(_d) if _d else 0:.2f} m, max {max(_d) if _d else 0:.2f} m; {_rep})", style="yellow")
             for vt in sorted(_live, key=lambda vt: -len(video_scene_dict[vt]['frame_infos'])):
                 _map = _map_icp_inputs(video_scene_dict, result_poses_dict_aligned, set(video_scene_dict) - _trusted, _scans_by_token)
                 if _map is None or len(_map) < 5000:

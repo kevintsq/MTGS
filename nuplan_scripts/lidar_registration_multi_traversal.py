@@ -756,7 +756,7 @@ def _inconsistent_passes(vt, video_scene_dict, poses, scans_by_token, clouds):
     axes) over the overlapping scans must stay within MTGS_REG_SWEEP_TOL_M / _DEG (0.15 m / 0.3 deg). A rigid fit of
     the whole pass was tried first (2026-10-30) and missed the per-frame 1.4 deg roll of ir_w2_06 entirely. Same-day
     passes of one vehicle agree to a few cm, so with the plain all-others map they anchor each other and a cross-
-    vehicle offset survives the sweeps. Returns (inconsistent tokens, report)."""
+    vehicle offset survives the sweeps. Returns (inconsistent passes, report, {other pass: median shift in m})."""
     import open3d as o3d
     from scipy.spatial.transform import Rotation
     voxel = float(os.environ.get('MTGS_REG_MAP_ICP_VOXEL', 0.3))
@@ -764,8 +764,8 @@ def _inconsistent_passes(vt, video_scene_dict, poses, scans_by_token, clouds):
     nsamp = int(os.environ.get('MTGS_REG_SWEEP_SAMPLES', 16))
     tokens = [i['token'] for i in video_scene_dict[vt]['frame_infos'] if i['token'] in poses and i['token'] in scans_by_token]
     if len(tokens) < 5:
-        return [], "no frames"
-    bad, rep = [], []
+        return [], "no frames", {}
+    bad, rep, shifts = [], [], {}
     for u in video_scene_dict:
         if u == vt:
             continue
@@ -805,11 +805,11 @@ def _inconsistent_passes(vt, video_scene_dict, poses, scans_by_token, clouds):
             rvs.append(poses[t][:3, :3].T @ Rotation.from_matrix(D[:3, :3]).as_rotvec(degrees=True))
         if len(dts) < 5:
             continue   # no real overlap
-        shift = float(np.median(dts)); rv = np.median(np.array(rvs), axis=0)
+        shift = float(np.median(dts)); rv = np.median(np.array(rvs), axis=0); shifts[u] = shift
         rep.append(f"{u.split('-')[-1]}: {shift:.2f} m, roll {rv[0]:+.2f} pitch {rv[1]:+.2f} yaw {rv[2]:+.2f} deg ({len(dts)} scans)")
         if shift > tol_m or np.abs(rv).max() > tol_deg:
             bad.append(u)
-    return bad, ", ".join(rep)
+    return bad, ", ".join(rep), shifts
 
 
 def _map_icp_inputs(video_scene_dict, result_poses_dict_aligned, exclude, scans_by_token, cache=None):
@@ -1177,7 +1177,7 @@ if __name__ == '__main__':
                     _excl = {vt}
                     if _pairwise:
                         # register only against the passes vt does NOT already agree with (see _inconsistent_passes)
-                        _bad, _prep = _inconsistent_passes(vt, video_scene_dict, result_poses_dict_aligned, _scans_by_token, _clouds)
+                        _bad, _prep, _ = _inconsistent_passes(vt, video_scene_dict, result_poses_dict_aligned, _scans_by_token, _clouds)
                         if not _bad:
                             say(f"Sweep {_sw + 1}: video {vt.split('-')[-1]} agrees with every overlapping pass ({_prep}), left as is", style="yellow")
                             continue
@@ -1202,6 +1202,54 @@ if __name__ == '__main__':
             _e = calculate_errors(video_scene_dict, result_poses_dict_aligned)
             say("After the consistency sweeps (vs INS): " + ", ".join(
                 f"{vt.split('-')[-1]}: {_e[vt]['mean_error']:.2f} m" for vt in video_scene_dict), style="yellow")
+
+        # Cross-pass consistency gate (2026-11-16, px_loc_0195: two groups of passes 3.1-3.4 m apart, each consistent
+        # inside, passed every gate: the BEV / vs-INS gates scale with the block's median error, the sweeps measure each
+        # pass against a map that holds its partner). Every overlapping pair of passes is measured by scan-to-map ICP of
+        # one pass's scans onto the other's accumulation (_inconsistent_passes). A pair more than MTGS_QA_PASS_PAIR_STOP_M
+        # (0.5 m; good blocks agree to 0.02-0.07 m) apart is repaired once: every pass that disagrees with most of the
+        # passes it overlaps is registered by map ICP onto the others; what still disagrees stops the stage.
+        _pair_stop = float(os.environ.get('MTGS_QA_PASS_PAIR_STOP_M', 0.5))
+        if _scans_by_token and _pair_stop > 0 and len(video_scene_dict) > 1:
+            def _pair_table():
+                _cl, _tab = {}, {}
+                for _vt in video_scene_dict:
+                    for _u, _sh in _inconsistent_passes(_vt, video_scene_dict, result_poses_dict_aligned, _scans_by_token, _cl)[2].items():
+                        _tab[(_vt, _u)] = _sh
+                return _tab
+            _id = lambda vt: vt.split('-')[-1]
+            _fmt = lambda tab: ", ".join(f"{_id(a)}->{_id(b)} {sh:.2f} m" for (a, b), sh in sorted(tab.items(), key=lambda kv: -kv[1]) if sh > _pair_stop)
+            _tab = _pair_table()
+            if any(sh > _pair_stop for sh in _tab.values()):
+                say(f"[pass QA] passes disagree by more than {_pair_stop:g} m: {_fmt(_tab)}", style="bold red")
+                _mv = []
+                for vt in video_scene_dict:
+                    _nb = {u: sh for (a, u), sh in _tab.items() if a == vt}
+                    if _nb and 2 * sum(sh > _pair_stop for sh in _nb.values()) > len(_nb):
+                        _mv.append(vt)
+                _ref = _aligned_reference(video_scene_dict, result_poses_dict_aligned, set(_mv))
+                _map = _map_icp_inputs(video_scene_dict, result_poses_dict_aligned, set(_mv), _scans_by_token) if _mv else None
+                for vt in _mv:
+                    v = video_scene_dict[vt]
+                    if _map is None or len(_map) < 5000:
+                        break
+                    _cur = {i['token']: result_poses_dict_aligned[i['token']].copy() for i in v['frame_infos']}.get
+                    fixed, rep = _map_icp_pass(v, _scans_by_token, [("aligned", _cur), ("ins", _gps_poses_on_aligned_height(v, _ref).get)], _map, vt)
+                    if fixed is not None:
+                        _d = [float(np.linalg.norm(fixed[t][:3, 3] - result_poses_dict_aligned[t][:3, 3])) for t in fixed]
+                        say(f"[pass QA] video {_id(vt)} disagrees with most passes it overlaps: registered onto the others "
+                            f"(moved median {np.median(_d):.2f} m, max {max(_d):.2f} m): {rep}", style="yellow")
+                        result_poses_dict_aligned.update(fixed)
+                    else:
+                        say(f"[pass QA] video {_id(vt)}: map ICP onto the other passes failed ({rep})", style="bold red")
+                _tab = _pair_table()
+                if any(sh > _pair_stop for sh in _tab.values()):
+                    msg = (f"[pass QA] STOP: passes still disagree by more than MTGS_QA_PASS_PAIR_STOP_M={_pair_stop:g} m after the "
+                           f"repair: {_fmt(_tab)}. The block would train ghost copies of the scene (two frames of reference).")
+                    say(msg, style="bold red")
+                    raise SystemExit(msg)
+            say(f"[pass QA] {len(_tab)} overlapping pass pairs, largest disagreement "
+                f"{max(_tab.values()) if _tab else 0:.2f} m (stop above {_pair_stop:g} m)")
 
         # MTGS_REG_LEVEL: 0 = full ICP, 1 = INS attitude + one constant per traversal
         # (measured worse: -1.5..-3 dB), 2 = full ICP minus the drift all traversals share

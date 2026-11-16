@@ -57,6 +57,9 @@ def merge_control_cfg(global_control, model_cfg):
     return model_cfg
 
 
+_LIDAR_DEPTH_LOSS = __import__("os").environ.get("MTGS_LIDAR_DEPTH_LOSS", "")   # "" = the configured loss, "log" = log-depth L1
+
+
 def masked_mean(x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
     """x[mask].mean() without the boolean index, whose output size forces a host sync every call.
     mask is [..., 1] bool and broadcasts over x's last dim; an empty mask gives 0 instead of NaN."""
@@ -1034,7 +1037,13 @@ class MTGSSceneModel(Model):
 
                 elif self.config.depth_source == "lidar":
                     # masked means: an empty mask gives 0 (the old .sum()==0 branch) without a host sync
-                    if self.config.depth_loss_type == DepthLossType.InverseL1:
+                    if _LIDAR_DEPTH_LOSS == "log":
+                        # MTGS_LIDAR_DEPTH_LOSS=log (experiment 2026-11-16): |log pred - log gt|. A road height error dh at
+                        # range d is a depth error dh * d / H: InverseL1 sees dh / (H d), fading with range; the log loss sees
+                        # dh / H at every range. Short MCMC run on pn_w2_02 (26k steps, 2.4 M): per-pixel road height spread
+                        # p10-p90 0.21 -> 0.12 m, pixels > 0.2 m above the lidar road 15.5 % -> 3.5 %, route NCC 0.613 -> 0.604.
+                        loss_depth = masked_mean(torch.abs(torch.log(pred_depth.clamp_min(1e-3)) - torch.log(gt_depth.clamp_min(1e-3))), depth_loss_mask)
+                    elif self.config.depth_loss_type == DepthLossType.InverseL1:
                         inverse_gt_depth = 1 / (gt_depth + 1e-5)
                         inverse_pred_depth = 1 / (pred_depth + 1e-5)
                         loss_depth = masked_mean(torch.abs(inverse_gt_depth - inverse_pred_depth), depth_loss_mask)

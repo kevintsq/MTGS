@@ -267,8 +267,17 @@ def run_bundle_adjustment(
     # reboot 2026-11-05: joint matching takes ~15 h per block and the stage restarts from scratch otherwise).
     # Features are kept as they are; matches_importer skips pairs that are already matched, so a snapshot
     # taken mid-matching resumes where it stopped; one taken after matching goes straight to the mapper.
+    # MTGS_SFM_PHASE=map (sfm_split.py): the database comes from the match job's snapshot; extraction and matching
+    # are not run again (the database is complete, so skipping matches_importer keeps it byte-identical)
+    split_phase = os.environ.get("MTGS_SFM_PHASE", "")
+    snap = os.environ.get("MTGS_SFM_SNAPSHOT_DIR")
+    if split_phase and not snap:
+        say(f"[sfm split] MTGS_SFM_PHASE={split_phase} without MTGS_SFM_SNAPSHOT_DIR (set by ba_multi_traversal)"); sys.exit(1)
     dbimp = os.environ.get("MTGS_SFM_DB_IMPORT")
-    if os.environ.get("MTGS_JOINT_SFM") == "1" and dbimp and os.path.exists(dbimp):
+    if split_phase == "map":
+        from nuplan_scripts.utils.colmap_utils import sfm_split
+        sfm_split.restore(colmap_path, snap, log=lambda m: say(m, flush=True))
+    elif os.environ.get("MTGS_JOINT_SFM") == "1" and dbimp and os.path.exists(dbimp):
         shutil.copy2(dbimp, f"{colmap_path}/database.db")
         say(f"[sfm] imported database {dbimp} ({os.path.getsize(dbimp)/1e9:.2f} GB): extraction skipped, matching resumes", flush=True)
         _prune_db_to_pair_list(f"{colmap_path}/database.db", f"{colmap_path}/image_pairs.txt")
@@ -300,19 +309,26 @@ def run_bundle_adjustment(
             sys.exit(1)
 
 
-    say("feature matching...")
-    colmap_matches_importer_args = [
-        colmap_exe, "matches_importer",
-        "--database_path", f"{colmap_path}/database.db",
-        "--match_list_path", f"{colmap_path}/image_pairs.txt",
-        "--FeatureMatching.num_threads", f"{_match_threads(num_workers)}"
-    ]
+    if split_phase != "map":
+        say("feature matching...")
+        colmap_matches_importer_args = [
+            colmap_exe, "matches_importer",
+            "--database_path", f"{colmap_path}/database.db",
+            "--match_list_path", f"{colmap_path}/image_pairs.txt",
+            "--FeatureMatching.num_threads", f"{_match_threads(num_workers)}"
+        ]
 
-    try:
-        _run_colmap(colmap_matches_importer_args, colmap_path, check=True)
-    except subprocess.CalledProcessError as e:
-        say(f"Error executing colmap matches_importer: {e}")
-        sys.exit(1)
+        try:
+            _run_colmap(colmap_matches_importer_args, colmap_path, check=True)
+        except subprocess.CalledProcessError as e:
+            say(f"Error executing colmap matches_importer: {e}")
+            sys.exit(1)
+
+    if split_phase == "match":
+        from nuplan_scripts.utils.colmap_utils import sfm_split
+        sfm_split.write(colmap_path, snap, os.environ.get("MTGS_SFM_SNAPSHOT_KEY", ""), os.environ.get("MTGS_SFM_MATCH_GPU_ENV"),
+                        log=lambda m: say(m, flush=True))
+        sys.exit(0)
 
     if os.path.exists(os.path.join(colmap_path, output_model)):
         shutil.rmtree(os.path.join(colmap_path, output_model))

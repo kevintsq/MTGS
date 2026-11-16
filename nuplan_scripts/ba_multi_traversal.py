@@ -5,6 +5,7 @@
 #-------------------------------------------------------------------------------#
 from nuplan_scripts.utils.console import say
 import os
+import sys
 import copy
 import shutil
 from collections import defaultdict
@@ -1064,7 +1065,9 @@ if __name__ == "__main__":
     # copy ego mask to sub data root
     copy_ego_masks(video_scene)
 
-    from nuplan_scripts.utils.colmap_utils import sfm_reuse
+    from nuplan_scripts.utils.colmap_utils import sfm_reuse, sfm_split
+    split = sfm_split.check_recipe(config)      # '' (one stage), 'match' (GPU job) or 'map' (CPU job): sfm_split.py
+    split_meta = None
     colmap_paths = []
     colmap_publish = []
     single_video_scene_dicts = []
@@ -1074,7 +1077,9 @@ if __name__ == "__main__":
     def _reuse(colmap_path, colmap_nfs_path, vsd):
         """A kept solution for exactly these inputs (sfm_reuse.py): mark the cameras as the build did and skip COLMAP."""
         name = os.path.basename(colmap_nfs_path)
-        key = sfm_keys[colmap_path] = sfm_reuse.compute_key(video_scene, vsd, config.use_colmap_ba)
+        # map phase: the key carries the COLMAP_USE_GPU of the match job, which made the features (sfm_split.py)
+        with sfm_split.gpu_env_of(split_meta['colmap_use_gpu'] if split_meta else os.environ.get('COLMAP_USE_GPU')):
+            key = sfm_keys[colmap_path] = sfm_reuse.compute_key(video_scene, vsd, config.use_colmap_ba)
         r = sfm_reuse.find(video_scene, colmap_nfs_path, name, key, vsd, log=say)
         if r is None:
             return False
@@ -1095,14 +1100,26 @@ if __name__ == "__main__":
         colmap_path = os.path.join(video_scene.colmap_path, 'joint')
         colmap_path, colmap_nfs_path = _colmap_workdir(colmap_path)
         colmap_publish.append((colmap_path, colmap_nfs_path))
+        split_dir = sfm_split.snap_dir(video_scene, os.path.basename(colmap_nfs_path))
+        if split == 'map':
+            split_meta = sfm_split.read_meta(split_dir)
         if _reuse(colmap_path, colmap_nfs_path, all_video_scene_dict):
-            pass
+            if split == 'match':
+                say('[sfm split] match phase: a kept solution matches the inputs; nothing to match (the map phase reuses it)')
+                sys.exit(0)
+        elif split == 'match' and sfm_split.has_db(split_dir) and \
+                (sfm_split.read_meta(split_dir) or {}).get('key') == sfm_keys[colmap_path]['sha256']:
+            say(f'[sfm split] match phase: snapshot in {split_dir} already holds these inputs; nothing to do')
+            sys.exit(0)
         # a finished model from an earlier attempt makes both expensive steps moot
-        elif _restore_published(colmap_path, colmap_nfs_path):
+        elif split != 'match' and _restore_published(colmap_path, colmap_nfs_path):
             skip_create_model = True
             skip_colmap_ba = True
             say('[colmap] reusing the archived joint model; '
                         'skipping model build and bundle adjustment')
+        elif split == 'map' and not (sfm_split.has_db(split_dir) and (split_meta or {}).get('key') == sfm_keys[colmap_path]['sha256']):
+            raise SystemExit('[sfm split] map phase: ' + (f'no match snapshot in {split_dir}' if not sfm_split.has_db(split_dir) else
+                             'the match snapshot was made from other inputs (key differs)') + ': run the ba_match stage')
         if colmap_path in reuse_of:
             pass
         elif not skip_create_model:
@@ -1184,6 +1201,11 @@ if __name__ == "__main__":
                     f'{sum(thread_counts[:pool_size])}/{total_threads} cores in use)')
 
         run_colmap = run_colmap_ba if config.use_colmap_ba else run_colmap_triangulation
+        if split:   # read by bundle_adjustment.py (one joint model in this mode)
+            os.environ['MTGS_SFM_SNAPSHOT_DIR'] = split_dir
+            os.environ['MTGS_SFM_SNAPSHOT_KEY'] = sfm_keys[colmap_paths[0]]['sha256']
+            if split == 'match' and os.environ.get('COLMAP_USE_GPU') is not None:
+                os.environ['MTGS_SFM_MATCH_GPU_ENV'] = os.environ['COLMAP_USE_GPU']
 
         with multiprocessing.Pool(processes=pool_size) as pool:
             return_codes = pool.starmap(run_colmap, list(zip(ordered_paths, thread_counts)))
@@ -1195,6 +1217,10 @@ if __name__ == "__main__":
             exit(1)
 
         say('All colmap done')
+        if split == 'match':   # the snapshot is all this phase leaves behind: no model, no alignment, no vsd
+            for _work, _nfs in colmap_publish:
+                safe_rmtree_colmap(_work, 'sfm split match phase done')
+            sys.exit(0)
         # keep every solution just computed, keyed, for a later retrain (sfm_reuse.py)
         for i in run_idx:
             kept = sfm_reuse.save(video_scene, colmap_paths[i], os.path.basename(colmap_publish[i][1]),
@@ -1230,3 +1256,6 @@ if __name__ == "__main__":
     video_scene.video_scene_dict = video_scene_dict_new
     video_scene.dump_pickle(video_scene.pickle_path_colmap)
     video_scene.update_pickle_link(video_scene.pickle_path_colmap)
+    if split == 'map' and sfm_split.has_db(split_dir):   # stage complete: the database is not needed again
+        sfm_split.consume(split_dir)
+        say(f'[sfm split] map phase done; match database in {split_dir} deleted (meta.json kept)')

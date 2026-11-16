@@ -4,6 +4,7 @@
 # Copyright (c) OpenDriveLab. All rights reserved.                              #
 #-------------------------------------------------------------------------------#
 from nuplan_scripts.utils.console import say
+from nuplan_scripts.utils.traj_step_qa import check_trajectory_steps
 import os
 import sys
 import copy
@@ -903,6 +904,7 @@ if __name__ == '__main__':
         video_scene.video_scene_dict = video_scene_dict
         video_scene_dict = video_scene.video_scene_dict_process(
             ['filter_low_velocity', 'inject_trajectory'], inline=True)
+        check_trajectory_steps(video_scene, 'regis', video_scene.pickle_path_registered.replace('.pkl', '_step_qa_failed.pkl'))
         video_scene.dump_pickle(video_scene.pickle_path_registered)
         video_scene.update_pickle_link(video_scene.pickle_path_registered)
         sys.exit(0)
@@ -1249,6 +1251,7 @@ if __name__ == '__main__':
         'inject_trajectory'
     ], inline=True)
 
+    check_trajectory_steps(video_scene, 'regis', video_scene.pickle_path_registered.replace('.pkl', '_step_qa_failed.pkl'))
     video_scene.dump_pickle(video_scene.pickle_path_registered)
     video_scene.update_pickle_link(video_scene.pickle_path_registered)
 

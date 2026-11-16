@@ -1228,5 +1228,7 @@ if __name__ == "__main__":
             clean_colmap_folder(colmap_path)
 
     video_scene.video_scene_dict = video_scene_dict_new
+    from nuplan_scripts.utils.traj_step_qa import check_trajectory_steps
+    check_trajectory_steps(video_scene, 'ba_stack', video_scene.pickle_path_colmap.replace('.pkl', '_step_qa_failed.pkl'))
     video_scene.dump_pickle(video_scene.pickle_path_colmap)
     video_scene.update_pickle_link(video_scene.pickle_path_colmap)

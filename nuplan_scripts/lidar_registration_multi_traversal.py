@@ -734,6 +734,11 @@ def _scan_icp(src, ref, ref_pts, T0, cs, max_iter):
     P = np.asarray(src.points)
     r = float(np.linalg.norm(P, axis=1).max()) + max(cs) + margin if len(P) else 0.0
     sel = np.flatnonzero(np.linalg.norm(ref_pts - T0[:3, 3], axis=1) < r)
+    if len(sel) < 30:
+        # No map within reach of the scan (ml_sg01 2026-11-16: a stretch of a pass far from every other pass in the
+        # consistency sweep): nothing to register against. The empty crop has no normals and point-to-plane ICP raised
+        # on it; this is a failed fit, not an error -- the caller tells it apart from a bad fit by its map coverage.
+        return T0, 0.0, float('inf')
     tgt = ref.select_by_index(sel) if len(sel) < len(ref_pts) else ref
     for attempt in range(2):
         T = T0
@@ -764,6 +769,23 @@ def _map_icp_frames(video, scans_by_token, poses, ref, voxel, max_dt=1.0, max_dy
         tilt = os.environ.get('MTGS_REG_PASS_TILT', '0') == '1'
     tokens = [info['token'] for info in video['frame_infos'] if info['token'] in poses and info['token'] in scans_by_token]
     ref_pts = np.asarray(ref.points)                        # for the per-scan crop in _scan_icp
+    # Map coverage of a frame whose fit failed (2026-11-16, ml_sg01): the share of its scan points, at its input pose,
+    # with a map point within MTGS_REG_MAP_ICP_COVER_M (2 m: wider than any input-pose error the gates admit). Below
+    # MTGS_REG_MAP_ICP_MIN_COVER the frame lies outside the map (a stretch no other pass drove): it is carried like any
+    # unrefined frame, but it is no registration failure and does not count towards the unrefined-run stop below.
+    cover_m = float(os.environ.get('MTGS_REG_MAP_ICP_COVER_M', 2.0))
+    min_cover = float(os.environ.get('MTGS_REG_MAP_ICP_MIN_COVER', 0.10))
+    _tree = []
+    outside = set()
+
+    def _cover(P, pose):
+        if not _tree:
+            from scipy.spatial import cKDTree
+            _tree.append(cKDTree(ref_pts))
+        if len(P) == 0:
+            return 0.0
+        d, _ = _tree[0].query((pose[:3, :3] @ P.T).T + pose[:3, 3], k=1, distance_upper_bound=cover_m)
+        return float(np.isfinite(d).mean())
     tilt_rep = ""
     if tilt:
         ego_rv = []
@@ -812,6 +834,12 @@ def _map_icp_frames(video, scans_by_token, poses, ref, voxel, max_dt=1.0, max_dy
             dyaw = abs(float(_R.from_matrix(D[:3, :3]).as_euler('zyx', degrees=True)[0]))
             ok = fitness >= 0.3 and dt <= max_dt and drot <= max_rot_deg and dyaw <= max_dyaw_deg
             res.append((rvec, dp) if ok else None)
+            if ok:
+                outside.discard(i)
+            elif _cover(np.asarray(src.points), base[t]) < min_cover:
+                outside.add(i)
+            else:
+                outside.discard(i)
         return res
 
     def _smooth(c):
@@ -871,6 +899,10 @@ def _map_icp_frames(video, scans_by_token, poses, ref, voxel, max_dt=1.0, max_dy
            f"max {max(mags) if mags else 0:.2f} m / {max(rots) if rots else 0:.2f} deg")
     if carried:
         rep += f"; {len(carried)} unrefined frames carried from their refined neighbours, {n2} of them refined in a second round"
+    out_left = [i for i in left if i in outside]
+    if out_left:
+        rep += f"; {len(out_left)} of them outside the map's coverage (no map within {cover_m:g} m of their scans), kept on the carried poses"
+    left = [i for i in left if i not in outside]
     if left:
         # what is still unrefined holds interpolated poses only: report every run, stop when one is too long to trust
         runs, s0 = [], left[0]

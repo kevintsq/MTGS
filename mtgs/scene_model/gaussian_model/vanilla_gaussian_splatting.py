@@ -964,8 +964,9 @@ class VanillaGaussianSplattingModel(torch.nn.Module):
     def cull_mask(self, params, max_2Dsize, counts):
         """
         Mask of the rows of `params` (a mapping name -> tensor) to delete: the ones under the opacity
-        threshold and, after the first opacity reset, the huge ones in world space and (until
-        stop_screen_size_at) in screen space. max_2Dsize None: rows without screen statistics.
+        threshold and, from the first opacity reset until stop_split_at, the huge ones in world space and (until
+        stop_screen_size_at) in screen space; after densification (continue_cull_post_densification) only the
+        transparent ones. max_2Dsize None: rows without screen statistics.
         The counts for the verbose log are summed into `counts` as GPU scalars: no host sync here.
         """
         # cull transparent ones
@@ -975,8 +976,11 @@ class VanillaGaussianSplattingModel(torch.nn.Module):
         culls = (torch.sigmoid(params["opacities"]) < thresh).reshape(-1)
         counts["below_alpha"] = counts.get("below_alpha", 0) + culls.sum()
 
-        if self.step > self.ctrl_config.refine_every * self.ctrl_config.reset_alpha_every:
-            # cull huge ones
+        # cull huge ones: only while densifying. After stop_split_at nothing splits, and a gaussian that has grown past the
+        # size limit is a surface the model needs (pn_w2_02, 2026-11-16: removing the 26k = 0.6 % such rows of the final
+        # model drops the route NCC 0.642 -> 0.588, removing the 1.29 M rows below 0.005 changes nothing); culled at every
+        # refinement, its neighbours grow to fill the gap and are culled in turn (continue_cull with the size rule: 0.557)
+        if self.ctrl_config.refine_every * self.ctrl_config.reset_alpha_every < self.step < self.ctrl_config.stop_split_at:
             toobigs = (torch.exp(params["scales"]).max(dim=-1).values > self.cull_scale_thresh(params["means"])).reshape(-1)
             counts["toobigs_ws"] = counts.get("toobigs_ws", 0) + toobigs.sum()
             if self.step < self.ctrl_config.stop_screen_size_at and max_2Dsize is not None:

@@ -64,6 +64,24 @@ def discover_video_stats(config, num_workers):
 
 
 def select(stats, test_logs, k, require_logs=()):
+    # MTGS_APPEARANCE_PER_LOG=1 (block-env flag, 2026-11-16, user: "按 log 数算"): k counts distinct LOGS, not passes --
+    # a log crossing the block twice gives two passes that share one appearance row in training (same day, minutes
+    # apart), so its second pass costs images, not a day. MTGS_MAX_PASSES (default 9 = 6 logs x 1.5) bounds the passes,
+    # i.e. the training images, so the coverage fill cannot keep adding passes of logs it already holds. Flag off: k
+    # counts passes exactly as before.
+    per_log = os.environ.get('MTGS_APPEARANCE_PER_LOG', '0') == '1'
+    max_passes = int(os.environ.get('MTGS_MAX_PASSES', 9)) if per_log else k
+    def _n_logs(ss):
+        return len({s_["log"] for s_ in ss})
+    def _can_add(chosen_, s_):
+        if not per_log:
+            return len(chosen_) < k
+        return len(chosen_) < max_passes and (s_["log"] in {c["log"] for c in chosen_} or _n_logs(chosen_) < k)
+    def _full(chosen_):
+        if not per_log:
+            return len(chosen_) >= k
+        return len(chosen_) >= max_passes or (_n_logs(chosen_) >= k and not any(
+            s_["log"] in {c["log"] for c in chosen_} and s_["idx"] not in {c["idx"] for c in chosen_} for s_ in stats))
     # Bad-weather logs poison a reconstruction (wet-road spray bakes into the
     # background; a clear scene renders rainy). Exclusion is a hard filter,
     # overriding even require_logs -- prefer clear multi-traversal over a
@@ -142,17 +160,28 @@ def select(stats, test_logs, k, require_logs=()):
             say(msg + " -- continuing (MTGS_REQUIRE_MISSING=warn)", style="bold yellow")
         else:
             raise SystemExit(msg + "\nFix the block box / windows, or set MTGS_REQUIRE_MISSING=warn to build without them.")
-    if len(req) > k:
+    over = (_n_logs(req) > k or len(req) > max_passes) if per_log else len(req) > k
+    if over:
         rows = "\n  ".join(f"{s_['log']} pass {s_['idx']}: {s_['n']} frames, "
                            f"ts {s_['ts']}-{s_.get('ts_end', s_['ts'])}" for s_ in req)
+        what = (f"{_n_logs(req)} required logs / {len(req)} passes for {k} logs / {max_passes} passes "
+                f"(MTGS_APPEARANCE_PER_LOG=1)" if per_log else
+                f"{len(req)} required passes for {k} slots (a log crossing the block twice counts twice)")
         if os.environ.get('MTGS_REQUIRE_OVERFLOW', '') == 'drop_shortest':
-            say(f"[auto_select] WARNING: {len(req)} required passes for {k} slots, dropping the shortest "
-                f"{len(req) - k} (MTGS_REQUIRE_OVERFLOW=drop_shortest):\n  {rows}", style="bold yellow")
+            say(f"[auto_select] WARNING: {what}, dropping the shortest (MTGS_REQUIRE_OVERFLOW=drop_shortest):\n  {rows}",
+                style="bold yellow")
         else:
-            raise SystemExit(f"[auto_select] {len(req)} required passes for {k} slots (a log crossing the block twice "
-                             f"counts twice):\n  {rows}\nNarrow MTGS_REQUIRE_WINDOWS, raise --max_traversals, or set "
-                             f"MTGS_REQUIRE_OVERFLOW=drop_shortest to drop the shortest ones.")
-    req = req[:k]
+            raise SystemExit(f"[auto_select] {what}:\n  {rows}\nNarrow MTGS_REQUIRE_WINDOWS, raise --max_traversals"
+                             f"{' / MTGS_MAX_PASSES' if per_log else ''}, or set MTGS_REQUIRE_OVERFLOW=drop_shortest "
+                             f"to drop the shortest ones.")
+    if per_log:
+        kept_req = []
+        for s_ in req:                       # longest first: the same cut as req[:k], counted in logs and passes
+            if _can_add(kept_req, s_):
+                kept_req.append(s_)
+        req = kept_req
+    else:
+        req = req[:k]
     req_idx = {s["idx"] for s in req}
     test = sorted([s for s in usable
                    if s["log"] in test_logs and s["idx"] not in req_idx],
@@ -191,11 +220,14 @@ def select(stats, test_logs, k, require_logs=()):
     for s_ in chosen:
         cover += frames_near(targets, s_["traj"])
     pool = [s_ for s_ in usable if s_["idx"] not in {c["idx"] for c in chosen}]
-    while len(chosen) < k and pool and len(targets) and (cover < COV_K).any():
+    while not _full(chosen) and pool and len(targets) and (cover < COV_K).any():
         def gain(s_):
             g = np.minimum(frames_near(targets, s_["traj"]), np.maximum(COV_K - cover, 0)).sum()
             return (g, s_["log"] in test_logs, s_["n"])
-        best = max(pool, key=gain)
+        cand = [s_ for s_ in pool if _can_add(chosen, s_)]
+        if not cand:
+            break
+        best = max(cand, key=gain)
         if gain(best)[0] <= 0:
             break
         pool.remove(best); chosen.append(best); cover += frames_near(targets, best["traj"])
@@ -203,17 +235,28 @@ def select(stats, test_logs, k, require_logs=()):
         say(f"[auto_select] route coverage after selection: min {int(cover.min())} / median "
               f"{int(np.median(cover))} frames within {COV_R:.0f} m (target {COV_K})", flush=True)
     test = [s_ for s_ in test if s_["idx"] not in {c["idx"] for c in chosen}]
-    chosen += test[:max(0, k - len(chosen))]
+    if per_log:
+        for s_ in test:
+            if _can_add(chosen, s_):
+                chosen.append(s_)
+    else:
+        chosen += test[:max(0, k - len(chosen))]
     rest = [s_ for s_ in rest if s_["idx"] not in {c["idx"] for c in chosen}]
     # fill remaining slots by greedy max-min timestamp spread
-    while len(chosen) < k and rest:
+    while not _full(chosen) and rest:
         if not chosen:
             rest.sort(key=lambda s: -s["n"])
             chosen.append(rest.pop(0))
             continue
-        best = max(rest, key=lambda s: (min(abs(s["ts"] - c["ts"]) for c in chosen), s["n"]))
+        cand = [s_ for s_ in rest if _can_add(chosen, s_)]
+        if not cand:
+            break
+        best = max(cand, key=lambda s: (min(abs(s["ts"] - c["ts"]) for c in chosen), s["n"]))
         rest.remove(best)
         chosen.append(best)
+    if per_log:
+        say(f"[auto_select] MTGS_APPEARANCE_PER_LOG: {len(chosen)} passes from {_n_logs(chosen)} logs "
+            f"(caps {k} logs / {max_passes} passes)", flush=True)
     return sorted(s["idx"] for s in chosen)
 
 

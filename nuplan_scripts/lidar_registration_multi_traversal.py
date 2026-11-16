@@ -178,6 +178,76 @@ def calculate_errors(video_scene_dict: dict, result_poses_dict: dict):
 
 _LAST_ALIGN_T = np.eye(4)
 
+def _tilt_dev(R, R_ins):
+    """World-frame tilt (deg, [x, y]) of the rotation R against the INS rotation R_ins: rotvec(R R_ins^T) without yaw."""
+    from scipy.spatial.transform import Rotation as _R
+    return _R.from_matrix(R @ R_ins.T).as_rotvec(degrees=True)[:2]
+
+
+def _retilt(R, d_from, d_to):
+    """R with its world-frame tilt moved from d_from to d_to (deg, [x, y]); yaw untouched."""
+    from scipy.spatial.transform import Rotation as _R
+    dd = np.asarray(d_to, dtype=float) - np.asarray(d_from, dtype=float)
+    return _R.from_rotvec([dd[0], dd[1], 0.0], degrees=True).as_matrix() @ R
+
+
+def _register_frame_gravity(self, frame, timestamps, gt_pose=None, traj_id=None):
+    """KissICP.register_frame with the roll / pitch of the joint odometry held to gravity (2026-11-16).
+
+    The stage trace of px_loc_0195 / ru_loc_0183 put the block tilts (up to 7.5 deg) into this step: (1) the first frame
+    of every traversal starts at its INS pose and is ICP'd with the warm-up settings (6 m correspondences, 6-DoF) onto the
+    shared map -- ru_loc_0183 pass 28 came out 4.7 deg tilted against a level map, px 26 5.4 deg, and the later
+    traversals inherited it; (2) 2 Hz scan-to-map odometry drifts in roll / pitch along a pass (px 23: 0.4 -> 3.4 deg,
+    26: 5.4 -> 10.7). Nothing after it corrects attitude (x/y alignment, z harmonisation, map ICP onto the majority).
+    Here (gt_pose = the INS pose, rotation in the world frame):
+    - traversal start: the tilt of the registered pose against the INS is clamped to MTGS_KISS_START_TILT_DEG (1.5 deg:
+      the INS attitude of a log is off gravity by up to ~1.5 deg, facade check of INS-placed maps 0.1-1.6), so a real
+      per-log offset survives and a snap does not; that clamped offset is the traversal's reference d0 (starting a
+      snapped traversal on the INS attitude instead left pw_loc_0195's passes 0.5-0.8 m apart);
+    - every other frame: the tilt deviation is pulled towards d0 by a complementary filter with time constant
+      MTGS_KISS_GRAVITY_TAU_S (10 s at 2 Hz: ICP's short-term attitude is kept, drift of 0.04-0.07 deg/s is held
+      to <= ~0.5 deg). Anchoring to d0 instead of to the INS keeps the log's own constant offset out of the correction
+      (levelling each pass to its own INS attitude broke consistent passes apart, pw_loc_0195).
+    MTGS_KISS_GRAVITY=0 restores the plain KissICP behaviour."""
+    frame = self.compensator.deskew_scan(frame, timestamps, self.last_delta)
+    frame = self.preprocess(frame)
+    source, frame_downsample = self.voxelize(frame)
+    sigma = self.adaptive_threshold.get_threshold()
+    start = self.last_traj_id != traj_id
+    if start:
+        self.warmup = 1
+        self.last_pose = gt_pose
+    warm = self.warmup >= 0
+    if warm:
+        self.warmup -= 1
+        initial_guess = gt_pose
+        sigma = 2
+    else:
+        initial_guess = self.last_pose @ self.last_delta
+    new_pose = self.registration.align_points_to_map(points=source, voxel_map=self.local_map, initial_guess=initial_guess,
+                                                     max_correspondance_distance=3 * sigma, kernel=sigma / 3)
+    if gt_pose is not None:
+        dev = _tilt_dev(new_pose[:3, :3], gt_pose[:3, :3])
+        if warm:
+            lim = float(os.environ.get('MTGS_KISS_START_TILT_DEG', 1.5)); m = float(np.hypot(*dev))
+            d0 = dev if m <= lim else dev * (lim / m)
+            if start:
+                self._grav_d0 = d0
+            d0 = self._grav_d0
+            new_pose = new_pose.copy(); new_pose[:3, :3] = _retilt(new_pose[:3, :3], dev, d0)
+        else:
+            tau = float(os.environ.get('MTGS_KISS_GRAVITY_TAU_S', 10.0)); a = 1.0 - np.exp(-0.5 / max(tau, 1e-3))
+            d0 = getattr(self, '_grav_d0', np.zeros(2))
+            new_pose = new_pose.copy(); new_pose[:3, :3] = _retilt(new_pose[:3, :3], dev, dev + a * (d0 - dev))
+    model_deviation = np.linalg.inv(initial_guess) @ new_pose
+    self.adaptive_threshold.update_model_deviation(model_deviation)
+    self.local_map.update(frame_downsample, new_pose)
+    self.last_delta = np.linalg.inv(self.last_pose) @ new_pose
+    self.last_pose = new_pose
+    self.last_traj_id = traj_id
+    return frame, source
+
+
 def align_poses(video_scene_dict:dict, result_poses_dict: dict):
     original_poses = []
     icp_poses = []
@@ -969,6 +1039,9 @@ if __name__ == '__main__':
         visualize=False,
     )
     kiss_icp_pipeline.config.out_dir = video_scene.registration_path
+    if os.environ.get('MTGS_KISS_GRAVITY', '1') == '1':
+        import types
+        kiss_icp_pipeline.odometry.register_frame = types.MethodType(_register_frame_gravity, kiss_icp_pipeline.odometry)
     kiss_icp_pipeline.run()
 
     # The registritaion works on the first frames coordinate.

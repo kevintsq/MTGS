@@ -97,8 +97,21 @@ def select(stats, test_logs, k, require_logs=()):
         drop_idx = {s["idx"] for s in dropped}
         stats = [s for s in stats if s["idx"] not in drop_idx]
         if not exempt:
+            gone = [r for r in require_logs if r.startswith(excl)]
+            if gone:
+                # the documented rule (user 2026-08-25: exclusion overrides require_logs unless
+                # MTGS_EXCLUDE_EXEMPT_REQUIRED=1) -- applied, but never silently (user rule 2026-11-16)
+                say(f"[auto_select] WARNING: {len(gone)} required log(s) excluded as bad weather / lens "
+                    f"(MTGS_EXCLUDE_LOGS; set MTGS_EXCLUDE_EXEMPT_REQUIRED=1 to keep a served scene's pass): {gone}",
+                    style="bold yellow")
             require_logs = tuple(r for r in require_logs if not r.startswith(excl))
-    usable = [s for s in stats if s["n"] >= MIN_FRAMES] or stats
+    # A required pass is a served scene's own pass: it is kept even when it is shorter than MIN_FRAMES (the cut is
+    # for clips that barely touch the block; before 2026-11-16 a short required pass fell out here without a word).
+    short_req = [s for s in stats if s["n"] < MIN_FRAMES and _required(s)]
+    if short_req:
+        say(f"[auto_select] keeping {len(short_req)} required pass(es) shorter than {MIN_FRAMES} frames: "
+            f"{[(s['log'], s['n']) for s in short_req]}", style="bold yellow")
+    usable = [s for s in stats if s["n"] >= MIN_FRAMES or _required(s)] or stats
     # A block serving a specific scene must reconstruct the road that scene
     # drives, so its own log takes a slot before the by-length ranking runs;
     # otherwise a location with 20 test logs keeps only the six longest and the
@@ -117,6 +130,28 @@ def select(stats, test_logs, k, require_logs=()):
             if s_["log"] in windows or s_["log"] not in seen:
                 one.append(s_); seen.add(s_["log"])
         req = one
+    # Every required log must be in the block (2026-11-16, user rule: no silent fallbacks): a required log with no
+    # in-block pass (outside the box, not in the window, missing db) or more required passes than slots stopped
+    # nobody -- ml_pit02 lost required 2021.09.16.19.27.01_veh-45_01749_03230 to `req[:k]` because another
+    # required log crosses the block twice (7 required passes, k = 6), visible only as "required logs present: 5/6".
+    missing = sorted(set(require_logs) - {s_["log"] for s_ in req})
+    if missing:
+        msg = (f"[auto_select] required log(s) without a usable in-block pass "
+               f"(windows: {[windows.get(m) for m in missing]}): {missing}")
+        if os.environ.get('MTGS_REQUIRE_MISSING', '') == 'warn':
+            say(msg + " -- continuing (MTGS_REQUIRE_MISSING=warn)", style="bold yellow")
+        else:
+            raise SystemExit(msg + "\nFix the block box / windows, or set MTGS_REQUIRE_MISSING=warn to build without them.")
+    if len(req) > k:
+        rows = "\n  ".join(f"{s_['log']} pass {s_['idx']}: {s_['n']} frames, "
+                           f"ts {s_['ts']}-{s_.get('ts_end', s_['ts'])}" for s_ in req)
+        if os.environ.get('MTGS_REQUIRE_OVERFLOW', '') == 'drop_shortest':
+            say(f"[auto_select] WARNING: {len(req)} required passes for {k} slots, dropping the shortest "
+                f"{len(req) - k} (MTGS_REQUIRE_OVERFLOW=drop_shortest):\n  {rows}", style="bold yellow")
+        else:
+            raise SystemExit(f"[auto_select] {len(req)} required passes for {k} slots (a log crossing the block twice "
+                             f"counts twice):\n  {rows}\nNarrow MTGS_REQUIRE_WINDOWS, raise --max_traversals, or set "
+                             f"MTGS_REQUIRE_OVERFLOW=drop_shortest to drop the shortest ones.")
     req = req[:k]
     req_idx = {s["idx"] for s in req}
     test = sorted([s for s in usable

@@ -222,6 +222,10 @@ class PrefetchDataLoader:
         # training sampler draws its images from that same state -- an extra console line changes the image order
         print(f"[image cache] capped at {self.cache_max} of {len(self.dataset)} samples (MTGS_CACHE_MAX_IMAGES): "
               "decoded ahead of the sampler instead of prefetching everything", flush=True)
+        # the same (empty) progress bar the full prefetch renders: its rich rendering draws from python's global random, and
+        # the training sampler continues from that state -- with it the capped run trains on the same image sequence
+        for _ in track(range(len(self.dataset)), description="Prefetching data", total=len(self.dataset)):
+            pass
 
     def _store(self, idx, data):
         with self.lock:

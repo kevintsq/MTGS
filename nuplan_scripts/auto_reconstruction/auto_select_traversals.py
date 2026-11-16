@@ -66,13 +66,14 @@ def discover_video_stats(config, num_workers):
 def select(stats, test_logs, k, require_logs=()):
     # MTGS_APPEARANCE_PER_LOG=1 (block-env flag, 2026-11-16, user: "按 log 数算"): k counts distinct LOGS, not passes --
     # a log crossing the block twice gives two passes that share one appearance row in training (same day, minutes
-    # apart), so its second pass costs images, not a day. MTGS_MAX_PASSES (default 9 = 6 logs x 1.5) bounds the passes,
-    # i.e. the training images, so the coverage fill cannot keep adding passes of logs it already holds. Flag off: k
-    # counts passes exactly as before.
+    # apart), so its second pass costs images, not a day. Extra passes of a chosen drive come only from the coverage
+    # greedy (routes / look-ahead); the other fills open new drives. 29-block bench (2026-11-16) without a pass cap:
+    # passes p50 6 / p90 8 / max 9, frames x1.0 / x1.5 / x1.7 of the 6-pass selection -> MTGS_MAX_PASSES (default 12) is
+    # only a safety cap. Flag off: k counts passes exactly as before.
     # "Log" here is the DRIVE (user 2026-11-16): the NAVSIM splits of one recorded drive count as one (drive_key).
     from nuplan_scripts.utils.log_names import drive_key
     per_log = os.environ.get('MTGS_APPEARANCE_PER_LOG', '0') == '1'
-    max_passes = int(os.environ.get('MTGS_MAX_PASSES', 9)) if per_log else k
+    max_passes = int(os.environ.get('MTGS_MAX_PASSES', 12)) if per_log else k
     def _n_logs(ss):
         return len({drive_key(s_["log"]) for s_ in ss})
     def _can_add(chosen_, s_):
@@ -264,9 +265,14 @@ def select(stats, test_logs, k, require_logs=()):
         say(f"[auto_select] look-ahead coverage after selection: {float((cover_a >= COV_KA).mean()):.0%} of "
             f"{len(ahead)} points with >= {COV_KA} frames within {COV_R:.0f} m (median {int(np.median(cover_a))})", flush=True)
     test = [s_ for s_ in test if s_["idx"] not in {c["idx"] for c in chosen}]
+    # The fills after the coverage greedy only open NEW drives (up to k): an extra pass of a drive already chosen costs
+    # images and is added only where it covers a served route / look-ahead region (the greedy above) -- otherwise every
+    # block would fill up to MTGS_MAX_PASSES with the other in-block passes of its drives (29-block bench, 2026-11-16).
+    def _new_drive(chosen_, s_):
+        return _can_add(chosen_, s_) and drive_key(s_["log"]) not in {drive_key(c["log"]) for c in chosen_}
     if per_log:
         for s_ in test:
-            if _can_add(chosen, s_):
+            if _new_drive(chosen, s_):
                 chosen.append(s_)
     else:
         chosen += test[:max(0, k - len(chosen))]
@@ -277,7 +283,7 @@ def select(stats, test_logs, k, require_logs=()):
             rest.sort(key=lambda s: -s["n"])
             chosen.append(rest.pop(0))
             continue
-        cand = [s_ for s_ in rest if _can_add(chosen, s_)]
+        cand = [s_ for s_ in rest if (_new_drive(chosen, s_) if per_log else _can_add(chosen, s_))]
         if not cand:
             break
         best = max(cand, key=lambda s: (min(abs(s["ts"] - c["ts"]) for c in chosen), s["n"]))

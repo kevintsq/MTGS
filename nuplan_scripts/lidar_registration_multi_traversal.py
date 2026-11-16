@@ -4,7 +4,7 @@
 # Copyright (c) OpenDriveLab. All rights reserved.                              #
 #-------------------------------------------------------------------------------#
 from nuplan_scripts.utils.console import say
-from nuplan_scripts.utils.traj_step_qa import check_trajectory_steps
+from nuplan_scripts.utils.traj_step_qa import check_trajectory_steps, check_unrefined_passes
 import os
 import sys
 import copy
@@ -1069,6 +1069,7 @@ if __name__ == '__main__':
         video_scene.video_scene_dict = video_scene_dict
         video_scene_dict = video_scene.video_scene_dict_process(
             ['filter_low_velocity', 'inject_trajectory'], inline=True)
+        check_unrefined_passes(video_scene, 'regis', video_scene.pickle_path_registered.replace('.pkl', '_unrefined_qa_failed.pkl'), warn_only=True)
         check_trajectory_steps(video_scene, 'regis', video_scene.pickle_path_registered.replace('.pkl', '_step_qa_failed.pkl'))
         video_scene.dump_pickle(video_scene.pickle_path_registered)
         video_scene.update_pickle_link(video_scene.pickle_path_registered)
@@ -1496,6 +1497,7 @@ if __name__ == '__main__':
         'inject_trajectory'
     ], inline=True)
 
+    check_unrefined_passes(video_scene, 'regis', video_scene.pickle_path_registered.replace('.pkl', '_unrefined_qa_failed.pkl'))
     check_trajectory_steps(video_scene, 'regis', video_scene.pickle_path_registered.replace('.pkl', '_step_qa_failed.pkl'))
     video_scene.dump_pickle(video_scene.pickle_path_registered)
     video_scene.update_pickle_link(video_scene.pickle_path_registered)

@@ -59,3 +59,37 @@ def check_trajectory_steps(video_scene, stage, failed_path=None):
         say(msg, style="bold red")
         raise SystemExit(msg)
     say(f"[step QA {stage}] {len(video_scene.video_scene_dict)} passes, {n_warn} with a step > {warn:g} m, none > {stop:g} m")
+
+
+def check_unrefined_passes(video_scene, stage, failed_path=None, warn_only=False):
+    """Passes the registration left on their INS poses (2026-11-16): x / y equal to the INS ('ego2global_original') on
+    more than MTGS_QA_UNREFINED_FRAC (0.9) of the frames. The height harmonisation moves z only, so such a pass looks
+    registered while no lidar ever touched it: 9 served passes were exactly INS (single-pass st_ blocks, fp_bx_08, ...)
+    and two more INS in x / y with a harmonised z (nb_20 pass 32, fq_loc_0002 pass 72, e12142d7's own pass, 0.33-0.69 m
+    off the block's other passes). x / y only: the vehicle-yaw fix may rotate an otherwise untouched pass.
+    Stops the stage (vsd written to failed_path), or only warns when keeping the INS was asked for (MTGS_SKIP_ICP=1)."""
+    frac_lim = float(os.environ.get('MTGS_QA_UNREFINED_FRAC', 0.9))
+    bad = []
+    for vt, v in video_scene.video_scene_dict.items():
+        fis = [f for f in v['frame_infos'] if 'ego2global_original' in f]
+        if not fis:
+            continue
+        d = np.array([np.linalg.norm(np.asarray(f['ego2global'], dtype=np.float64)[:2, 3]
+                                     - np.asarray(f['ego2global_original'], dtype=np.float64)[:2, 3]) for f in fis])
+        frac = float(np.mean(d < 1e-4))
+        if frac > frac_lim:
+            bad.append(f"{vt.rsplit('-', 1)[-1]} ({frac * 100:.0f} % of {len(fis)} frames)")
+    if not bad:
+        say(f"[unrefined QA {stage}] every pass was moved off its INS poses by the registration")
+        return
+    msg = (f"[unrefined QA {stage}] pass(es) {', '.join(bad)} still on their INS poses in x / y: no lidar registration "
+           f"reached them (a z-only harmonisation does not count).")
+    if warn_only:
+        say(msg + " Kept: MTGS_SKIP_ICP=1 asks for the INS poses.", style="bold yellow")
+        return
+    if failed_path:
+        video_scene.dump_pickle(failed_path)
+    msg += (" Fix the registration of that pass (or set MTGS_QA_UNREFINED_FRAC=1 knowingly)."
+            + (f" vsd written to {failed_path} for inspection." if failed_path else ""))
+    say(msg, style="bold red")
+    raise SystemExit(msg)

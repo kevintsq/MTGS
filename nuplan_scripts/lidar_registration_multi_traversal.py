@@ -625,18 +625,44 @@ def _map_icp_frames(video, scans_by_token, poses, ref, voxel, max_dt=1.0, max_dy
     # smooth: replace each correction by the component-wise median of its window
     # (rotation vector and origin displacement), so a single bad ICP frame cannot kink the pass
     out = dict(poses)
+    sm = [None] * len(tokens)                               # smoothed correction per frame, None = no refined frame near it
     for i, t in enumerate(tokens):
         nb = [corr[j] for j in range(max(0, i - win // 2), min(len(corr), i + win // 2 + 1)) if corr[j] is not None]
         if len(nb) < 2:
             continue
-        r = np.median(np.array([x[0] for x in nb]), axis=0); tr = np.median(np.array([x[1] for x in nb]), axis=0)
+        sm[i] = (np.median(np.array([x[0] for x in nb]), axis=0), np.median(np.array([x[1] for x in nb]), axis=0))
+    # Frames without a refined frame near them must not keep the input pose: next to refined frames that sit up to
+    # max_dt away from it, the pass then holds two frames of reference with a step between them (ru_area0806 pass 357,
+    # 2026-11-16: 47 frames left on the INS shape, 2.2 m / 0.85 m steps to the refined frames on either side, a road
+    # smeared over 2 m under them, the camera placed into it -> white fog in HUGSIM). They take the correction of the
+    # refined frames before and after them, blended by frame index (one side only: that one), like ego_pose_carry.
+    ok_idx = [i for i in range(len(tokens)) if sm[i] is not None]
+    n_carried = 0
+    if ok_idx:
+        oi = np.asarray(ok_idx)
+        for i in range(len(tokens)):
+            if sm[i] is not None:
+                continue
+            k = int(np.searchsorted(oi, i)); a = ok_idx[k - 1] if k > 0 else None; b = ok_idx[k] if k < len(ok_idx) else None
+            if a is None or b is None:
+                sm[i] = sm[b if a is None else a]
+            else:
+                w = (i - a) / (b - a)
+                ra, rb = _R.from_rotvec(sm[a][0]), _R.from_rotvec(sm[b][0])
+                sm[i] = ((ra * _R.from_rotvec(w * (ra.inv() * rb).as_rotvec())).as_rotvec(), (1.0 - w) * sm[a][1] + w * sm[b][1])
+            n_carried += 1
+    for i, t in enumerate(tokens):
+        if sm[i] is None:
+            continue
+        r, tr = sm[i]
         M = np.eye(4); M[:3, :3] = _R.from_rotvec(r).as_matrix() @ poses[t][:3, :3]; M[:3, 3] = poses[t][:3, 3] + tr
         out[t] = M
     mags = [float(np.linalg.norm(x[1])) for x in corr if x is not None]
     rots = [float(np.degrees(np.linalg.norm(x[0]))) for x in corr if x is not None]
     return out, (tilt_rep + f"per-frame map ICP: {n_ok}/{len(tokens)} frames refined, median correction "
                  f"{np.median(mags) if mags else 0:.2f} m / {np.median(rots) if rots else 0:.2f} deg, "
-                 f"max {max(mags) if mags else 0:.2f} m / {max(rots) if rots else 0:.2f} deg")
+                 f"max {max(mags) if mags else 0:.2f} m / {max(rots) if rots else 0:.2f} deg"
+                 + (f", {n_carried} unrefined frames carried from their refined neighbours" if n_carried else ""))
 
 def _pass_accumulation(video, scans_by_token, poses):
     """World-frame accumulation of a pass (every 2nd frame, r < 60 m, every 3rd point) at `poses`."""

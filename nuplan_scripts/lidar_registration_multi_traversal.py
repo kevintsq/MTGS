@@ -406,6 +406,98 @@ def _z_inconsistent_videos(video_scene_dict, result_poses_dict_aligned, skip, ga
     return out
 
 
+def _facade_tilt(video, poses, scans_by_token, nmax=80):
+    """World tilt (deg, [x, y]) of one pass's lidar map against gravity from its building facades: wall normals
+    (|n_z| < 0.3) of a level map are horizontal; a map rotated by the small horizontal rotation w has
+    n_z = w_x n_y - w_y n_x (trimmed least squares). Independent of the IMU and of the INS altitude. None without scans."""
+    import open3d as o3d
+    fis = [i for i in video['frame_infos'] if i['token'] in poses and i['token'] in scans_by_token and not i.get('skipped')]
+    fis = fis[::max(1, len(fis) // nmax)][:nmax]
+    pts = []
+    for i in fis:
+        P = scans_by_token[i['token']][:, :3]; P = P[np.linalg.norm(P[:, :2], axis=1) < 40.0][::2]
+        T = poses[i['token']] @ np.asarray(i['lidar2ego'], dtype=float)
+        pts.append((T[:3, :3] @ P.T).T + T[:3, 3])
+    if not pts:
+        return None
+    pc = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(np.concatenate(pts))).voxel_down_sample(0.25)
+    pc.estimate_normals(o3d.geometry.KDTreeSearchParamHybrid(radius=0.8, max_nn=30)); n = np.asarray(pc.normals)
+    m = np.abs(n[:, 2]) < 0.3
+    if m.sum() < 2000:
+        return None
+    A = np.c_[n[m, 1], -n[m, 0]]; bb = n[m, 2]; keep = np.ones(len(bb), bool)
+    for _ in range(3):
+        x = np.linalg.lstsq(A[keep], bb[keep], rcond=None)[0]; r = bb - A @ x; keep = np.abs(r) < 2.5 * np.std(r[keep])
+    return np.degrees(x)
+
+
+def _level_passes_to_imu(video_scene_dict, result_poses_dict_aligned, scans_by_token, exclude=()):
+    """Remove a rigid world-frame tilt of the registration against gravity, before the passes are harmonised.
+
+    The joint KISS-ICP chain can leave the block, or single passes, rotated about a horizontal axis: px_loc_0195 passes
+    26 / 57 / 58 / 61 by ~7.3 deg (2026-11-16) while 23 / 59 were level, so the steps after it took the tilted majority
+    as the reference (the harmonisation "corrected" the level passes by -4 m, map ICP then pulled them onto the tilted
+    ones); 131 served blocks hold passes > 1.5 deg off (ru_loc_0183: all four ~5 deg). Body-frame roll / pitch offsets
+    swing with the heading for such a pass (pass 57: pitch -6.5 -> +1.5 deg through an 87 deg turn) while the
+    world-frame tilt w = rotvec(R_reg R_ins^T)[x, y] stays constant.
+    Two levels, both rigid rotations about ONE centre (the block's mean position):
+    - the block: the median w over all frames, applied to every pass when > MTGS_REG_LEVEL_DEG (1 deg) and confirmed by
+      the facades of the passes' lidar maps (_facade_tilt: median over passes within max(1.5 deg, 35 %) of it; the
+      facade fit reads low, regression dilution: px 5.5 vs 7.3, ru_fq_loc_0188 1.0 vs 1.9 -> after levelling 0.2-0.4);
+    - a pass whose own w departs from the block's by > MTGS_REG_LEVEL_PASS_DEG (3 deg) is levelled by the difference
+      when its own facades confirm it. Smaller per-pass differences are left: every log's INS attitude carries its own
+      bias of ~1 deg, and levelling each pass by its own w broke mutually consistent passes apart (pw_loc_0195: pass 5
+      ended 3 m off the others).
+    Returns ([(what, |w| deg, |facade| deg or None, applied, reason)], ...)."""
+    from scipy.spatial.transform import Rotation as _R
+    gate = float(os.environ.get('MTGS_REG_LEVEL_DEG', 1.0)); pgate = float(os.environ.get('MTGS_REG_LEVEL_PASS_DEG', 3.0))
+    out = []
+    if gate <= 0:
+        return out
+    P, Wp = {}, {}
+    for vt, v in video_scene_dict.items():
+        if vt in exclude:
+            continue
+        fis = [i for i in v['frame_infos'] if i['token'] in result_poses_dict_aligned]
+        if len(fis) < 10:
+            continue
+        T = np.array([result_poses_dict_aligned[i['token']] for i in fis]); O = np.array([np.asarray(i['ego2global'], dtype=float) for i in fis])
+        P[vt] = fis; Wp[vt] = np.array([_R.from_matrix(T[k, :3, :3] @ O[k, :3, :3].T).as_rotvec(degrees=True) for k in range(len(fis))])[:, :2]
+    if not P:
+        return out
+    c = np.array([result_poses_dict_aligned[i['token']][:3, 3] for fis in P.values() for i in fis]).mean(axis=0)
+
+    def _rotate(vts, w):
+        Rc = _R.from_rotvec([-w[0], -w[1], 0.0], degrees=True).as_matrix()
+        for vt in vts:
+            for i in P[vt]:
+                M = result_poses_dict_aligned[i['token']].copy()
+                M[:3, :3] = Rc @ M[:3, :3]; M[:3, 3] = Rc @ (M[:3, 3] - c) + c
+                result_poses_dict_aligned[i['token']] = M
+
+    wb = np.median(np.concatenate(list(Wp.values())), axis=0); mb = float(np.hypot(*wb))
+    if mb > gate:
+        F = [f for f in (_facade_tilt(video_scene_dict[vt], result_poses_dict_aligned, scans_by_token) for vt in P) if f is not None]
+        fb = np.median(np.array(F), axis=0) if F else None
+        if fb is not None and np.hypot(*(fb - wb)) <= max(1.5, 0.35 * mb):
+            _rotate(list(P), wb)
+            for vt in P:
+                Wp[vt] = Wp[vt] - wb
+            out.append(("block", mb, float(np.hypot(*fb)), True, f"({wb[0]:+.1f}, {wb[1]:+.1f}) deg, facades ({fb[0]:+.1f}, {fb[1]:+.1f})"))
+        else:
+            out.append(("block", mb, None if fb is None else float(np.hypot(*fb)), False, "facades do not confirm it"))
+    for vt in P:
+        w = np.median(Wp[vt], axis=0); m = float(np.hypot(*w))
+        if m <= pgate:
+            continue
+        f = _facade_tilt(video_scene_dict[vt], result_poses_dict_aligned, scans_by_token)
+        if f is None or np.hypot(*(f - w)) > max(1.5, 0.35 * m):
+            out.append((vt, m, None if f is None else float(np.hypot(*f)), False, "its facades do not confirm it")); continue
+        _rotate([vt], w)
+        out.append((vt, m, float(np.hypot(*f)), True, f"({w[0]:+.1f}, {w[1]:+.1f}) deg off the block, facades ({f[0]:+.1f}, {f[1]:+.1f})"))
+    return out
+
+
 def _harmonize_z(video_scene_dict, result_poses_dict_aligned, radius=15.0, min_nb=3, win=8, gate=0.3):
     """Put every pass on the height of the passes already registered around it.
 
@@ -1025,6 +1117,12 @@ if __name__ == '__main__':
 
     # Height harmonisation: bring every pass onto the height of the passes registered
     # around it before the height QA.
+    # rigid world tilts of whole passes against gravity first: the harmonisation below and every map ICP after it take
+    # the other passes as their reference
+    for what, m, mf, ok, why in (_level_passes_to_imu(video_scene_dict, result_poses_dict_aligned, _scans_by_token, set(bad_videos)) if _scans_by_token else []):
+        say(("Block" if what == "block" else f"Traversal {what.split('-')[-1]}") + f": tilted {m:.1f} deg against the IMU in the world "
+            f"frame (facades " + ("n/a" if mf is None else f"{mf:.1f} deg") + f") {why} -> " + ("levelled" if ok else "left as is"),
+            style="yellow" if ok else None)
     _applied = _harmonize_z(video_scene_dict, result_poses_dict_aligned)
     for vt, off in _applied.items():
         say(f"Traversal {vt.split('-')[-1]}: height corrected by {-off:+.2f} m onto the other passes.", style="yellow")

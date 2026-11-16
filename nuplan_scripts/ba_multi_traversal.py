@@ -739,12 +739,32 @@ def align_model(video_scene: VideoScene, video_scene_dict, colmap_path, thresh=1
         U, S_, Vt = np.linalg.svd(M)
         R_ = U @ np.diag([1., 1., np.sign(np.linalg.det(U @ Vt))]) @ Vt
         ma, mb = A.mean(0), B.mean(0)
+        # YAW from the centres (MTGS_SIM3_YAW=orient restores the orientation yaw). Each vehicle's camera rig has its
+        # own heading offset to its INS, so the orientation mean rotates a mixed-vehicle block by a weighted mean of
+        # those offsets (px_loc_0195, veh-28 + veh-48: +0.54 deg about z, 0.6 m median placement error along the
+        # passes). The horizontal track pins the yaw without that bias; roll / pitch stay from the orientations.
         Ar = (A - ma) @ R_.T
+        psi, why = 0.0, 'orient'
+        if os.environ.get('MTGS_SIM3_YAW', 'centres') == 'centres':
+            a2, b2 = Ar[:, :2], (B - mb)[:, :2]
+            ext = float(np.sqrt(np.linalg.eigvalsh(np.cov(b2.T))[-1])) if len(b2) > 2 else 0.0
+            psi_c = float(np.arctan2((a2[:, 0] * b2[:, 1] - a2[:, 1] * b2[:, 0]).sum(), (a2 * b2).sum()))
+            ymax = float(os.environ.get('MTGS_SIM3_YAW_MAX_DEG', 3.0))
+            if ext < float(os.environ.get('MTGS_SIM3_YAW_MIN_EXT_M', 5.0)):
+                why = f'track extent {ext:.1f} m too small, orientation yaw kept'
+            elif abs(np.degrees(psi_c)) > ymax:
+                why = f'centre yaw {np.degrees(psi_c):+.2f} deg beyond {ymax:g} deg, orientation yaw kept'
+            else:
+                psi, why = psi_c, 'centres'
+            if psi:
+                c_, s_z = np.cos(psi), np.sin(psi)
+                R_ = np.array([[c_, -s_z, 0.], [s_z, c_, 0.], [0., 0., 1.]]) @ R_
+                Ar = (A - ma) @ R_.T
         s_ = float((Ar * (B - mb)).sum() / (Ar ** 2).sum())
         t_ = mb - s_ * R_ @ ma
         dang = np.degrees(np.arccos(np.clip((np.trace(R0.T @ R_) - 1) / 2, -1, 1)))
-        say(f'[align] Sim3 rotation from camera orientations: {dang:.2f} deg away from the centre-only fit '
-                    f'(scale {s_:.4f} vs {s0:.4f}, {len(A)} cameras)')
+        say(f'[align] Sim3 rotation from camera orientations, yaw {why} ({np.degrees(psi):+.3f} deg): {dang:.2f} deg '
+            f'away from the centre-only fit (scale {s_:.4f} vs {s0:.4f}, {len(A)} cameras)')
         return s_, R_, t_
 
     scale, R, t = _fit_sim3(colmap_cam_array, raw_cam_array, colmap_cam_R, raw_cam_R_arr)

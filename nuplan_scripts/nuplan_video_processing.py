@@ -275,6 +275,11 @@ class ProduceVideoSceneDict:
                 'frame_infos': []
             }
 
+            # per-video frame accounting (2026-11-16): frames dropped below used to print one tqdm line each and nothing
+            # else, so a selected log whose blob lacked its lidar came out as an EMPTY video that registration later
+            # dropped as an outlier (torch ml_sg01, 2021.10.05.07.49.39_veh-52_00770_00905: cameras, no MergedPointCloud)
+            stats = {'log_name': video['log_name'], 'n_lidar_pcs': len(video['lidar_pcs']), 'n_missing_lidar': 0,
+                     'n_broken_cams': 0}
             for frame_idx, lidar_pc in enumerate(video['lidar_pcs']):
                 lidar_pc: LidarPc
 
@@ -299,6 +304,7 @@ class ProduceVideoSceneDict:
                 pc_file_path = os.path.join(NUPLAN_SENSOR_ROOT, pc_file_name)
                 if not os.path.exists(pc_file_path):
                     tqdm.write(f'LiDAR file missing for {lidar_pc_token}')
+                    stats['n_missing_lidar'] += 1
                     continue
 
                 info = {
@@ -338,13 +344,26 @@ class ProduceVideoSceneDict:
                 info['cams'] = cams
                 if cams is None:
                     tqdm.write(f'Camera info broken for {lidar_pc_token}')
+                    stats['n_broken_cams'] += 1
                     continue
 
                 box_info = get_box_info_from_lidar_pc(lidar_pc, with_parking_cars=True)
                 info.update(box_info)
                 video_scene_dict[video_token]['frame_infos'].append(info)
 
-            return video_scene_dict
+            # The sensor blobs hold the 2 Hz key frames of the 10 Hz lidar_pc stream, so ~80 % of lidar_pcs never have
+            # a file -- a hole in the KEPT key frames is what matters: time not covered at the video's own key-frame
+            # rate (gaps > 2 periods, incl. the start / end), as a share of the video's duration.
+            ts = np.array([f['timestamp'] for f in video_scene_dict[video_token]['frame_infos']], dtype=np.int64)
+            stats['n_frames'] = len(ts)
+            dur = max(int(video['lidar_pcs'][-1].timestamp - start_ts), 1)
+            if len(ts) >= 2:
+                per = float(np.median(np.diff(ts)))
+                g = np.diff(np.concatenate([[start_ts], ts, [video['lidar_pcs'][-1].timestamp]])).astype(float)
+                stats['hole_frac'] = float(np.clip(g[g > 2 * per] - per, 0, None).sum() / dur)
+            else:
+                stats['hole_frac'] = 1.0 if dur > 1 else 0.0
+            return video_scene_dict, {video_token: stats}
 
         def __len__(self):
             return len(self.video_infos)
@@ -366,10 +385,35 @@ class ProduceVideoSceneDict:
             collate_fn=lambda x: x, pin_memory=False, drop_last=False)
 
         video_scene_dict = {}
+        ProduceVideoSceneDict.frame_stats = {}   # video_token -> frame accounting of this run (see PseudoDataset)
         for batch in tqdm(dataloader, desc='Processing Videos', ncols=120):
-            video_scene_dict.update(batch[0])
+            part, stats = batch[0]
+            video_scene_dict.update(part)
+            ProduceVideoSceneDict.frame_stats.update(stats)
 
         return video_scene_dict
+
+
+def check_selected_frames(frame_stats, max_missing_frac):
+    """Frame accounting of the SELECTED videos (prefilter run). A selected video with no usable frame stops prep1 with
+    the reason -- it used to become an empty video that registration dropped as a raw-ICP outlier, so the block
+    silently trained on one pass fewer. Frames dropped for missing lidar / broken camera info are reported per video,
+    and a hole share (time of the video not covered by kept key frames) above max_missing_frac is a loud warning."""
+    empty = []
+    for vt, st in sorted(frame_stats.items()):
+        msg = (f"video {vt.rsplit('-', 1)[-1]} ({st['log_name']}): {st['n_frames']} key frames kept of "
+               f"{st['n_lidar_pcs']} lidar_pcs ({st['n_missing_lidar']} without lidar file -- ~80 % is the 2 Hz key-frame "
+               f"sampling -- {st['n_broken_cams']} with broken camera info), holes {st['hole_frac']:.0%} of the video")
+        if st['n_frames'] == 0:
+            empty.append(msg)
+        elif st['hole_frac'] > max_missing_frac:
+            say(f"[prep1] WARNING {msg}: above MTGS_MAX_KEYFRAME_HOLE_FRAC={max_missing_frac:g}", style="bold yellow")
+        else:
+            say(f"[prep1] {msg}")
+    if empty:
+        raise SystemExit("[prep1] selected video(s) without a single usable frame -- the sensor data of these logs is "
+                         "missing on this host (check the blob / stage-in), stopping instead of reconstructing without "
+                         "them:\n  " + "\n  ".join(empty))
 
 
 if __name__ == '__main__':
@@ -443,6 +487,9 @@ if __name__ == '__main__':
         video_infos = video_infos,
         num_workers = args.num_workers
     )
+    if args.prefilter and len(config.selected_videos) != 0:
+        check_selected_frames(ProduceVideoSceneDict.frame_stats,
+                              float(os.environ.get('MTGS_MAX_KEYFRAME_HOLE_FRAC', 0.05)))
 
     if isinstance(config, FrameCentralConfig):
         if config.multi_traversal_mode == 'reconstruction':

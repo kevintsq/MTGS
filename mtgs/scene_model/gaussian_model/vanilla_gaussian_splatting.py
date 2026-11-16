@@ -66,6 +66,11 @@ MCMC_MIN_OPACITY = 0.005
 #                                     far_background_cull_scale_factor = 20 m) count as dead; recipe = the full rule incl. 0.5 m
 #                                     within 100 m (3 % of the live gaussians of an MCMC model break it); off.
 MCMC_STOP_FRAC = float(_os.environ.get("MTGS_MCMC_STOP_FRAC", "0.85"))
+# Culling after densification (2026-11-16, continue_cull_post_densification, on in the MTGS recipe unless MTGS_CULL_POST=0):
+# gaussians the second half of the schedule drives transparent were never removed (13-20 % of a served model's rows ended
+# below 0.005). MTGS_CULL_POST_ALPHA: the opacity threshold of the culls after stop_split_at (0 = the config's
+# cull_alpha_thresh); during densification the config's threshold applies as before.
+CULL_POST_ALPHA = float(_os.environ.get("MTGS_CULL_POST_ALPHA", "0"))
 MCMC_NOISE_MAX_SIGMA = float(_os.environ.get("MTGS_MCMC_NOISE_MAX_SIGMA", "1.0"))
 # MTGS_MCMC_CLEANUP: each = every refinement after the relocation phase removes the dead / invalid gaussians; final = only the last
 # refinement of the run does (dead gaussians keep random-walking until then, as in gsplat).
@@ -964,7 +969,10 @@ class VanillaGaussianSplattingModel(torch.nn.Module):
         The counts for the verbose log are summed into `counts` as GPU scalars: no host sync here.
         """
         # cull transparent ones
-        culls = (torch.sigmoid(params["opacities"]) < self.ctrl_config.cull_alpha_thresh).reshape(-1)
+        thresh = self.ctrl_config.cull_alpha_thresh
+        if CULL_POST_ALPHA > 0 and self.step >= self.ctrl_config.stop_split_at:
+            thresh = CULL_POST_ALPHA
+        culls = (torch.sigmoid(params["opacities"]) < thresh).reshape(-1)
         counts["below_alpha"] = counts.get("below_alpha", 0) + culls.sum()
 
         if self.step > self.ctrl_config.refine_every * self.ctrl_config.reset_alpha_every:

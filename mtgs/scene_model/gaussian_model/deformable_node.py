@@ -3,6 +3,7 @@
 # Source code: https://github.com/OpenDriveLab/MTGS                             #
 # Copyright (c) OpenDriveLab. All rights reserved.                              #
 #-------------------------------------------------------------------------------#
+from nuplan_scripts.utils.console import say
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Type
 import warnings
@@ -15,9 +16,7 @@ from torch.nn import Parameter
 try:
     from gsplat.cuda._wrapper import spherical_harmonics
 except ImportError:
-    print("Please install gsplat>=1.0.0")
-
-from nerfstudio.utils.rich_utils import CONSOLE
+    say("Please install gsplat>=1.0.0")
 
 from .utils import quat_mult, quat_to_rotmat, interpolate_quats, ConditionalDeformNetwork
 
@@ -292,7 +291,7 @@ class DeformableSubModel(VanillaGaussianSplattingModel):
             return
         if self.step < self.ctrl_config.stop_split_at:
             if self.xys_grad_norm is None or self.vis_counts is None or self.max_2Dsize is None:
-                CONSOLE.log(f"skip refinement after for non rigid object {self.model_name}")
+                say(f"skip refinement after for non rigid object {self.model_name}")
                 return
 
         super().refinement_after(optimizers, step)

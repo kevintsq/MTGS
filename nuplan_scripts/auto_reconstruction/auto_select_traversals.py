@@ -16,6 +16,7 @@
 #      spread (date/lighting diversity), preferring more frames on ties;       #
 #   3. blocks with fewer traversals than the cap keep everything.               #
 #-------------------------------------------------------------------------------#
+from nuplan_scripts.utils.console import say
 import os
 import json
 import argparse
@@ -88,10 +89,10 @@ def select(stats, test_logs, k, require_logs=()):
         dropped = [s for s in stats if s["log"].startswith(excl) and not (exempt and _required(s))]
         kept = [s for s in stats if s["log"].startswith(excl) and exempt and _required(s)]
         if dropped:
-            print(f"[auto_select] excluding {len(dropped)} bad-weather traversals "
+            say(f"[auto_select] excluding {len(dropped)} bad-weather traversals "
                   f"({len(set(s['log'] for s in dropped))} logs)", flush=True)
         if kept:
-            print(f"[auto_select] keeping {len(kept)} bad-weather pass(es) that hold a served "
+            say(f"[auto_select] keeping {len(kept)} bad-weather pass(es) that hold a served "
                   f"scene (MTGS_EXCLUDE_EXEMPT_REQUIRED): {sorted(s['idx'] for s in kept)}", flush=True)
         drop_idx = {s["idx"] for s in dropped}
         stats = [s for s in stats if s["idx"] not in drop_idx]
@@ -143,7 +144,7 @@ def select(stats, test_logs, k, require_logs=()):
         routes = [np.asarray(r, dtype=float)[:, :2] for r in json.load(open(served)).values() if len(r)]
         if routes:
             targets = np.concatenate([targets] + routes)
-            print(f"[auto_select] coverage targets include {len(routes)} served scene routes ({served})", flush=True)
+            say(f"[auto_select] coverage targets include {len(routes)} served scene routes ({served})", flush=True)
     if len(targets) > 400:
         targets = targets[:: len(targets) // 400 + 1]
     def frames_near(pts, traj):
@@ -164,7 +165,7 @@ def select(stats, test_logs, k, require_logs=()):
             break
         pool.remove(best); chosen.append(best); cover += frames_near(targets, best["traj"])
     if targets.size:
-        print(f"[auto_select] route coverage after selection: min {int(cover.min())} / median "
+        say(f"[auto_select] route coverage after selection: min {int(cover.min())} / median "
               f"{int(np.median(cover))} frames within {COV_R:.0f} m (target {COV_K})", flush=True)
     test = [s_ for s_ in test if s_["idx"] not in {c["idx"] for c in chosen}]
     chosen += test[:max(0, k - len(chosen))]
@@ -200,7 +201,7 @@ def main():
 
     config = load_config(args.config)
     if config.selected_videos and not args.force:
-        print(f"[auto_select] {config.road_block_name}: selected_videos already set "
+        say(f"[auto_select] {config.road_block_name}: selected_videos already set "
               f"({list(config.selected_videos)}), skipping. Use --force to redo.")
         if args.manifest_out and not os.path.exists(args.manifest_out):
             stats = discover_video_stats(config, args.num_workers)
@@ -208,12 +209,12 @@ def main():
             os.makedirs(os.path.dirname(os.path.abspath(args.manifest_out)), exist_ok=True)
             with open(args.manifest_out, "w") as f:
                 f.write("\n".join(logs) + "\n")
-            print(f"[auto_select] manifest -> {args.manifest_out} ({len(logs)} logs)")
+            say(f"[auto_select] manifest -> {args.manifest_out} ({len(logs)} logs)")
         return
 
     # 1. discovery pass: all in-block traversals, db-only
     stats = discover_video_stats(config, args.num_workers)
-    print(f"[auto_select] {config.road_block_name}: {len(stats)} traversals discovered")
+    say(f"[auto_select] {config.road_block_name}: {len(stats)} traversals discovered")
 
     test_logs = set()
     if args.groups and os.path.exists(args.groups):
@@ -228,28 +229,28 @@ def main():
                 test_logs = set(g["test_logs"])
                 break
     if not test_logs:
-        print("[auto_select] WARNING: no groups json / location match; "
+        say("[auto_select] WARNING: no groups json / location match; "
               "selecting purely by diversity")
 
     require = [x for x in args.require_logs.split(",") if x]
     picked = select(stats, test_logs, args.max_traversals, require)
     if require:
         got = {s["log"] for s in stats if s["idx"] in set(picked)} & set(require)
-        print(f"[auto_select] required logs present: {len(got)}/{len(require)}")
+        say(f"[auto_select] required logs present: {len(got)}/{len(require)}")
     n_test = sum(1 for s in stats if s["idx"] in picked and s["log"] in test_logs)
-    print(f"[auto_select] picked {picked} ({n_test} from navtest logs)")
+    say(f"[auto_select] picked {picked} ({n_test} from navtest logs)")
 
     if args.manifest_out:
         logs = sorted({s["log"] for s in stats if s["idx"] in set(picked)})
         os.makedirs(os.path.dirname(os.path.abspath(args.manifest_out)), exist_ok=True)
         with open(args.manifest_out, "w") as f:
             f.write("\n".join(logs) + "\n")
-        print(f"[auto_select] manifest -> {args.manifest_out} ({len(logs)} logs)")
+        say(f"[auto_select] manifest -> {args.manifest_out} ({len(logs)} logs)")
 
     # 2. write the selection back into the config yaml
     config.selected_videos = tuple(picked)
     config.save_config(args.config)
-    print(f"[auto_select] updated {args.config}")
+    say(f"[auto_select] updated {args.config}")
 
 
 if __name__ == "__main__":

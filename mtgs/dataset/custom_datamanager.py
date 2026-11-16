@@ -4,6 +4,7 @@
 # Copyright (c) OpenDriveLab. All rights reserved.                              #
 #-------------------------------------------------------------------------------#
 from __future__ import annotations
+from nuplan_scripts.utils.console import say
 import os
 
 from dataclasses import dataclass, field
@@ -20,7 +21,6 @@ from nerfstudio.data.datamanagers.base_datamanager import TDataset
 from nerfstudio.data.datamanagers.full_images_datamanager import FullImageDatamanagerConfig, FullImageDatamanager
 from nerfstudio.data.datasets.base_dataset import InputDataset
 from nerfstudio.utils.misc import get_orig_class
-from nerfstudio.utils.rich_utils import CONSOLE
 
 from .custom_dataset import CustomInputDataset
 from .utils.dataloader import AsyncDataLoader, FixedIndicesPseudoDataloader, OnDemandDataLoader, PinnedUploader, PrefetchDataLoader
@@ -120,14 +120,14 @@ class CustomFullImageDatamanager(FullImageDatamanager, Generic[TDataset]):
         self.eval_dataparser_outputs: DataparserOutputs = self.dataparser.get_dataparser_outputs(split=self.test_split)
 
         if set(self.train_dataparser_outputs.image_filenames) == set(self.eval_dataparser_outputs.image_filenames):
-            CONSOLE.log("Train and eval images are the same.")
+            say("Train and eval images are the same.")
             self.same_train_eval = True
         else:
             self.same_train_eval = False
 
         train_cache_strategy = eval_cache_strategy = self.config.cache_strategy
         if self.config.eval_cache_strategy is not None:
-            CONSOLE.log(f"Using {self.config.eval_cache_strategy} cache strategy for evaluation")
+            say(f"Using {self.config.eval_cache_strategy} cache strategy for evaluation")
             eval_cache_strategy = self.config.eval_cache_strategy
 
         if test_mode in ["inference", "test"]:
@@ -150,7 +150,7 @@ class CustomFullImageDatamanager(FullImageDatamanager, Generic[TDataset]):
             scaling_factor = self.config.camera_res_scale_factor / (2 ** (self.config.dynamic_scaling_factor_stages - i))
             self.scaling_factors.append(scaling_factor)
 
-        CONSOLE.log(f"Scaling factors: {self.scaling_factors}")
+        say(f"Scaling factors: {self.scaling_factors}")
         self.train_dataset = self.create_train_dataset()
         self.train_dataloaders = []
         for scaling_factor in self.scaling_factors:

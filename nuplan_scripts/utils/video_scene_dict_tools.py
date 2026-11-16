@@ -3,6 +3,7 @@
 # Source code: https://github.com/OpenDriveLab/MTGS                             #
 # Copyright (c) OpenDriveLab. All rights reserved.                              #
 #-------------------------------------------------------------------------------#
+from nuplan_scripts.utils.console import say
 import os
 import copy
 import pickle
@@ -19,20 +20,20 @@ class VideoScene:
 
     def load_pickle(self, path, verbose=True):
         if verbose:
-            CONSOLE.log(f'Loading pickle from {path}')
+            say(f'Loading pickle from {path}')
         with open(path, 'rb') as f:
             self.video_scene_dict = pickle.load(f)
         return self.video_scene_dict
 
     def dump_pickle(self, path, verbose=True):
         if verbose:
-            CONSOLE.log(f'Saving pickle to {path}')
+            say(f'Saving pickle to {path}')
         with open(path, 'wb') as f:
             pickle.dump(self.video_scene_dict, f)
 
     def update_pickle_link(self, path, verbose=True):
         if verbose:
-            CONSOLE.log(f'Linking {os.path.basename(path)} to {os.path.basename(self.pickle_path)}')
+            say(f'Linking {os.path.basename(path)} to {os.path.basename(self.pickle_path)}')
         if os.path.exists(self.pickle_path) or os.path.islink(self.pickle_path):
             os.unlink(self.pickle_path)
         os.symlink(os.path.basename(path), self.pickle_path)
@@ -217,9 +218,9 @@ SCENE_DICT_FACTORY = Factory()
 
 @SCENE_DICT_FACTORY.register("filter_by_video_idx")
 def filter_by_video_idx(video_scene_dict, video_idxs):
-    CONSOLE.log(f'Select videos {video_idxs}')
+    say(f'Select videos {video_idxs}')
     if len(video_idxs) == 0:
-        CONSOLE.log('No video selected, skipping...')
+        say('No video selected, skipping...')
         return video_scene_dict
 
     idx_map = {}
@@ -259,7 +260,7 @@ def filter_low_velocity(video_scene_dict):
             last_pose = info['can_bus'][0:3]
 
         count_after_skipped = sum([1 for info in frame_infos if not info.get('skipped', False)])
-        CONSOLE.log(f'filter_low_velocity: {video_token}, {len(frame_infos)} -> {count_after_skipped}')
+        say(f'filter_low_velocity: {video_token}, {len(frame_infos)} -> {count_after_skipped}')
 
         video_scene_dict_filtered[video_token] = video_scene_dict[video_token]
     return video_scene_dict_filtered

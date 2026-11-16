@@ -3,6 +3,7 @@
 # Source code: https://github.com/OpenDriveLab/MTGS                             #
 # Copyright (c) OpenDriveLab. All rights reserved.                              #
 #-------------------------------------------------------------------------------#
+from nuplan_scripts.utils.console import say
 from concurrent.futures import ThreadPoolExecutor
 import os
 from collections import OrderedDict
@@ -12,9 +13,6 @@ import torch
 from rich.progress import track
 import threading
 import torch.multiprocessing as mp
-
-from nerfstudio.utils.rich_utils import CONSOLE
-
 
 class PinnedUploader:
     """Moves one cached sample (data dict + Cameras) to the device without a stream sync.
@@ -130,7 +128,7 @@ class AsyncDataLoader:
             drop_last=False,
             collate_fn=collate_fn,
         )
-        CONSOLE.log(f'Start async loading images.')
+        say(f'Start async loading images.')
         self._start_loading()
 
     def _start_loading(self):
@@ -140,7 +138,7 @@ class AsyncDataLoader:
                     if idx not in self.cache:  # Only cache if not already cached
                         assert batch is not None
                         self._remember(idx, batch)
-            CONSOLE.log(f'Async loading images finished.', style='bold green')
+            say(f'Async loading images finished.', style='bold green')
 
         self.thread = threading.Thread(target=load_data, daemon=True)
         self.thread.start()
@@ -218,14 +216,8 @@ class PrefetchDataLoader:
         self.upcoming = set()                   # predicted next indices: never evicted
         self.pool = _Pool(max_workers=max(1, int(self.datamanager.config.num_workers) or 4), thread_name_prefix="mtgs_cache")
         self.stats = dict(hit=0, wait=0, miss=0, wait_s=0.0, miss_s=0.0)
-        # print, not CONSOLE.log: rich draws from python's global random for every styled render (Style ids), and the
-        # training sampler draws its images from that same state -- an extra console line changes the image order
-        print(f"[image cache] capped at {self.cache_max} of {len(self.dataset)} samples (MTGS_CACHE_MAX_IMAGES): "
+        say(f"[image cache] capped at {self.cache_max} of {len(self.dataset)} samples (MTGS_CACHE_MAX_IMAGES): "
               "decoded ahead of the sampler instead of prefetching everything", flush=True)
-        # the same (empty) progress bar the full prefetch renders: its rich rendering draws from python's global random, and
-        # the training sampler continues from that state -- with it the capped run trains on the same image sequence
-        for _ in track(range(len(self.dataset)), description="Prefetching data", total=len(self.dataset)):
-            pass
 
     def _store(self, idx, data):
         with self.lock:
@@ -301,5 +293,5 @@ class PrefetchDataLoader:
         """Every 2000 samples: how often the training thread waited (wait = decode in flight, miss = not predicted)."""
         st = self.stats; n = st["hit"] + st["wait"] + st["miss"]
         if n % 2000 == 0:
-            print(f"[image cache] {n} samples: resident {st['hit']}, waited {st['wait']} ({st['wait_s']:.1f} s), "
+            say(f"[image cache] {n} samples: resident {st['hit']}, waited {st['wait']} ({st['wait_s']:.1f} s), "
                   f"decoded on the spot {st['miss']} ({st['miss_s']:.1f} s)", flush=True)   # print: see _init_capped

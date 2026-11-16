@@ -3,6 +3,7 @@
 # Source code: https://github.com/OpenDriveLab/MTGS                             #
 # Copyright (c) OpenDriveLab. All rights reserved.                              #
 #-------------------------------------------------------------------------------#
+from nuplan_scripts.utils.console import say
 import os
 import sys
 import shutil
@@ -60,7 +61,7 @@ def run_point_triangulator(
 
     colmap_exe = "colmap.bat" if platform.system() == "Windows" else "colmap"
 
-    print("extracting features...")
+    say("extracting features...")
     colmap_feature_extractor_args = [
         colmap_exe, "feature_extractor",
         "--database_path", f"{colmap_path}/database.db",
@@ -77,11 +78,11 @@ def run_point_triangulator(
         from nuplan_scripts.utils.colmap_utils.bundle_adjustment import _normalize_rigs
         _normalize_rigs(f"{colmap_path}/database.db")
     except subprocess.CalledProcessError as e:
-        print(f"Error executing colmap feature_extractor: {e}")
+        say(f"Error executing colmap feature_extractor: {e}")
         sys.exit(1)
 
 
-    print("feature matching...")
+    say("feature matching...")
     colmap_matches_importer_args = [
         colmap_exe, "matches_importer",
         "--database_path", f"{colmap_path}/database.db",
@@ -92,7 +93,7 @@ def run_point_triangulator(
     try:
         _run_colmap(colmap_matches_importer_args, colmap_path, check=True)
     except subprocess.CalledProcessError as e:
-        print(f"Error executing colmap matches_importer: {e}")
+        say(f"Error executing colmap matches_importer: {e}")
         sys.exit(1)
 
     if os.path.exists(os.path.join(colmap_path, output_model)):
@@ -100,7 +101,7 @@ def run_point_triangulator(
 
     os.makedirs(os.path.join(colmap_path, output_model, "0"), exist_ok=True)
 
-    print("dropping rigs from database to prevent crash...")
+    say("dropping rigs from database to prevent crash...")
     try:
         import sqlite3
         conn = sqlite3.connect(f"{colmap_path}/database.db")
@@ -110,7 +111,7 @@ def run_point_triangulator(
         conn.commit()
         conn.close()
     except Exception as e:
-        print(f"Failed to drop rigs: {e}")
+        say(f"Failed to drop rigs: {e}")
 
     colmap_point_triangulator_args = [
         colmap_exe, "point_triangulator",
@@ -138,7 +139,7 @@ def run_point_triangulator(
             "--output_path", f"{colmap_path}/{output_model}/0",
             ], colmap_path, check=True)
     except subprocess.CalledProcessError as e:
-        print(f"Error executing colmap_point_triangulator_args: {e}")
+        say(f"Error executing colmap_point_triangulator_args: {e}")
         sys.exit(1)
 
 

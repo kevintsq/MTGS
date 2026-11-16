@@ -3,6 +3,7 @@
 # Source code: https://github.com/OpenDriveLab/MTGS                             #
 # Copyright (c) OpenDriveLab. All rights reserved.                              #
 #-------------------------------------------------------------------------------#
+from nuplan_scripts.utils.console import say
 import os
 import shutil
 import argparse
@@ -159,7 +160,7 @@ def run_reconstruction(task_manager, gpu_manager, args):
 
     success = True
     try:
-        CONSOLE.log(f'Reconstruction for {config_id} started (GPU {gpu_id})')
+        say(f'Reconstruction for {config_id} started (GPU {gpu_id})')
         start_time = time.time()
         command = [
             "bash",
@@ -180,10 +181,10 @@ def run_reconstruction(task_manager, gpu_manager, args):
             if process.returncode != 0:
                 raise Exception(f'Reconstruction for {config_id} failed')
         end_time = time.time()
-        CONSOLE.log(f'{config_id} done (GPU {gpu_id}) in {end_time - start_time:.2f} seconds')
+        say(f'{config_id} done (GPU {gpu_id}) in {end_time - start_time:.2f} seconds')
 
     except Exception as e:
-        CONSOLE.log(f'[ERROR] Reconstruction for {config_id} failed: {e}')
+        say(f'[ERROR] Reconstruction for {config_id} failed: {e}')
         success = False
     finally:
         gpu_manager.release_gpu(gpu_lock_file)
@@ -193,7 +194,7 @@ def run_reconstruction(task_manager, gpu_manager, args):
 
 def worker_process(task_manager, gpu_manager, args, worker_id):
     """Worker process that continuously processes tasks from queue"""
-    CONSOLE.log(f'Worker {worker_id} started')
+    say(f'Worker {worker_id} started')
     
     while True:
         try:
@@ -205,17 +206,17 @@ def worker_process(task_manager, gpu_manager, args, worker_id):
                 # Check if we should keep trying or exit
                 available_count = len(task_manager.get_available_tasks())
                 if available_count == 0:
-                    CONSOLE.log(f'Worker {worker_id}: No more tasks available, exiting')
+                    say(f'Worker {worker_id}: No more tasks available, exiting')
                     break
                 continue
                 
-            CONSOLE.log(f'Worker {worker_id}: Task completed successfully')
+            say(f'Worker {worker_id}: Task completed successfully')
                 
         except Exception as e:
-            CONSOLE.log(f'Worker {worker_id} error: {e}')
+            say(f'Worker {worker_id} error: {e}')
             time.sleep(1)
     
-    CONSOLE.log(f'Worker {worker_id} finished')
+    say(f'Worker {worker_id} finished')
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
@@ -233,14 +234,14 @@ if __name__ == '__main__':
     
     # Get initial count of available tasks (for display only)
     initial_available_tasks = task_manager.get_available_tasks()
-    CONSOLE.log(f"Found {len(initial_available_tasks)} available tasks out of {len(task_manager.configs)} total tasks")
+    say(f"Found {len(initial_available_tasks)} available tasks out of {len(task_manager.configs)} total tasks")
     
     if not initial_available_tasks:
-        CONSOLE.log("No available tasks to process. All tasks are either completed or running.")
+        say("No available tasks to process. All tasks are either completed or running.")
         exit(0)
 
     available_devices = torch.cuda.device_count()
-    CONSOLE.log(f"Found {available_devices} GPU devices")
+    say(f"Found {available_devices} GPU devices")
 
     # Clean up old locks
     if os.path.exists(f'{os.path.expanduser("~")}/.cache/gpu_locks'):
@@ -248,7 +249,7 @@ if __name__ == '__main__':
 
     # Determine number of workers
     num_workers = available_devices
-    CONSOLE.log(f"Starting {num_workers} worker processes")
+    say(f"Starting {num_workers} worker processes")
     
     # Create shared managers
     gpu_manager = GPUManager(lock_dir=f'{os.path.expanduser("~")}/.cache/gpu_locks')
@@ -264,6 +265,6 @@ if __name__ == '__main__':
     for p in processes:
         p.join()
     
-    CONSOLE.log("All worker processes completed")
+    say("All worker processes completed")
 
     shutil.rmtree(f'{os.path.expanduser("~")}/.cache/gpu_locks')

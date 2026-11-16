@@ -3,6 +3,7 @@
 # Source code: https://github.com/OpenDriveLab/MTGS                             #
 # Copyright (c) OpenDriveLab. All rights reserved.                              #
 #-------------------------------------------------------------------------------#
+from nuplan_scripts.utils.console import say
 import atexit
 import json
 import os
@@ -52,7 +53,7 @@ class CoverAwareSampler:
                 self.queue = torch.multinomial(w, self.block, replacement=True).tolist()   # the one host sync per block
                 if sum(self.mined) % (40 * self.block) == 0:
                     q = e.quantile(torch.tensor([0.5, 0.9, 0.99, 1.0], device=e.device)).tolist()
-                    print(f"[view-cover] step {self.k}: excess rarity p50/90/99/max {[round(x, 4) for x in q]}, scored {int(known.sum())}/{self.n}", flush=True)
+                    say(f"[view-cover] step {self.k}: excess rarity p50/90/99/max {[round(x, 4) for x in q]}, scored {int(known.sum())}/{self.n}", flush=True)
             idx = self.queue.pop(); self.mined[idx] += 1
         if idx is None:
             idx = self.base.get_next_image_idx()
@@ -85,7 +86,7 @@ class CoverAwareSampler:
                      score=None if self.score is None else self.score.tolist())
             json.dump(d, open(self.log + ".tmp", "w")); os.replace(self.log + ".tmp", self.log)
         except Exception as e:   # never take the training down for a log
-            print(f"[view-cover] dump failed: {e}", flush=True)
+            say(f"[view-cover] dump failed: {e}", flush=True)
 
 def _peek(sampler, k, state_attrs):
     """The next k indices `sampler` will return, without changing it or python's random state (the training's only

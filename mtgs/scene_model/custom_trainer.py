@@ -3,6 +3,7 @@
 # Source code: https://github.com/OpenDriveLab/MTGS                             #
 # Copyright (c) OpenDriveLab. All rights reserved.                              #
 #-------------------------------------------------------------------------------#
+from nuplan_scripts.utils.console import say
 import time
 import copy
 import gc
@@ -22,7 +23,7 @@ from nerfstudio.engine.optimizers import Optimizers
 from nerfstudio.utils.decorators import check_main_thread
 from nerfstudio.engine.callbacks import TrainingCallbackAttributes
 from nerfstudio.utils import profiler, writer
-from nerfstudio.utils.rich_utils import CONSOLE
+
 from mtgs.custom_viewer.viewer import Viewer
 from mtgs.utils.ckpt_io import load_ckpt
 
@@ -172,7 +173,7 @@ class CustomTrainer(Trainer):
         if os.environ.get("MTGS_RESUMED") == "1" and self.config.max_num_iterations == 0:
             self.training_state = "completed"
             self.save_checkpoint(self.step)
-            CONSOLE.print(f"[resume] run already finished at step {self.step}: final checkpoint rewritten, nothing to train", style="bold yellow")
+            say(f"[resume] run already finished at step {self.step}: final checkpoint rewritten, nothing to train", style="bold yellow")
             return
         super().train()
 
@@ -191,9 +192,9 @@ class CustomTrainer(Trainer):
         # stop; the run resumes from the last periodic mirror. MTGS_SIGTERM_SAVE=1 tries the save anyway.
         if os.environ.get("MTGS_SIGTERM_SAVE") == "1":
             self._term = True
-            CONSOLE.print("[preempt] SIGTERM received: saving to the mirror at the next step boundary", style="bold yellow")
+            say("[preempt] SIGTERM received: saving to the mirror at the next step boundary", style="bold yellow")
         else:
-            CONSOLE.print("[preempt] SIGTERM received: exiting; resume will use the last mirrored checkpoint", style="bold yellow")
+            say("[preempt] SIGTERM received: exiting; resume will use the last mirrored checkpoint", style="bold yellow")
             os._exit(143)
 
     def _ckpt_dict(self, step: int, completed: bool) -> dict:
@@ -259,8 +260,8 @@ class CustomTrainer(Trainer):
                 torch.save(host, ckpt_path)
                 break
             except Exception as e:
-                CONSOLE.log(f"[ERROR] saving checkpoint on attempt {attempt + 1}", style="bold red")
-                CONSOLE.print(e)
+                say(f"[ERROR] saving checkpoint on attempt {attempt + 1}", style="bold red")
+                say(e)
                 if attempt == 4:
                     self._save_error = e
                     return
@@ -298,7 +299,7 @@ class CustomTrainer(Trainer):
         tmp = self._mirror / f".step-{step:09d}.partial"
         torch.save(self._ckpt_dict(step, completed=False), tmp)
         self._mirror_install(tmp, step)
-        CONSOLE.print(f"[preempt] saved step {step} to {self._mirror} in {time.time() - t0:.1f} s; exiting for requeue", style="bold yellow")
+        say(f"[preempt] saved step {step} to {self._mirror} in {time.time() - t0:.1f} s; exiting for requeue", style="bold yellow")
         os._exit(143)
 
     # MTGS_SYNC_DEBUG=<step>: report every host<->GPU synchronisation made during steps
@@ -326,7 +327,7 @@ class CustomTrainer(Trainer):
                          "loss": {k: float(v) for k, v in loss_dict.items()}}
             bad = {k: v for k, v in self._dbg["loss"].items() if not math.isfinite(v)}
             if bad:
-                print(f"[nan-debug] step {step} NON-FINITE LOSS {bad} cam {self._dbg['cam']}", flush=True)
+                say(f"[nan-debug] step {step} NON-FINITE LOSS {bad} cam {self._dbg['cam']}", flush=True)
             return model_outputs, loss_dict, metrics_dict
         self.pipeline.get_train_loss_dict = wrapped
 
@@ -335,7 +336,7 @@ class CustomTrainer(Trainer):
                 fin = torch.isfinite(grad)
                 if not bool(fin.all()):
                     rows = (~fin.reshape(grad.shape[0], -1).all(1)).nonzero().flatten().tolist() if grad.dim() > 1 else []
-                    print(f"[nan-debug] step {self._dbg['step']} {name} grad non-finite: {int((~fin).sum())} values, rows {rows[:8]} "
+                    say(f"[nan-debug] step {self._dbg['step']} {name} grad non-finite: {int((~fin).sum())} values, rows {rows[:8]} "
                           f"(of {grad.shape[0]}); loss {self._dbg['loss']}; cam {self._dbg['cam']}", flush=True)
                 return grad
             return hook
@@ -346,7 +347,7 @@ class CustomTrainer(Trainer):
             gp = getattr(gm, "gauss_params", None)
             if gp is not None and "means" in gp:
                 gp["means"].register_hook(make_hook(f"{mname}.means"))
-        print("[nan-debug] hooks installed", flush=True)
+        say("[nan-debug] hooks installed", flush=True)
 
     def train_iteration(self, step: int):
         if self._term:   # SIGTERM arrived during the previous step: its state is complete, save it and leave
@@ -364,7 +365,7 @@ class CustomTrainer(Trainer):
         # loss table is printed here (one GPU sync per MTGS_LOSS_LOG_EVERY steps; 0 = off).
         if self._loss_every and step % self._loss_every == 0:
             terms = " ".join(f"{k}={float(v):.4g}" for k, v in out[1].items())
-            print(f"[loss] step {step} total={float(out[0]):.4g} {terms}", flush=True)
+            say(f"[loss] step {step} total={float(out[0]):.4g} {terms}", flush=True)
         if self._sync_debug is not None and step == self._sync_debug + 3:
             torch.cuda.set_sync_debug_mode(0)
         return out
@@ -494,7 +495,7 @@ class CustomTrainer(Trainer):
         if load_dir is not None:
             load_step = self.config.load_step
             if load_step is None:
-                print("Loading latest Nerfstudio checkpoint from load_dir...")
+                say("Loading latest Nerfstudio checkpoint from load_dir...")
                 # NOTE: this is specific to the checkpoint name format
                 load_step = sorted(int(x[x.find("-") + 1 : x.find(".")]) for x in os.listdir(load_dir))[-1]
             load_path: Path = load_dir / f"step-{load_step:09d}.ckpt"
@@ -505,7 +506,7 @@ class CustomTrainer(Trainer):
             load_path = load_checkpoint
             loaded_state = load_ckpt(load_path)
         else:
-            CONSOLE.print("No Nerfstudio checkpoint to load, so training from scratch.")
+            say("No Nerfstudio checkpoint to load, so training from scratch.")
             return
         # load the checkpoints for pipeline, optimizers, and gradient scalar
         self._start_step = loaded_state["step"] + 1
@@ -522,7 +523,7 @@ class CustomTrainer(Trainer):
             self.optimizers.load_schedulers(loaded_state["schedulers"])
         if "scalers" in loaded_state:
             self.grad_scaler.load_state_dict(loaded_state["scalers"])
-        CONSOLE.print(f"Done loading Nerfstudio checkpoint from {load_path}")
+        say(f"Done loading Nerfstudio checkpoint from {load_path}")
         if os.environ.get("MTGS_RESUMED") == "1":
             # the run's config.yml must not keep pointing at the mirror checkpoint it resumed from: the render /
             # eval / export stages read config.yml and would look for that step in nerfstudio_models (pa_loc_0191,
@@ -532,7 +533,7 @@ class CustomTrainer(Trainer):
             try:
                 self.config.save_config()
             except Exception as e:   # never let bookkeeping stop a resumed run
-                CONSOLE.print(f"[resume] could not rewrite config.yml: {e}")
+                say(f"[resume] could not rewrite config.yml: {e}")
         if os.environ.get("MTGS_RESUMED") == "1":
             # nerfstudio trains range(start, start + max_num_iterations): shorten it so a resumed run ends at
             # the original final step instead of running a full schedule on top of the checkpoint
@@ -542,4 +543,4 @@ class CustomTrainer(Trainer):
             # runs no step at all, so without this the finished model was saved as step 0 (Civo v2_07, 2026-10-30)
             # and a later resume would have retrained the whole schedule on top of it
             self.step = self._start_step - 1
-            CONSOLE.print(f"[resume] step {self._start_step} of {total}: {self.config.max_num_iterations} steps left", style="bold yellow")
+            say(f"[resume] step {self._start_step} of {total}: {self.config.max_num_iterations} steps left", style="bold yellow")

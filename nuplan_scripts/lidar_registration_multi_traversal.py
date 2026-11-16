@@ -3,6 +3,7 @@
 # Source code: https://github.com/OpenDriveLab/MTGS                             #
 # Copyright (c) OpenDriveLab. All rights reserved.                              #
 #-------------------------------------------------------------------------------#
+from nuplan_scripts.utils.console import say
 import os
 import sys
 import copy
@@ -58,7 +59,7 @@ def _relative_tilt_offsets(video_scene_dict, result_poses):
     common = np.mean(np.stack(list(med.values())), axis=0)
     rel = {vt: m - common for vt, m in med.items()}
     for vt, r in rel.items():
-        CONSOLE.log(f"[level] {vt.split('-')[-1]}: pitch {np.degrees(r[0]):+.2f} deg, "
+        say(f"[level] {vt.split('-')[-1]}: pitch {np.degrees(r[0]):+.2f} deg, "
                     f"roll {np.degrees(r[1]):+.2f} deg, z {r[2]:+.2f} m "
                     f"(common removed: pitch {np.degrees(common[0]):+.2f} deg, z {common[2]:+.2f} m)")
     return rel
@@ -105,7 +106,7 @@ def _common_drift(video_scene_dict, result_poses, radius=20.0, min_neighbours=12
             idx = tree.query(xy[k], k=min(min_neighbours, len(tokens)))[1]
         common[tok] = np.median(delta[np.atleast_1d(idx)], axis=0)
     c = np.asarray(list(common.values()))
-    CONSOLE.log(f"[level2] common drift over the block: pitch {np.degrees(c[:,0].min()):+.2f}..{np.degrees(c[:,0].max()):+.2f} deg, "
+    say(f"[level2] common drift over the block: pitch {np.degrees(c[:,0].min()):+.2f}..{np.degrees(c[:,0].max()):+.2f} deg, "
                 f"roll {np.degrees(c[:,1].min()):+.2f}..{np.degrees(c[:,1].max()):+.2f} deg, z {c[:,2].min():+.2f}..{c[:,2].max():+.2f} m")
     return common
 
@@ -171,7 +172,7 @@ def calculate_errors(video_scene_dict: dict, result_poses_dict: dict):
     for video_token, errors in error_dict.items():
         table.add_row([int(video_token.split('-')[-1]), errors['max_end_point_error'], errors['mean_error'], errors['mean_heading_error']])
     table.add_row(["Total", max(total_errors), np.mean(total_errors), np.mean(total_heading_errors)])
-    print(table)
+    say(table)
     return error_dict
 
 _LAST_ALIGN_T = np.eye(4)
@@ -317,7 +318,7 @@ def _apply_vehicle_yaw_fix(ego2global, lidar2ego, cams, log_name):
             cam['sensor2lidar_translation'] = Rzi[:3, :3] @ tc
     if veh not in _VEH_FIX_LOGGED:
         _VEH_FIX_LOGGED.add(veh)
-        CONSOLE.log(f"[veh-yaw-fix] {veh}: body and cameras rotated {-_VEH_FIX[veh]:+.2f} deg about lidar z "
+        say(f"[veh-yaw-fix] {veh}: body and cameras rotated {-_VEH_FIX[veh]:+.2f} deg about lidar z "
                     f"(lidar2global unchanged) for log {log_name}", style="yellow")
     return E_new, L_new
 
@@ -797,7 +798,7 @@ if __name__ == '__main__':
         # global method, calls the same pairs either INVALID or a 0.57m
         # correction -- i.e. the GPS/IMU poses were already right and there is
         # no geometry here to refine against. Keep them.
-        CONSOLE.log("MTGS_SKIP_ICP=1: keeping GPS/IMU poses, no ICP refinement",
+        say("MTGS_SKIP_ICP=1: keeping GPS/IMU poses, no ICP refinement",
                     style="bold yellow")
         for video_token in video_scene_dict:
             for info in video_scene_dict[video_token]['frame_infos']:
@@ -809,7 +810,7 @@ if __name__ == '__main__':
         video_scene.update_pickle_link(video_scene.pickle_path_registered)
         sys.exit(0)
 
-    CONSOLE.log("ICP errors", style="bold green")
+    say("ICP errors", style="bold green")
     error_dict = calculate_errors(video_scene_dict, result_poses_dict)
     visualize_lidar_registration(video_scene, result_poses_dict)
 
@@ -834,7 +835,7 @@ if __name__ == '__main__':
     _mean = np.array([error_dict[vt]['mean_error'] for vt in video_scene_dict])
     epe_gate = max(PRE_EPE, PRE_REL * float(np.median(_epe)))
     mean_gate = max(PRE_MEAN, PRE_REL * float(np.median(_mean)))
-    CONSOLE.log(f"Pre-alignment outlier gates: EPE > {epe_gate:.2f} m, mean > {mean_gate:.2f} m "
+    say(f"Pre-alignment outlier gates: EPE > {epe_gate:.2f} m, mean > {mean_gate:.2f} m "
                 f"(block medians {np.median(_epe):.2f} / {np.median(_mean):.2f})")
     # Absolute ceiling on top of the relative gate (2026-10-30, w2_02: half the passes diverged to 145-189 m, the
     # block median became 73 m and the relative gate let 157 m and 145 m through). A raw EPE of tens of metres is a
@@ -848,11 +849,11 @@ if __name__ == '__main__':
     pre_dropped = {}
     if outliers and len(outliers) < len(video_scene_dict):
         for vt in outliers:
-            CONSOLE.log(f"Drop video {vt.split('-')[-1]} before alignment (raw ICP outlier).",
+            say(f"Drop video {vt.split('-')[-1]} before alignment (raw ICP outlier).",
                         style="yellow")
             pre_dropped[vt] = video_scene_dict.pop(vt)
 
-    CONSOLE.log("ICP errors after alignment", style="bold green")
+    say("ICP errors after alignment", style="bold green")
     result_poses_dict_aligned = align_poses(video_scene_dict, result_poses_dict)
     error_dict_aligned = calculate_errors(video_scene_dict, result_poses_dict_aligned)
 
@@ -870,7 +871,7 @@ if __name__ == '__main__':
         for vt in list(video_scene_dict.keys()):
             e = error_dict_aligned[vt]
             if e['mean_error'] > fb_max and e['mean_heading_error'] < 2.0:
-                CONSOLE.log(f"Traversal {vt.split('-')[-1]}: ICP moved it "
+                say(f"Traversal {vt.split('-')[-1]}: ICP moved it "
                             f"{e['mean_error']:.1f}m with only "
                             f"{e['mean_heading_error']:.1f} deg of rotation change "
                             f"(slide, not refinement) -- keeping the GPS pose.",
@@ -898,7 +899,7 @@ if __name__ == '__main__':
     # Ceilings on the relative gates (2026-10-30): when most passes are broken the median is broken too.
     qa_epe_gate = min(qa_epe_gate, max(float(os.environ.get('MTGS_REG_QA_EPE', 1.0)), float(os.environ.get('MTGS_REG_QA_ABS_EPE', 5.0))))
     qa_mean_gate = min(qa_mean_gate, max(float(os.environ.get('MTGS_REG_QA_MEAN', 0.5)), float(os.environ.get('MTGS_REG_QA_ABS_MEAN', 2.0))))
-    CONSOLE.log(f"Post-alignment QA gates: EPE > {qa_epe_gate:.2f} m, mean > {qa_mean_gate:.2f} m "
+    say(f"Post-alignment QA gates: EPE > {qa_epe_gate:.2f} m, mean > {qa_mean_gate:.2f} m "
                 f"(block medians {np.median(_e) if len(_e) else 0:.2f} / {np.median(_m) if len(_m) else 0:.2f})")
     for video_token in list(video_scene_dict.keys()):
         max_end_point_error = error_dict_aligned[video_token]['max_end_point_error']
@@ -928,7 +929,7 @@ if __name__ == '__main__':
     # around it before the height QA.
     _applied = _harmonize_z(video_scene_dict, result_poses_dict_aligned)
     for vt, off in _applied.items():
-        CONSOLE.log(f"Traversal {vt.split('-')[-1]}: height corrected by {-off:+.2f} m onto the other passes.", style="yellow")
+        say(f"Traversal {vt.split('-')[-1]}: height corrected by {-off:+.2f} m onto the other passes.", style="yellow")
     # Height QA: the BEV metrics above cannot see a pass that ICP settled 1-3 m
     # above or below the others (fk_loc_0185 trav 20 +3.3 m, fp_gapC_010 trav 18
     # +1.0 m passed EPE/ATE/ARE and trained a second road layer).
@@ -936,12 +937,12 @@ if __name__ == '__main__':
     if dz_gate > 0:
         for vt, dz in _z_inconsistent_videos(video_scene_dict, result_poses_dict_aligned,
                                              set(bad_videos) | gps_videos, dz_gate).items():
-            CONSOLE.log(f"Traversal {vt.split('-')[-1]}: registered {dz:+.2f} m off the other "
+            say(f"Traversal {vt.split('-')[-1]}: registered {dz:+.2f} m off the other "
                         f"traversals' height (gate {dz_gate} m) -> bad registration.", style="yellow")
             bad_videos.append(vt)
 
     if isinstance(config, FrameCentralConfig) and list(video_scene_dict.keys())[0] in bad_videos:
-        CONSOLE.log("WARNING: The central log has bad registration result. Use log pose and disable multi-traversal.", style="bold red")
+        say("WARNING: The central log has bad registration result. Use log pose and disable multi-traversal.", style="bold red")
         first_key = list(video_scene_dict.keys())[0]
         video_scene_dict = {first_key: video_scene_dict[first_key]}
     else:
@@ -971,18 +972,18 @@ if __name__ == '__main__':
                     _icp = lambda t: (_LAST_ALIGN_T @ result_poses_dict[t]) if t in result_poses_dict else None
                     fixed, rep = _map_icp_pass(v, _scans_by_token, [("icp+global", _icp), ("ins", _ins)], _map, vt)
                     if fixed is not None:
-                        CONSOLE.log(f"Restoring video {vt.split('-')[-1]} by map ICP ({len(fixed)} frames): {rep}", style="yellow")
+                        say(f"Restoring video {vt.split('-')[-1]} by map ICP ({len(fixed)} frames): {rep}", style="yellow")
                         result_poses_dict_aligned.update(fixed)
                         continue
-                    CONSOLE.log(f"Map ICP failed for video {vt.split('-')[-1]} ({rep}); falling back to GPS poses", style="bold red")
+                    say(f"Map ICP failed for video {vt.split('-')[-1]} ({rep}); falling back to GPS poses", style="bold red")
                 if keep_icp and _is_pinned(v):
-                    CONSOLE.log(f"Restoring video {vt.split('-')[-1]} on its ICP poses through the "
+                    say(f"Restoring video {vt.split('-')[-1]} on its ICP poses through the "
                                 f"global alignment ({len(v['frame_infos'])} frames, MTGS_PIN_KEEP_ICP).",
                                 style="yellow")
                     for info in v['frame_infos']:
                         result_poses_dict_aligned[info['token']] = _LAST_ALIGN_T @ result_poses_dict[info['token']]
                     continue
-                CONSOLE.log(f"Restoring video {vt.split('-')[-1]} on GPS poses "
+                say(f"Restoring video {vt.split('-')[-1]} on GPS poses "
                             f"({len(v['frame_infos'])} frames): dropped before alignment, "
                             f"but the block would be short without it.", style="yellow")
                 for info in v['frame_infos']:
@@ -1011,16 +1012,16 @@ if __name__ == '__main__':
                     _icp = lambda t: result_poses_dict_aligned.get(t)
                     fixed, rep = _map_icp_pass(_v, _scans_by_token, [("aligned icp", _icp), ("ins", _ins)], _map, video_token)
                     if fixed is not None:
-                        CONSOLE.log(f"Keeping video {video_token.split('-')[-1]} by map ICP (QA said mean {e['mean_error']:.2f} m / {e['mean_heading_error']:.2f} deg): {rep}", style="yellow")
+                        say(f"Keeping video {video_token.split('-')[-1]} by map ICP (QA said mean {e['mean_error']:.2f} m / {e['mean_heading_error']:.2f} deg): {rep}", style="yellow")
                         result_poses_dict_aligned.update(fixed)
                         continue
-                    CONSOLE.log(f"Map ICP failed for video {video_token.split('-')[-1]} ({rep}); falling back to GPS poses", style="bold red")
+                    say(f"Map ICP failed for video {video_token.split('-')[-1]} ({rep}); falling back to GPS poses", style="bold red")
                 if os.environ.get('MTGS_PIN_KEEP_ICP', '0') == '1' and _is_pinned(video_scene_dict[video_token]):
-                    CONSOLE.log(f"Keeping video {video_token.split('-')[-1]} on its aligned ICP poses "
+                    say(f"Keeping video {video_token.split('-')[-1]} on its aligned ICP poses "
                                 f"(QA said mean {e['mean_error']:.2f}m / {e['mean_heading_error']:.2f} deg; "
                                 f"MTGS_PIN_KEEP_ICP).", style="yellow")
                     continue
-                CONSOLE.log(f"Keeping video {video_token.split('-')[-1]} on GPS poses "
+                say(f"Keeping video {video_token.split('-')[-1]} on GPS poses "
                             f"(QA said mean {e['mean_error']:.2f}m / "
                             f"{e['mean_heading_error']:.2f} deg, but the block would "
                             f"otherwise be short).", style="yellow")
@@ -1030,7 +1031,7 @@ if __name__ == '__main__':
             for video_token in bad_videos:
                 if video_token in rescued:
                     continue
-                CONSOLE.log(f"Remove video {video_token.split('-')[-1]} due to bad registration result.", style="yellow")
+                say(f"Remove video {video_token.split('-')[-1]} due to bad registration result.", style="yellow")
                 video_scene_dict.pop(video_token)
             if len(video_scene_dict) == 0:
                 raise ValueError("All videos have bad registration result.")
@@ -1046,7 +1047,7 @@ if __name__ == '__main__':
             if not _trusted and len(_live) > 1:
                 _root = sorted(_live, key=lambda vt: (not _is_pinned(video_scene_dict[vt]), -len(video_scene_dict[vt]['frame_infos'])))[0]
                 _trusted.add(_root); _live.remove(_root)
-                CONSOLE.log(f"No ICP-registered pass to anchor to: video {_root.split('-')[-1]} (GPS poses) is the reference", style="yellow")
+                say(f"No ICP-registered pass to anchor to: video {_root.split('-')[-1]} (GPS poses) is the reference", style="yellow")
             for vt in sorted(_live, key=lambda vt: -len(video_scene_dict[vt]['frame_infos'])):
                 _map = _map_icp_inputs(video_scene_dict, result_poses_dict_aligned, set(video_scene_dict) - _trusted, _scans_by_token)
                 if _map is None or len(_map) < 5000:
@@ -1055,11 +1056,11 @@ if __name__ == '__main__':
                 fixed, rep = _map_icp_pass(video_scene_dict[vt], _scans_by_token, [("ins", _cur)], _map, vt)
                 if fixed is not None:
                     _d = [np.linalg.norm(fixed[t][:3, 3] - result_poses_dict_aligned[t][:3, 3]) for t in fixed if t in result_poses_dict_aligned]
-                    CONSOLE.log(f"GPS pass {vt.split('-')[-1]} registered onto the trusted passes by map ICP "
+                    say(f"GPS pass {vt.split('-')[-1]} registered onto the trusted passes by map ICP "
                                 f"(moved median {np.median(_d) if _d else 0:.2f} m, max {max(_d) if _d else 0:.2f} m): {rep}", style="yellow")
                     result_poses_dict_aligned.update(fixed); gps_videos.discard(vt); _trusted.add(vt)
                 else:
-                    CONSOLE.log(f"GPS pass {vt.split('-')[-1]} stays on GPS poses (map ICP: {rep})", style="bold red")
+                    say(f"GPS pass {vt.split('-')[-1]} stays on GPS poses (map ICP: {rep})", style="bold red")
 
         # MTGS_REG_MAP_ICP_ALL=1: inter-pass consistency sweep. The passes only agree
         # as well as the odometry chain and the x/y Kabsch let them (fq_loc_0182,
@@ -1082,9 +1083,9 @@ if __name__ == '__main__':
                         # register only against the passes vt does NOT already agree with (see _inconsistent_passes)
                         _bad, _prep = _inconsistent_passes(vt, video_scene_dict, result_poses_dict_aligned, _scans_by_token, _clouds)
                         if not _bad:
-                            CONSOLE.log(f"Sweep {_sw + 1}: video {vt.split('-')[-1]} agrees with every overlapping pass ({_prep}), left as is", style="yellow")
+                            say(f"Sweep {_sw + 1}: video {vt.split('-')[-1]} agrees with every overlapping pass ({_prep}), left as is", style="yellow")
                             continue
-                        CONSOLE.log(f"Sweep {_sw + 1}: video {vt.split('-')[-1]} disagrees with {[u.split('-')[-1] for u in _bad]} ({_prep}); registering onto them", style="yellow")
+                        say(f"Sweep {_sw + 1}: video {vt.split('-')[-1]} disagrees with {[u.split('-')[-1] for u in _bad]} ({_prep}); registering onto them", style="yellow")
                         _excl = set(video_scene_dict) - set(_bad)
                     _map = _map_icp_inputs(video_scene_dict, result_poses_dict_aligned, _excl, _scans_by_token, _parts)
                     if _map is None or len(_map) < 5000:
@@ -1093,17 +1094,17 @@ if __name__ == '__main__':
                     fixed, rep = _map_icp_pass(v, _scans_by_token, [("aligned", _cur)], _map, vt)
                     if fixed is not None:
                         _d = [np.linalg.norm(fixed[t][:3, 3] - result_poses_dict_aligned[t][:3, 3]) for t in fixed if t in result_poses_dict_aligned]
-                        CONSOLE.log(f"Sweep {_sw + 1}: video {vt.split('-')[-1]} moved onto the other passes "
+                        say(f"Sweep {_sw + 1}: video {vt.split('-')[-1]} moved onto the other passes "
                                     f"(median {np.median(_d) if _d else 0:.2f} m, max {max(_d) if _d else 0:.2f} m): {rep}", style="yellow")
                         result_poses_dict_aligned.update(fixed); _clouds.pop(vt, None)
                     else:
-                        CONSOLE.log(f"Sweep {_sw + 1}: video {vt.split('-')[-1]} left as is ({rep})", style="yellow")
+                        say(f"Sweep {_sw + 1}: video {vt.split('-')[-1]} left as is ({rep})", style="yellow")
             # the sweeps move passes onto each other, which can carry the whole block
             # off the INS by a common offset (synthetic: 1.4 m); re-anchor with the same
             # x/y Kabsch the block was aligned with, so fallback placement stays valid
             result_poses_dict_aligned = align_poses(video_scene_dict, result_poses_dict_aligned)
             _e = calculate_errors(video_scene_dict, result_poses_dict_aligned)
-            CONSOLE.log("After the consistency sweeps (vs INS): " + ", ".join(
+            say("After the consistency sweeps (vs INS): " + ", ".join(
                 f"{vt.split('-')[-1]}: {_e[vt]['mean_error']:.2f} m" for vt in video_scene_dict), style="yellow")
 
         # MTGS_REG_LEVEL: 0 = full ICP, 1 = INS attitude + one constant per traversal

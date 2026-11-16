@@ -3,6 +3,7 @@
 # Source code: https://github.com/OpenDriveLab/MTGS                             #
 # Copyright (c) OpenDriveLab. All rights reserved.                              #
 #-------------------------------------------------------------------------------#
+from nuplan_scripts.utils.console import say
 import os
 import argparse
 from pathlib import Path
@@ -24,7 +25,7 @@ if __name__ == '__main__':
     reconstruction_dir = os.path.join(config.data_root, recon_subdir, config.road_block_name)
     nerfstudio_config = Path(reconstruction_dir) / 'config.yml'
 
-    CONSOLE.log("Rendering background reconstruction model.", style='bold magenta')
+    say("Rendering background reconstruction model.", style='bold magenta')
     from mtgs.tools.render import RenderInterpolated
     render = RenderInterpolated(
         load_config=nerfstudio_config,
@@ -33,7 +34,7 @@ if __name__ == '__main__':
     render.main()
 
     if os.environ.get('MTGS_SKIP_EVAL') != '1':
-        CONSOLE.log("Evaluating background reconstruction model.", style='bold magenta')
+        say("Evaluating background reconstruction model.", style='bold magenta')
         import json
         from nerfstudio.utils.eval_utils import eval_setup
 
@@ -50,4 +51,4 @@ if __name__ == '__main__':
             "checkpoint": str(checkpoint_path),
             "results": metrics_dict,
         }, indent=2), "utf8")
-        CONSOLE.print(f"Saved results to: {output_path}")
+        say(f"Saved results to: {output_path}")

@@ -13,6 +13,7 @@ the dataparser's use_colmap_pose, which the caller sets from the same gate.
 
   restore_ins_poses.py <video_scene_dict.pkl> [--drop-colmap-param]
 """
+from nuplan_scripts.utils.console import say
 import pickle, sys
 import numpy as np
 from pyquaternion import Quaternion
@@ -36,5 +37,5 @@ for v in vsd.values():
                 cam.pop("colmap_param", None)
         n += 1
 pickle.dump(vsd, open(path, "wb"))
-print(f"restored INS poses for {n} frames"
+say(f"restored INS poses for {n} frames"
       + (" (colmap_param dropped)" if drop else " (colmap_param kept)"))

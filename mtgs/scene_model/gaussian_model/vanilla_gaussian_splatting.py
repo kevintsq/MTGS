@@ -3,6 +3,7 @@
 # Source code: https://github.com/OpenDriveLab/MTGS                             #
 # Copyright (c) OpenDriveLab. All rights reserved.                              #
 #-------------------------------------------------------------------------------#
+from nuplan_scripts.utils.console import say
 import math
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Type
@@ -16,14 +17,13 @@ from torch.nn import Parameter
 try:
     from gsplat.cuda._wrapper import spherical_harmonics
 except ImportError:
-    print("Please install gsplat>=1.0.0")
+    say("Please install gsplat>=1.0.0")
 
 from nerfstudio.engine.callbacks import TrainingCallback, TrainingCallbackAttributes, TrainingCallbackLocation
 from nerfstudio.engine.optimizers import Optimizers
 
 # need following import for background color override
 from nerfstudio.configs.base_config import InstantiateConfig, PrintableConfig
-from nerfstudio.utils.rich_utils import CONSOLE
 
 from .utils import num_sh_bases, random_quat_tensor, matrix_to_quaternion, rotate_vector_to_vector, RGB2SH, quat_to_rotmat
 import os as _os
@@ -229,7 +229,7 @@ class VanillaGaussianSplattingModel(torch.nn.Module):
             _, first = np.unique(xyz.detach().cpu().numpy(), axis=0, return_index=True)
             if len(first) < xyz.shape[0]:
                 keep = torch.from_numpy(np.sort(first)).to(xyz.device)
-                CONSOLE.log(f"init points: dropped {xyz.shape[0] - len(keep)} exact duplicates of {xyz.shape[0]}")
+                say(f"init points: dropped {xyz.shape[0] - len(keep)} exact duplicates of {xyz.shape[0]}")
                 # in place: subclasses (MultiColorGaussianSplatting) size their own parameters from the caller's dict
                 for k, v in list(points_3d.items()):
                     if torch.is_tensor(v) and v.dim() >= 1 and v.shape[0] == xyz.shape[0]:
@@ -250,7 +250,7 @@ class VanillaGaussianSplattingModel(torch.nn.Module):
             shs[:, 0, :3] = RGB2SH(points_3d['rgb'] / 255)
             shs[:, 1:, 3:] = 0.0
         else:
-            CONSOLE.log("use color only optimization with sigmoid activation")
+            say("use color only optimization with sigmoid activation")
             shs[:, 0, :3] = torch.logit(points_3d['rgb'] / 255, eps=1e-10)
         
         # .contiguous(): these are views into shs; the fused Adam kernel
@@ -634,8 +634,8 @@ class VanillaGaussianSplattingModel(torch.nn.Module):
             if self.step < self.ctrl_config.stop_split_at:
                 # then we densify
                 if self.config.verbose:
-                    CONSOLE.log(f"[=================== INFO for {self.model_name_abbr} <{self.model_type}> ===================]")
-                    CONSOLE.log(f"Do densification at step {self.step}")
+                    say(f"[=================== INFO for {self.model_name_abbr} <{self.model_type}> ===================]")
+                    say(f"Do densification at step {self.step}")
                 assert self.xys_grad_norm is not None and self.vis_counts is not None and self.max_2Dsize is not None
                 # avg_grad_norm = (self.xys_grad_norm / self.vis_counts) * 0.5 * max(self.last_size[0], self.last_size[1])
                 avg_grad_norm = self.xys_grad_norm / self.vis_counts
@@ -653,7 +653,7 @@ class VanillaGaussianSplattingModel(torch.nn.Module):
                         if budget > 0:
                             high_grads[hg[torch.topk(avg_grad_norm.reshape(-1)[hg], budget).indices]] = True
                         if self.step % (10 * self.ctrl_config.refine_every) == 0:
-                            CONSOLE.log(f"[cap {self.model_name}] step {self.step}: {hg.numel()} candidates, budget {budget}, n {self.num_points}")
+                            say(f"[cap {self.model_name}] step {self.step}: {hg.numel()} candidates, budget {budget}, n {self.num_points}")
 
                 splits = (self.scales.exp().max(dim=-1).values > self.ctrl_config.densify_size_thresh).reshape(-1)
                 splits &= high_grads
@@ -699,7 +699,7 @@ class VanillaGaussianSplattingModel(torch.nn.Module):
                     self.opacities.data.copy_(torch.logit(op.clamp(min=1e-6, max=1.0 - 1e-6)))
             elif self.step < self.ctrl_config.stop_split_at and self.step % reset_interval == self.ctrl_config.refine_every:
                 if self.config.verbose:
-                    CONSOLE.log(f"Reset opacity at step {self.step}")
+                    say(f"Reset opacity at step {self.step}")
                 # Reset value is set to be twice of the cull_alpha_thresh
                 reset_value = self.ctrl_config.cull_alpha_thresh * 2.0
                 # math.log: same float32 bound as torch.logit(...).item() without the GPU round trip; in place
@@ -721,10 +721,10 @@ class VanillaGaussianSplattingModel(torch.nn.Module):
                 read = dict(zip(keys, torch.stack([counts[k].float() for k in keys]).tolist()))  # one sync
                 if extra_cull is not None:
                     n_split, n_dup = split_idx.numel(), dup_idx.numel()
-                    CONSOLE.log(f"avg_grad_norm: {read['avg_grad_norm']}")
-                    CONSOLE.log(f"Splitting {n_split / n_old} gaussians: {n_split}/{n_old}")
-                    CONSOLE.log(f"Duplicating {n_dup / n_old} gaussians: {n_dup}/{n_old}")
-                CONSOLE.log(
+                    say(f"avg_grad_norm: {read['avg_grad_norm']}")
+                    say(f"Splitting {n_split / n_old} gaussians: {n_split}/{n_old}")
+                    say(f"Duplicating {n_dup / n_old} gaussians: {n_dup}/{n_old}")
+                say(
                     f"Culled {n_before - self.num_points} gaussians "
                     f"({int(read.get('below_alpha', 0))} below alpha thresh, {int(read.get('toobigs', 0))}"
                     f"({int(read.get('toobigs_ws', 0))}, {int(read.get('toobigs_vs', 0))}) too bigs, {self.num_points} remaining)"
@@ -743,7 +743,7 @@ class VanillaGaussianSplattingModel(torch.nn.Module):
         n = grad_norm.shape[0]; dev = grad_norm.device
         if getattr(self, "_cov_cnt", None) is None or self._cov_cnt.shape[0] != n:
             if getattr(self, "_cov_cnt", None) is not None:
-                CONSOLE.log(f"[cover {self.model_name}] step {step}: {self._cov_cnt.shape[0]} -> {n} gaussians, counters restarted")
+                say(f"[cover {self.model_name}] step {step}: {self._cov_cnt.shape[0]} -> {n} gaussians, counters restarted")
             self._cov_cnt = torch.zeros(n, device=dev, dtype=torch.float32)
             self._cov_age = torch.zeros(n, device=dev, dtype=torch.float32)
             self._cov_ref = torch.full((), 1e-3, device=dev)
@@ -761,7 +761,7 @@ class VanillaGaussianSplattingModel(torch.nn.Module):
             self._cov_ref = torch.where(torch.isfinite(ref) & (ref > 0), ref, self._cov_ref)
             if step % COVER_LOG_EVERY == 0:   # log: one sync per 10k steps
                 q = torch.nanquantile(f, torch.tensor([0.05, 0.25, 0.5, 0.75, 0.95], device=dev))
-                print(f"[cover {self.model_name}] step {step}: f_g p5/25/50/75/95 {[round(float(x), 5) for x in q]} ref {float(self._cov_ref):.5f}", flush=True)   # print: rich eats the [tag] and wraps
+                say(f"[cover {self.model_name}] step {step}: f_g p5/25/50/75/95 {[round(float(x), 5) for x in q]} ref {float(self._cov_ref):.5f}", flush=True)   # print: rich eats the [tag] and wraps
         if COVER_DUMP and (step == _COVER_LAST or (step > 0 and step % 20000 == 0)):
             torch.save({"step": step, "cnt": self._cov_cnt, "age": self._cov_age, "ref": self._cov_ref, "means": self.means.detach()}, COVER_DUMP)
         return c
@@ -840,7 +840,7 @@ class VanillaGaussianSplattingModel(torch.nn.Module):
         self._mcmc_update(optimizers, lambda name, p: p[keep], lambda key, v: v[keep])
         if getattr(self, "_cov_cnt", None) is not None and self._cov_cnt.shape[0] == n_before:
             self._cov_cnt = self._cov_cnt[keep]; self._cov_age = self._cov_age[keep]
-        CONSOLE.log(f"[mcmc {self.model_name}] step {self.step}: cleanup removed {n_drop} dead / invalid gaussians, {self.num_points} left")
+        say(f"[mcmc {self.model_name}] step {self.step}: cleanup removed {n_drop} dead / invalid gaussians, {self.num_points} left")
 
     @torch.no_grad()
     def _mcmc_refine(self, optimizers):
@@ -862,7 +862,7 @@ class VanillaGaussianSplattingModel(torch.nn.Module):
         invalid = self._mcmc_invalid()
         dead = (opac <= MCMC_MIN_OPACITY) | invalid
         if self.step % (10 * self.ctrl_config.refine_every) == 0:
-            CONSOLE.log(f"[mcmc {self.model_name}] step {self.step}: {int(dead.sum())} dead of {opac.shape[0]}, of them {int(invalid.sum())} out of bound / oversized")
+            say(f"[mcmc {self.model_name}] step {self.step}: {int(dead.sum())} dead of {opac.shape[0]}, of them {int(invalid.sum())} out of bound / oversized")
         dead_idx = dead.nonzero(as_tuple=True)[0]; alive_idx = (~dead).nonzero(as_tuple=True)[0]
         n_dead = int(dead_idx.numel())
         gw = None   # gradient weight of the draw (None = opacity only, as gsplat)
@@ -872,7 +872,7 @@ class VanillaGaussianSplattingModel(torch.nn.Module):
             if bool(seen.any()):
                 gw = (g / g[seen].median().clamp_min(1e-12)).clamp(0.1, 10.0) ** MCMC_GRAD_POW
         if MCMC_SAMPLE == "grad" and self.step % (10 * self.ctrl_config.refine_every) == 0:
-            CONSOLE.log(f"[mcmc-grad {self.model_name}] step {self.step}: " + ("NO gradient statistics, opacity draw" if gw is None else
+            say(f"[mcmc-grad {self.model_name}] step {self.step}: " + ("NO gradient statistics, opacity draw" if gw is None else
                         f"weight p10/50/90 {[round(float(x), 2) for x in gw.quantile(torch.tensor([0.1, 0.5, 0.9], device=gw.device))]}"))
         if n_dead > 0 and alive_idx.numel() > 0:
             src = alive_idx[sample(opac[alive_idx] if gw is None else opac[alive_idx] * gw[alive_idx], n_dead)]
@@ -918,7 +918,7 @@ class VanillaGaussianSplattingModel(torch.nn.Module):
             if getattr(self, "_cov_cnt", None) is not None and self._cov_cnt.shape[0] == n_cur:
                 self._cov_cnt = torch.cat([self._cov_cnt, self._cov_cnt[src]]); self._cov_age = torch.cat([self._cov_age, self._cov_age[src]])
         if self.config.verbose:
-            CONSOLE.log(f"[mcmc {self.model_name}] step {self.step}: relocated {n_dead}, added {n_add}, now {self.num_points}")
+            say(f"[mcmc {self.model_name}] step {self.step}: relocated {n_dead}, added {n_add}, now {self.num_points}")
 
     @torch.no_grad()
     def _mcmc_inject_noise(self):

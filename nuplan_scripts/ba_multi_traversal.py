@@ -3,6 +3,7 @@
 # Source code: https://github.com/OpenDriveLab/MTGS                             #
 # Copyright (c) OpenDriveLab. All rights reserved.                              #
 #-------------------------------------------------------------------------------#
+from nuplan_scripts.utils.console import say
 import os
 import copy
 import shutil
@@ -196,9 +197,9 @@ def _restore_published(work, nfs_path):
             try:
                 subprocess.run(cmd, check=True)
                 restored = True
-                CONSOLE.log(f'[colmap] restored {name} from {os.path.basename(arc)}')
+                say(f'[colmap] restored {name} from {os.path.basename(arc)}')
             except Exception as exc:
-                CONSOLE.log(f'[colmap] could not restore {name}: {exc}')
+                say(f'[colmap] could not restore {name}: {exc}')
             break
     return restored and os.path.isdir(os.path.join(work, 'sfm_model'))
 
@@ -245,9 +246,9 @@ def _publish_colmap(work, nfs_path):
             cmd = ['tar', '-C', work, '--zstd', '-cf', tar, name]
         try:
             subprocess.run(cmd, check=True)
-            CONSOLE.log(f'[colmap] archived {name} -> {os.path.basename(tar)}')
+            say(f'[colmap] archived {name} -> {os.path.basename(tar)}')
         except Exception as exc:            # keep the run alive; the model is still on scratch
-            CONSOLE.log(f'[colmap] archive of {name} failed ({exc}); copying instead')
+            say(f'[colmap] archive of {name} failed ({exc}); copying instead')
             shutil.copytree(src, os.path.join(nfs_path, name), dirs_exist_ok=True)
     for log in ('colmap_ba.log', 'image_pairs.txt'):
         src = os.path.join(work, log)
@@ -305,7 +306,7 @@ def _write_rig_config(video_scene_dict, colmap_path, ref='CAM_F0'):
         rigs[veh] = {'cameras': cams}
     with open(os.path.join(colmap_path, 'rig_config.json'), 'w') as f:
         json.dump(list(rigs.values()), f, indent=1)
-    CONSOLE.log(f'[sfm rig] rig_config.json: {len(rigs)} rigs ({", ".join(rigs)}), ref {ref}')
+    say(f'[sfm rig] rig_config.json: {len(rigs)} rigs ({", ".join(rigs)}), ref {ref}')
 
 
 def _overlapping_pairs(cam_views, max_dist_scaled):
@@ -473,7 +474,7 @@ def create_colmap_model(video_scene: VideoScene, video_scene_dict, colmap_path):
 
                 progress_bar.update(1)
 
-    print(f'Filter out invalid images: {invalid_images}/{len(frame_infos) * 8}')
+    say(f'Filter out invalid images: {invalid_images}/{len(frame_infos) * 8}')
     import json as _json
     with open(f'{colmap_path}/name_to_token.json', 'w') as _f:
         _json.dump(name_to_token, _f)
@@ -508,7 +509,7 @@ def create_colmap_model(video_scene: VideoScene, video_scene_dict, colmap_path):
         candidates[j].append((iou, i))
 
     if max_dist > 0:
-        CONSOLE.log(f'[pairs] MTGS_MAX_PAIR_DIST={max_dist} m (= {max_dist * scale_factor:.4g} colmap units) dropped {n_far} overlapping pairs')
+        say(f'[pairs] MTGS_MAX_PAIR_DIST={max_dist} m (= {max_dist * scale_factor:.4g} colmap units) dropped {n_far} overlapping pairs')
     pairs = set()
     if max_per_image <= 0:
         for i, lst in candidates.items():
@@ -530,7 +531,7 @@ def create_colmap_model(video_scene: VideoScene, video_scene_dict, colmap_path):
             for _iou, j in keep:
                 a, b = sorted((cam_views[i]['token'], cam_views[j]['token']))
                 pairs.add((a, b))
-        CONSOLE.log(f'[pairs] capped at {max_per_image} per image -> {len(pairs)} pairs '
+        say(f'[pairs] capped at {max_per_image} per image -> {len(pairs)} pairs '
                     f'for {len(cam_views)} images')
 
     f_pairs = open(f'{colmap_path}/image_pairs.txt', 'w')
@@ -619,7 +620,7 @@ def _rigidity_gate(frame_infos, images_aligned, rigid_m, video_token=''):
         q = np.stack([d for _, c, d in devs if c == cam])
         sys_off[cam] = np.median(q, axis=0) if len(q) >= 5 else np.zeros(3)
         if np.linalg.norm(sys_off[cam]) > 0.3:
-            CONSOLE.log(f'[sfm align] {video_token} {cam}: constant offset {np.linalg.norm(sys_off[cam]):.2f} m from the calibrated '
+            say(f'[sfm align] {video_token} {cam}: constant offset {np.linalg.norm(sys_off[cam]):.2f} m from the calibrated '
                         f'rig ({np.round(sys_off[cam], 2).tolist()} in the ego frame), kept; outliers are judged around it')
     n = 0
     for info, cam, d_ in devs:
@@ -639,12 +640,12 @@ def align_model(video_scene: VideoScene, video_scene_dict, colmap_path, thresh=1
         if val.image_ids.shape[0] < 3:
             continue
         points3D_new[key] = val
-    print('[Read Colmap] filter {}/{} points3D, min view = {}'.format(len(points3D_new), len(points3D), 3))
+    say('[Read Colmap] filter {}/{} points3D, min view = {}'.format(len(points3D_new), len(points3D), 3))
 
     # read camera
     camera_params = {}
     for key in cameras.keys():
-        # print(cameras[key])
+        # say(cameras[key])
         p = cameras[key].params
         if cameras[key].model == 'PINHOLE':
             fx, fy, cx, cy = p
@@ -742,7 +743,7 @@ def align_model(video_scene: VideoScene, video_scene_dict, colmap_path, thresh=1
         s_ = float((Ar * (B - mb)).sum() / (Ar ** 2).sum())
         t_ = mb - s_ * R_ @ ma
         dang = np.degrees(np.arccos(np.clip((np.trace(R0.T @ R_) - 1) / 2, -1, 1)))
-        CONSOLE.log(f'[align] Sim3 rotation from camera orientations: {dang:.2f} deg away from the centre-only fit '
+        say(f'[align] Sim3 rotation from camera orientations: {dang:.2f} deg away from the centre-only fit '
                     f'(scale {s_:.4f} vs {s0:.4f}, {len(A)} cameras)')
         return s_, R_, t_
 
@@ -778,10 +779,10 @@ def align_model(video_scene: VideoScene, video_scene_dict, colmap_path, thresh=1
             if m_.sum() >= 6:
                 sim3_of[v_] = _fit_sim3(colmap_cam_array[m_], raw_cam_array[m_], colmap_cam_R[m_], raw_cam_R_arr[m_])
         if bad:
-            CONSOLE.log(f'[sfm align] disconnected passes {sorted(bad)} (median residual '
+            say(f'[sfm align] disconnected passes {sorted(bad)} (median residual '
                         f'{", ".join(f"{med[b]:.1f}" for b in sorted(bad))} m under the joint fit of '
                         f'{len(keep_v)} passes): own Sim3 each')
-        CONSOLE.log('[sfm align] joint fit (scale %.4f) median residual per pass: ' % scale
+        say('[sfm align] joint fit (scale %.4f) median residual per pass: ' % scale
                     + ", ".join(f"{v_.rsplit('-', 1)[1]}:{m_:.2f}" for v_, m_ in sorted(med.items())))
         if os.environ.get('MTGS_SFM_LOCAL_SCALE') == '1':
             # A smoothly bent SfM trajectory shortens its chords, so the least-squares Sim3 scale
@@ -809,7 +810,7 @@ def align_model(video_scene: VideoScene, video_scene_dict, colmap_path, thresh=1
                 m_ = np.isin(vids, keep_v)
                 scale = scale / r_
                 t = np.mean(raw_cam_array[m_] - scale * colmap_cam_array[m_] @ R.T, axis=0)
-                CONSOLE.log(f'[sfm align] local-step scale: chord fit / local = {r_:.4f} over {len(ratios)} steps -> scale {scale:.4f}')
+                say(f'[sfm align] local-step scale: chord fit / local = {r_:.4f} over {len(ratios)} steps -> scale {scale:.4f}')
 
     def _sim3_for(tk):
         return sim3_of.get(token_video.get(tk), (scale, R, t))
@@ -888,7 +889,7 @@ def align_model(video_scene: VideoScene, video_scene_dict, colmap_path, thresh=1
                         cam_info['colmap_param'] = colmap_cam_info
 
     if rigid_m > 0:
-        CONSOLE.log(f'[sfm align] rigidity gate ({rigid_m} m): dropped {n_rigid} cameras off their frame')
+        say(f'[sfm align] rigidity gate ({rigid_m} m): dropped {n_rigid} cameras off their frame')
     if os.environ.get('MTGS_JOINT_SFM') == '1' and invalid_count > 0.5 * max(1, len(images_out)):
         # never hand training a block whose SfM poses failed to align (2026-10-25: two runs
         # trained on 0 and 6 valid images after an alignment failure)
@@ -927,7 +928,7 @@ def align_model(video_scene: VideoScene, video_scene_dict, colmap_path, thresh=1
                 info['ego2global_rotation'] = Quaternion(matrix=pose[:3, :3], atol=1e-6)
                 info['lidar2global'] = pose @ info['lidar2ego']
                 n_upd += 1; written.add(id(info))
-        CONSOLE.log(f'[Align Colmap] wrote BA ego poses for {n_upd} frames')
+        say(f'[Align Colmap] wrote BA ego poses for {n_upd} frames')
         if os.environ.get('MTGS_JOINT_SFM') == '1':
             # a frame without any SfM camera keeps its metric ego pose, which can be metres off the
             # SfM frame: its lidar would stack as a ghost copy. Skip such frames; drop a pass that
@@ -941,17 +942,17 @@ def align_model(video_scene: VideoScene, video_scene_dict, colmap_path, thresh=1
                 for f in fis:
                     if not any(c.get('valid', True) and 'colmap_param' in c for c in f['cams'].values()):
                         f['skipped'] = 'sfm_unregistered'; n_skip += 1
-            CONSOLE.log(f'[sfm align] skipped {n_skip} frames without SfM cameras; dropped passes '
+            say(f'[sfm align] skipped {n_skip} frames without SfM cameras; dropped passes '
                         f'{[v_.rsplit("-", 1)[1] for v_ in dropped]}')
         # every frame the SfM solution did not touch (standing ego, no SfM camera, out of region) continues the SfM
         # frames next to it in time instead of keeping the pose of the stage before (see ego_pose_carry)
         from nuplan_scripts.utils.ego_pose_carry import carry_ego_correction
         n_carry = sum(carry_ego_correction(v_['frame_infos'], lambda f_: id(f_) in written, lambda f_: id(f_) not in written)
                       for v_ in video_scene_dict.values())
-        CONSOLE.log(f'[Align Colmap] {n_carry} frames outside the SfM solution continue the SfM ego poses next to them')
-    CONSOLE.log(f'[Align Colmap] for {os.path.basename(colmap_path)}')
-    CONSOLE.log(f'[Align Colmap] invalid count = {invalid_count}, total = {len(images_out)}')
-    CONSOLE.log(f'[Align Colmap] error = {np.mean(errors):.3f}')
+        say(f'[Align Colmap] {n_carry} frames outside the SfM solution continue the SfM ego poses next to them')
+    say(f'[Align Colmap] for {os.path.basename(colmap_path)}')
+    say(f'[Align Colmap] invalid count = {invalid_count}, total = {len(images_out)}')
+    say(f'[Align Colmap] error = {np.mean(errors):.3f}')
     return video_scene_dict
 
 def _ba_input_pickle(video_scene):
@@ -965,7 +966,7 @@ def _ba_input_pickle(video_scene):
     if os.path.islink(link) and os.path.basename(os.readlink(link)) in later:
         for p in (video_scene.pickle_path_registered, video_scene.pickle_path_filtered, video_scene.pickle_path_raw):
             if os.path.exists(p):
-                CONSOLE.log(f'\\[ba input] {os.path.basename(link)} links to {os.readlink(link)} (a later stage); '
+                say(f'[ba input] {os.path.basename(link)} links to {os.readlink(link)} (a later stage); '
                             f'starting from {os.path.basename(p)}')
                 return p
     return link
@@ -1010,7 +1011,7 @@ def _stage_log(colmap_path, name):
 
 
 def run_colmap_ba(colmap_path, num_workers=8):
-    CONSOLE.log(f'Colmap BA for {os.path.basename(colmap_path)} started')
+    say(f'Colmap BA for {os.path.basename(colmap_path)} started')
     log_file = _stage_log(colmap_path, 'colmap_ba.log')
 
     if os.path.exists(log_file):
@@ -1021,14 +1022,14 @@ def run_colmap_ba(colmap_path, num_workers=8):
         process = subprocess.Popen(command, stdout=log, stderr=log, shell=True)
         process.communicate()
         if process.returncode != 0:
-            CONSOLE.log(f'[ERROR] Colmap Triangulation for {os.path.basename(colmap_path)} failed')
+            say(f'[ERROR] Colmap Triangulation for {os.path.basename(colmap_path)} failed')
             return False
 
-    CONSOLE.log(f'Colmap BA for {os.path.basename(colmap_path)} done')
+    say(f'Colmap BA for {os.path.basename(colmap_path)} done')
     return True
 
 def run_colmap_triangulation(colmap_path, num_workers=8):
-    CONSOLE.log(f'Colmap Triangulation for {os.path.basename(colmap_path)} started')
+    say(f'Colmap Triangulation for {os.path.basename(colmap_path)} started')
     log_file = _stage_log(colmap_path, 'colmap_triangulation.log')
 
     if os.path.exists(log_file):
@@ -1039,10 +1040,10 @@ def run_colmap_triangulation(colmap_path, num_workers=8):
         process = subprocess.Popen(command, stdout=log, stderr=log, shell=True)
         process.communicate()
         if process.returncode != 0:
-            CONSOLE.log(f'[ERROR] Colmap Triangulation for {os.path.basename(colmap_path)} failed')
+            say(f'[ERROR] Colmap Triangulation for {os.path.basename(colmap_path)} failed')
             return False
 
-    CONSOLE.log(f'Colmap Triangulation for {os.path.basename(colmap_path)} done')
+    say(f'Colmap Triangulation for {os.path.basename(colmap_path)} done')
     return True
 
 if __name__ == "__main__":
@@ -1064,7 +1065,6 @@ if __name__ == "__main__":
     copy_ego_masks(video_scene)
 
     from nuplan_scripts.utils.colmap_utils import sfm_reuse
-    from rich.markup import escape   # log lines start with [...], which rich would take for markup and drop
     colmap_paths = []
     colmap_publish = []
     single_video_scene_dicts = []
@@ -1075,16 +1075,16 @@ if __name__ == "__main__":
         """A kept solution for exactly these inputs (sfm_reuse.py): mark the cameras as the build did and skip COLMAP."""
         name = os.path.basename(colmap_nfs_path)
         key = sfm_keys[colmap_path] = sfm_reuse.compute_key(video_scene, vsd, config.use_colmap_ba)
-        r = sfm_reuse.find(video_scene, colmap_nfs_path, name, key, vsd, log=lambda m: CONSOLE.log(escape(m)))
+        r = sfm_reuse.find(video_scene, colmap_nfs_path, name, key, vsd, log=say)
         if r is None:
             return False
         model, name_map, invalid, src = r
         sfm_reuse.mark_valid(vsd, invalid, name_map)
         reuse_of[colmap_path] = (model, name_map)
-        CONSOLE.log(f'\\[sfm reuse] {name}: COLMAP solution reused from {model} (key {key["sha256"][:12]}, '
+        say(f'[sfm reuse] {name}: COLMAP solution reused from {model} (key {key["sha256"][:12]}, '
                     f'{key["images"]} input cameras); no model build, no COLMAP')
         if invalid is None or os.path.realpath(src) != os.path.realpath(sfm_reuse.keep_dir(video_scene, name)):
-            CONSOLE.log(f'\\[sfm reuse] {name}: kept keyed in {sfm_reuse.adopt(video_scene, src, name, key, vsd)}')
+            say(f'[sfm reuse] {name}: kept keyed in {sfm_reuse.adopt(video_scene, src, name, key, vsd)}')
         return True
 
     # Joint mode: one colmap model over every traversal, so bundle adjustment enforces
@@ -1101,14 +1101,14 @@ if __name__ == "__main__":
         elif _restore_published(colmap_path, colmap_nfs_path):
             skip_create_model = True
             skip_colmap_ba = True
-            CONSOLE.log('[colmap] reusing the archived joint model; '
+            say('[colmap] reusing the archived joint model; '
                         'skipping model build and bundle adjustment')
         if colmap_path in reuse_of:
             pass
         elif not skip_create_model:
             create_colmap_model(video_scene, all_video_scene_dict, colmap_path)
         else:
-            CONSOLE.log('Skipping create colmap model for joint')
+            say('Skipping create colmap model for joint')
         colmap_paths.append(colmap_path)
         single_video_scene_dicts.append(all_video_scene_dict)
     # 2. process each video scene
@@ -1126,7 +1126,7 @@ if __name__ == "__main__":
         elif not skip_create_model:
             create_colmap_model(video_scene, video_scene_dict, colmap_path)
         else:
-            CONSOLE.log(f'Skipping craete colmap model for {video_token}')
+            say(f'Skipping craete colmap model for {video_token}')
         colmap_paths.append(colmap_path)
         single_video_scene_dicts.append(video_scene_dict)
 
@@ -1178,7 +1178,7 @@ if __name__ == "__main__":
             slots = [base + (1 if i < remainder else 0) for i in range(pool_size)]
             thread_counts = [slots[i % pool_size] for i in range(num_tasks)]
 
-        CONSOLE.log(f'Using threads {thread_counts} for videos '
+        say(f'Using threads {thread_counts} for videos '
                     f'{[os.path.basename(p) for p in ordered_paths]} with pool size {pool_size} '
                     f'(weights {[weights[i] for i in order]}, '
                     f'{sum(thread_counts[:pool_size])}/{total_threads} cores in use)')
@@ -1191,18 +1191,18 @@ if __name__ == "__main__":
         if not all(return_codes):
             for colmap_path, return_code in zip(ordered_paths, return_codes):
                 if not return_code:
-                    CONSOLE.log(f'[ERROR] Colmap failed for {os.path.basename(colmap_path)}')
+                    say(f'[ERROR] Colmap failed for {os.path.basename(colmap_path)}')
             exit(1)
 
-        CONSOLE.log('All colmap done')
+        say('All colmap done')
         # keep every solution just computed, keyed, for a later retrain (sfm_reuse.py)
         for i in run_idx:
             kept = sfm_reuse.save(video_scene, colmap_paths[i], os.path.basename(colmap_publish[i][1]),
                                   sfm_keys[colmap_paths[i]], single_video_scene_dicts[i])
             if kept:
-                CONSOLE.log(f'\\[sfm reuse] solution of {os.path.basename(colmap_publish[i][1])} kept in {kept}')
+                say(f'[sfm reuse] solution of {os.path.basename(colmap_publish[i][1])} kept in {kept}')
     elif run_idx:
-        CONSOLE.log('Skipping colmap')
+        say('Skipping colmap')
 
     # 4. merge all the models
     video_scene_dict_new = {}

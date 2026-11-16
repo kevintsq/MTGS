@@ -6,6 +6,7 @@
 
 #!/usr/bin/env python
 from __future__ import annotations
+from nuplan_scripts.utils.console import CONSOLE, say
 
 import gzip
 import json
@@ -78,7 +79,7 @@ def _render_trajectory_video(
         keep_images: Also return every rendered frame (uint8 arrays, H * W * 3 bytes each); leave this
             off unless the caller genuinely needs the frames in memory rather than in the written video.
     """
-    CONSOLE.print("[bold green]Creating trajectory " + output_format)
+    say("[bold green]Creating trajectory " + output_format, markup=True)
     cameras.rescale_output_resolution(rendered_resolution_scaling_factor)
     cameras = cameras.to(pipeline.device)
     fps = len(cameras) / seconds
@@ -136,8 +137,8 @@ def _render_trajectory_video(
                 for rendered_output_name in rendered_output_names:
                     if rendered_output_name not in outputs:
                         CONSOLE.rule("Error", style="red")
-                        CONSOLE.print(f"Could not find {rendered_output_name} in the model outputs", justify="center")
-                        CONSOLE.print(
+                        say(f"Could not find {rendered_output_name} in the model outputs", justify="center")
+                        say(
                             f"Please set --rendered_output_name to one of: {outputs.keys()}", justify="center"
                         )
                         sys.exit(1)
@@ -194,7 +195,7 @@ def _render_trajectory_video(
         table.add_row("Video", str(output_filename))
     else:
         table.add_row("Images", str(output_image_dir))
-    CONSOLE.print(Panel(table, title="[bold][green]:tada: Render Complete :tada:[/bold]", expand=False))
+    say(Panel(table, title="[bold][green]:tada: Render Complete :tada:[/bold]", expand=False))
 
     return render_images
 
@@ -217,17 +218,17 @@ def _hstack_videos(input_filenames: List[Path], output_filename: Path, fps: floa
         for frames in zip(*readers):
             writer.add_image(np.concatenate(frames, axis=-2))
 
-    CONSOLE.print(f"[bold green]Wrote {output_filename} ({num_frames} frames, {width}x{height})")
+    say(f"[bold green]Wrote {output_filename} ({num_frames} frames, {width}x{height})", markup=True)
 
 def find_ckpt_path(config: TrainerConfig) -> Tuple[Path, int]:
     assert config.load_dir is not None
     if config.load_step is None:
-        CONSOLE.print("Loading latest checkpoint from load_dir")
+        say("Loading latest checkpoint from load_dir")
         # NOTE: this is specific to the checkpoint name format
         if not os.path.exists(config.load_dir):
             CONSOLE.rule("Error", style="red")
-            CONSOLE.print(f"No checkpoint directory found at {config.load_dir}, ", justify="center")
-            CONSOLE.print(
+            say(f"No checkpoint directory found at {config.load_dir}, ", justify="center")
+            say(
                 "Please make sure the checkpoint exists, they should be generated periodically during training",
                 justify="center",
             )
@@ -441,11 +442,11 @@ class RenderCameraPath(BaseRender):
             self.output_path = left_eye_path
 
             if camera_path.camera_type[0] == CameraType.OMNIDIRECTIONALSTEREO_L.value:
-                CONSOLE.print("[bold green]:goggles: Omni-directional Stereo VR :goggles:")
+                say("[bold green]:goggles: Omni-directional Stereo VR :goggles:", markup=True)
             else:
-                CONSOLE.print("[bold green]:goggles: VR180 :goggles:")
+                say("[bold green]:goggles: VR180 :goggles:", markup=True)
 
-            CONSOLE.print("Rendering left eye view")
+            say("Rendering left eye view")
 
         # add mp4 suffix to video output if none is specified
         if self.output_format == "video" and str(self.output_path.suffix) == "":
@@ -490,7 +491,7 @@ class RenderInterpolated(BaseRender):
         def update_config(config: TrainerConfig) -> TrainerConfig:
             config.pipeline.datamanager.dataparser.train_split_fraction = 1.0
             config.pipeline.datamanager.dataparser.cameras = self.multi_view_camera
-            CONSOLE.print(f'Using cams {self.multi_view_camera}.', style="bold green")
+            say(f'Using cams {self.multi_view_camera}.', style="bold green")
             return config
 
         config, pipeline, _, _ = eval_setup(
@@ -691,10 +692,10 @@ class DatasetRender(BaseRender):
                     for rendered_output_name in rendered_output_names:
                         if rendered_output_name not in all_outputs:
                             CONSOLE.rule("Error", style="red")
-                            CONSOLE.print(
+                            say(
                                 f"Could not find {rendered_output_name} in the model outputs", justify="center"
                             )
-                            CONSOLE.print(
+                            say(
                                 f"Please set --rendered-output-name to one of: {all_outputs}", justify="center"
                             )
                             sys.exit(1)
@@ -775,7 +776,7 @@ class DatasetRender(BaseRender):
         )
         for split in self.split.split("+"):
             table.add_row(f"Outputs {split}", str(self.output_path / split))
-        CONSOLE.print(Panel(table, title="[bold][green]:tada: Render on split {} Complete :tada:[/bold]", expand=False))
+        say(Panel(table, title="[bold][green]:tada: Render on split {} Complete :tada:[/bold]", expand=False))
 
 
 Commands = tyro.conf.FlagConversionOff[

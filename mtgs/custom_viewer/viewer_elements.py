@@ -17,6 +17,7 @@
 
 
 from __future__ import annotations
+from nuplan_scripts.utils.console import say
 
 import warnings
 from abc import abstractmethod
@@ -37,7 +38,7 @@ from viser import (
 )
 
 from nerfstudio.cameras.cameras import Cameras, CameraType
-from nerfstudio.utils.rich_utils import CONSOLE
+
 from mtgs.custom_viewer.utils import CameraState, get_camera
 
 if TYPE_CHECKING:
@@ -163,7 +164,7 @@ class ViewerControl:
 
     def register_click_cb(self, cb: Callable):
         """Deprecated, use register_pointer_cb instead."""
-        CONSOLE.log("`register_click_cb` is deprecated, use `register_pointer_cb` instead.")
+        say("`register_click_cb` is deprecated, use `register_pointer_cb` instead.")
         self.register_pointer_cb("click", cb)
 
     @overload

@@ -1,3 +1,4 @@
+from nuplan_scripts.utils.console import say
 import abc
 from enum import Enum
 from typing import Literal, Optional
@@ -376,7 +377,7 @@ def normal_from_depth_image(
     """estimate normals from depth map"""
     if smooth:
         if torch.count_nonzero(depths) > 0:
-            print("Input depth map contains 0 elements, skipping smoothing filter")
+            say("Input depth map contains 0 elements, skipping smoothing filter")
         else:
             kernel_size = (9, 9)
             depths = torch.from_numpy(

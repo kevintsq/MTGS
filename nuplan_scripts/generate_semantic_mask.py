@@ -3,6 +3,7 @@
 # Source code: https://github.com/OpenDriveLab/MTGS                             #
 # Copyright (c) OpenDriveLab. All rights reserved.                              #
 #-------------------------------------------------------------------------------#
+from nuplan_scripts.utils.console import say
 import os
 import argparse
 
@@ -64,7 +65,7 @@ class SkySeg:
         self.sess = ort.InferenceSession(SKYSEG_ONNX, providers=provs)
         if self.sess.get_providers()[0] == 'CPUExecutionProvider':
             raise SystemExit("skyseg: onnxruntime fell back to the CPU (no CUDA / cuDNN for its CUDA EP)")
-        print(f"skyseg on {self.sess.get_providers()[0]} ({SKYSEG_ONNX})")
+        say(f"skyseg on {self.sess.get_providers()[0]} ({SKYSEG_ONNX})")
         self.inp, self.out = self.sess.get_inputs()[0].name, self.sess.get_outputs()[0].name
         self.dev = dev
         self.mean = torch.tensor([0.485, 0.456, 0.406], device=device).view(1, 3, 1, 1)

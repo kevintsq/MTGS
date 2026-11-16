@@ -3,6 +3,7 @@
 # Source code: https://github.com/OpenDriveLab/MTGS                             #
 # Copyright (c) OpenDriveLab. All rights reserved.                              #
 #-------------------------------------------------------------------------------#
+from nuplan_scripts.utils.console import say
 import os
 import shutil
 import argparse
@@ -57,7 +58,7 @@ def run_reconstruction(task, args):
     success = True
     try:
         if args.resume and os.path.exists(eval_file):
-            CONSOLE.log(f'[INFO] Reconstruction for {os.path.basename(output_dir)} already completed. Skipping...')
+            say(f'[INFO] Reconstruction for {os.path.basename(output_dir)} already completed. Skipping...')
         else:
             if os.path.exists(log_file):
                 os.remove(log_file)
@@ -65,7 +66,7 @@ def run_reconstruction(task, args):
             train_traversal_str = ','.join(map(str, task["train_traversal"])) if task["train_traversal"] else "None"
             eval_traversal_str = ','.join(map(str, task["eval_traversal"])) if task["eval_traversal"] else "None"
 
-            CONSOLE.log(f'Reconstruction for {os.path.basename(output_dir)} started (GPU {gpu_id})')
+            say(f'Reconstruction for {os.path.basename(output_dir)} started (GPU {gpu_id})')
             start_time = time.time()
             command = f'python -m mtgs.tools.batch_exp.run_single_road_block --ns-config {args.ns_config} --config {task["config"]} --train-traversal {train_traversal_str} --eval-traversal {eval_traversal_str} --output-dir {args.output_dir}'
             if args.eval_only:
@@ -76,10 +77,10 @@ def run_reconstruction(task, args):
                 if process.returncode != 0:
                     raise Exception(f'Reconstruction for {os.path.basename(output_dir)} failed')
             end_time = time.time()
-            CONSOLE.log(f'{os.path.basename(output_dir)} done (GPU {gpu_id}) in {end_time - start_time:.2f} seconds')
+            say(f'{os.path.basename(output_dir)} done (GPU {gpu_id}) in {end_time - start_time:.2f} seconds')
 
     except Exception as e:
-        CONSOLE.log(f'[ERROR] Reconstruction for {os.path.basename(output_dir)} failed: {e}')
+        say(f'[ERROR] Reconstruction for {os.path.basename(output_dir)} failed: {e}')
         success = False
     finally:
         gpu_manager.release_gpu(lock_file)
@@ -101,7 +102,7 @@ if __name__ == '__main__':
     tasks = tasks_registry[args.task_name]
 
     available_devices = torch.cuda.device_count()
-    CONSOLE.log(f"Found {available_devices} GPU devices")
+    say(f"Found {available_devices} GPU devices")
     if os.path.exists(args.output_dir + '/gpu_locks'):
         shutil.rmtree(args.output_dir + '/gpu_locks')
 
@@ -168,8 +169,8 @@ if __name__ == '__main__':
 
     # Format the table
     pd.set_option('display.float_format', lambda x: '%.3f' % x if isinstance(x, float) else str(x))
-    print("\nResults Summary:")
-    print(df.to_string(index=False))
+    say("\nResults Summary:")
+    say(df.to_string(index=False))
     df.to_csv(f'{args.output_dir}/results_summary.csv', index=False, float_format='%.3f')
 
     # Save summary metrics to TSV

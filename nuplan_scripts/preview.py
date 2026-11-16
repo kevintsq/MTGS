@@ -3,6 +3,7 @@
 # Source code: https://github.com/OpenDriveLab/MTGS                             #
 # Copyright (c) OpenDriveLab. All rights reserved.                              #
 #-------------------------------------------------------------------------------#
+from nuplan_scripts.utils.console import say
 import copy
 import glob
 import streamlit as st
@@ -246,7 +247,7 @@ def create_app(
             # Save the config to local disk
             video_scene.config.save_config(selected_config)
             st.success(f"Config saved to {selected_config}")
-            print(f"Config saved to {selected_config}")
+            say(f"Config saved to {selected_config}")
 
             st.session_state.last_selected_config = None
             st.session_state.show_confirm_button = False

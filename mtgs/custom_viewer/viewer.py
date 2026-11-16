@@ -15,6 +15,7 @@
 """Manage the state of the viewer"""
 
 from __future__ import annotations
+from nuplan_scripts.utils.console import say
 
 import contextlib
 import threading
@@ -114,7 +115,7 @@ class Viewer:
         if share:
             share_url = self.viser_server.request_share_url()
             if share_url is None:
-                print("Couldn't make share URL!")
+                say("Couldn't make share URL!")
 
         if share_url is not None:
             self.viewer_info = [f"Viewer at: http://localhost:{websocket_port} or {share_url}"]
@@ -252,9 +253,8 @@ class Viewer:
             from nerfstudio.viewer_legacy.server.viewer_elements import ViewerElement as LegacyViewerElement
 
             if len(parse_object(pipeline, LegacyViewerElement, "Custom Elements")) > 0:
-                from nerfstudio.utils.rich_utils import CONSOLE
 
-                CONSOLE.print(
+                say(
                     "Legacy ViewerElements detected in model, please import nerfstudio.viewer.viewer_elements instead",
                     style="bold yellow",
                 )

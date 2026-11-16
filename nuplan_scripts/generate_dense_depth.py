@@ -3,6 +3,7 @@
 # Source code: https://github.com/OpenDriveLab/MTGS                             #
 # Copyright (c) OpenDriveLab. All rights reserved.                              #
 #-------------------------------------------------------------------------------#
+from nuplan_scripts.utils.console import say
 import os
 import argparse
 from tqdm import tqdm
@@ -288,7 +289,7 @@ if __name__ == '__main__':
             # measured on a Pro6000: bs=4 @ 24 workers is the knee (21.2 it/s vs
             # 15.2 at bs=1/6w); bs=8 is slightly worse, so 4 is the cap.
             batch_size = 4 if free_gb >= 34 else 2 if free_gb >= 18 else 1
-            print(f'[generate_dense_depth] GPU free {free_gb:.0f} GiB -> DEPTH_BATCH={batch_size}')
+            say(f'[generate_dense_depth] GPU free {free_gb:.0f} GiB -> DEPTH_BATCH={batch_size}')
         # The ROI follows from the calibration that undistort_image_with_cam_info
         # actually uses — which is the BA-refined colmap_param when present, and it
         # differs per camera. Key on exactly that, or the stack hits mismatched shapes.
@@ -343,10 +344,10 @@ if __name__ == '__main__':
                     try:
                         outputs = model.infer(inputs, intrinsics.clone())
                         batched_infer = True
-                        print('[generate_dense_depth] batched UniDepth inference OK')
+                        say('[generate_dense_depth] batched UniDepth inference OK')
                     except RuntimeError:
                         batched_infer = False
-                        print('[generate_dense_depth] stock UniDepth: per-sample forward')
+                        say('[generate_dense_depth] stock UniDepth: per-sample forward')
                         outputs = _infer_per_sample()
                 elif batched_infer:
                     outputs = model.infer(inputs, intrinsics.clone())
@@ -374,7 +375,7 @@ if __name__ == '__main__':
                 # undistorted ROI produces a 1-D / mismatched depth map). Skip the
                 # frame instead of crashing the whole stage.
                 if pk.shape[0] != h or pk.shape[1] != w:
-                    print(f"[generate_dense_depth] skip {output_path}: "
+                    say(f"[generate_dense_depth] skip {output_path}: "
                           f"depth shape {pk.shape[:2]} != roi ({h},{w})")
                     pbar.update(distributed_state.num_processes)
                     continue
@@ -390,7 +391,7 @@ if __name__ == '__main__':
     pbar.close()
 
     if not distributed_state.is_main_process:
-        print(f'exiting subprocess {distributed_state.process_index}')
+        say(f'exiting subprocess {distributed_state.process_index}')
         exit()
 
     if not args.report_errors:
@@ -416,5 +417,5 @@ if __name__ == '__main__':
     for key, value in ref_errors.items():
         table.add_row([key, f"{np.mean(value):.4f}"])
 
-    print(table)
+    say(table)
 

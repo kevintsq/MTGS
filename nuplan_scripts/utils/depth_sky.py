@@ -9,6 +9,7 @@ masks/raw/cityscape/<image>.png otherwise), in RAW image space; it is undistorte
 exactly like the image the depth model saw (nearest neighbour, same ROI), so its pixels
 line up with the depth PNG (ROI pasted back into the full frame at the same place).
 """
+from nuplan_scripts.utils.console import say
 import os
 
 import cv2
@@ -34,7 +35,7 @@ def _raw_sky(video_scene, cam_info):
             return m > 127
         if video_scene.raw_mask_path not in _FALLBACK_SAID:
             _FALLBACK_SAID.add(video_scene.raw_mask_path)
-            print(f"[depth_sky] no skyseg masks under {video_scene.raw_mask_path}/{video_scene.mask_suffix_sky}: "
+            say(f"[depth_sky] no skyseg masks under {video_scene.raw_mask_path}/{video_scene.mask_suffix_sky}: "
                   f"cityscapes sky class used (rerun generate_semantic_mask.py to add them)", flush=True)
     seg = cv2.imread(os.path.join(video_scene.raw_mask_path, video_scene.mask_suffix_cityscape, dp).replace('.jpg', '.png'),
                      cv2.IMREAD_UNCHANGED)

@@ -3,6 +3,7 @@
 # Source code: https://github.com/OpenDriveLab/MTGS                             #
 # Copyright (c) OpenDriveLab. All rights reserved.                              #
 #-------------------------------------------------------------------------------#
+from nuplan_scripts.utils.console import say
 import os
 import pickle
 from dataclasses import dataclass, field
@@ -23,7 +24,6 @@ from nerfstudio.data.dataparsers.base_dataparser import (
     DataparserOutputs,
 )
 from nerfstudio.data.scene_box import SceneBox
-from nerfstudio.utils.rich_utils import CONSOLE
 
 from nuplan_scripts.utils.video_scene_dict_tools import VideoScene
 from nuplan_scripts.utils.config import FrameCentralConfig, RoadBlockConfig, load_config
@@ -170,7 +170,7 @@ class NuplanDataParser(DataParser):
 
         travels = self.config.train_scene_travels if split == "train" else self.config.eval_scene_travels
         if travels is None or len(travels) == 0:
-            CONSOLE.log('No specific scene travels, use all scenes')
+            say('No specific scene travels, use all scenes')
             travels = None
         if travels is not None:
             video_scene_dict = video_scene.video_scene_dict_process(
@@ -272,7 +272,7 @@ class NuplanDataParser(DataParser):
                         )
                     else:
                         if split != 'test' and not_warned and self.config.use_colmap_pose:
-                            CONSOLE.log(f"[WARNING] COLMAP pose not found for key \"{video_token}\". Use original pose instead.")
+                            say(f"[WARNING] COLMAP pose not found for key \"{video_token}\". Use original pose instead.")
                             not_warned = False
 
                         ego2global = info['ego2global_original'] if self.config.use_original_pose else info['ego2global']
@@ -405,7 +405,7 @@ class NuplanDataParser(DataParser):
             # that one tensor, read once per checkpoint file (mmap); not a full load of the ~8 GB file per split
             pose_adj = load_pipeline_tensor(self.config.load_cam_optim_from, self.config.cam_optim_key)
             if pose_adj.shape[0] != poses.shape[0]:
-                CONSOLE.log(f"[WARNING] pose_adj shape {pose_adj.shape[0]} does not match poses shape {poses.shape[0]}")
+                say(f"[WARNING] pose_adj shape {pose_adj.shape[0]} does not match poses shape {poses.shape[0]}")
             else:
                 from nerfstudio.cameras.lie_groups import exp_map_SO3xR3
                 pose_adj = exp_map_SO3xR3(pose_adj) # n 3 4
@@ -483,7 +483,7 @@ class NuplanDataParser(DataParser):
             if os.path.exists(path):
                 pcd += o3d.io.read_point_cloud(str(path))
             else:
-                CONSOLE.print(f"[WARNING] no LiDAR stacked pcd found in {path.name}")
+                say(f"[WARNING] no LiDAR stacked pcd found in {path.name}")
 
         pcd = pcd.remove_statistical_outlier(nb_neighbors=20, std_ratio=0.5)[0]
         pcd = pcd.voxel_down_sample(voxel_size=0.15)
@@ -498,7 +498,7 @@ class NuplanDataParser(DataParser):
             if os.path.exists(path):
                 pcd += o3d.io.read_point_cloud(str(path))
             else:
-                CONSOLE.print(f"[WARNING] no SFM pcd found in {path.name}")
+                say(f"[WARNING] no SFM pcd found in {path.name}")
 
         points3D = torch.from_numpy(np.asarray(pcd.points, dtype=np.float32))
         points3D = points3D @ transform_matrix[:3, :3].T + transform_matrix[:3, 3]
@@ -547,7 +547,7 @@ class NuplanDataParser(DataParser):
                             points3D = torch.from_numpy(np.asarray(pcd.points, dtype=np.float32))
                             points3D_rgb = torch.from_numpy((np.asarray(pcd.colors) * 255).astype(np.uint8))
                         else:
-                            CONSOLE.print("[WARNING] no pcd found for {} {}".format(video_token, track_token))
+                            say("[WARNING] no pcd found for {} {}".format(video_token, track_token))
                             points3D = torch.zeros((0, 3))
                             points3D_rgb = torch.zeros((0, 3))
 

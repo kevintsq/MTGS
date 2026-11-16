@@ -7,6 +7,7 @@ of its frames that way).
 
   make_union_box.py <old_block> <new_block> [--margin 40]
 """
+from nuplan_scripts.utils.console import say
 import argparse, json, os, pickle, re
 import numpy as np
 
@@ -55,5 +56,5 @@ assert j == 4, f"could not rewrite box for {a.old}"
 open(f"{W}/configs_v1final/{a.new}.yml", "w").write(head + "road_block:" + "\n".join(lines))
 h = open(f"{HA}/mtgs_navtest_configs_v1final/{a.old}.yml").read().replace(a.old, a.new)
 open(f"{HA}/mtgs_navtest_configs_v1final/{a.new}.yml", "w").write(h)
-print(f"{a.new}: {ob[2]-ob[0]:.0f}x{ob[3]-ob[1]:.0f} -> {box[2]-box[0]:.0f}x{box[3]-box[1]:.0f} m "
+say(f"{a.new}: {ob[2]-ob[0]:.0f}x{ob[3]-ob[1]:.0f} -> {box[2]-box[0]:.0f}x{box[3]-box[1]:.0f} m "
       f"({len(toks)} scenes)")

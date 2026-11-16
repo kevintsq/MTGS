@@ -3,6 +3,7 @@
 # Source code: https://github.com/OpenDriveLab/MTGS                             #
 # Copyright (c) OpenDriveLab. All rights reserved.                              #
 #-------------------------------------------------------------------------------#
+from nuplan_scripts.utils.console import say
 import os
 import argparse
 import shutil
@@ -22,7 +23,7 @@ if __name__ == '__main__':
     # MTGS_KEEP_PREP=1: keep the whole prep tree of this block (masks, depth, registration, colmap, point clouds),
     # e.g. to inspect what a training was fed. Tens of GB per block: set it per block, not in a recipe.
     if os.environ.get('MTGS_KEEP_PREP') == '1':
-        print(f"[clean] MTGS_KEEP_PREP=1: prep tree of {config.road_block_name} kept")
+        say(f"[clean] MTGS_KEEP_PREP=1: prep tree of {config.road_block_name} kept")
         raise SystemExit(0)
 
     folders_to_remove = [
@@ -56,7 +57,7 @@ if __name__ == '__main__':
                     shutil.rmtree(dst) if os.path.isdir(dst) else os.remove(dst)
                 shutil.move(src, dst)
         if os.path.isdir(keep_root):
-            print(f"[clean] SfM models kept in {keep_root}: {sorted(os.listdir(keep_root))}")
+            say(f"[clean] SfM models kept in {keep_root}: {sorted(os.listdir(keep_root))}")
 
     for folder in folders_to_remove:
         dir_path = os.path.join(data_root, config.road_block_name, folder)
@@ -68,6 +69,6 @@ if __name__ == '__main__':
                 if os.path.isdir(p_):
                     safe_rmtree_colmap(p_, "clean_temp_files")
             if os.listdir(dir_path):
-                print(f"[clean] {dir_path} kept: {os.listdir(dir_path)}")
+                say(f"[clean] {dir_path} kept: {os.listdir(dir_path)}")
                 continue
         shutil.rmtree(dir_path)

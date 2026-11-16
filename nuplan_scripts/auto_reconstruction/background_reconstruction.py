@@ -3,6 +3,7 @@
 # Source code: https://github.com/OpenDriveLab/MTGS                             #
 # Copyright (c) OpenDriveLab. All rights reserved.                              #
 #-------------------------------------------------------------------------------#
+from nuplan_scripts.utils.console import say
 import os
 import argparse
 
@@ -108,6 +109,6 @@ if __name__ == '__main__':
             ns_config.load_dir = Path(mirror)
             ns_config.load_step = steps[-1]
             os.environ['MTGS_RESUMED'] = '1'
-            print(f"[resume] {config.road_block_name}: resuming from {mirror}/step-{steps[-1]:09d}.ckpt", flush=True)
+            say(f"[resume] {config.road_block_name}: resuming from {mirror}/step-{steps[-1]:09d}.ckpt", flush=True)
 
     main(ns_config)

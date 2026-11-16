@@ -3,6 +3,7 @@
 # Source code: https://github.com/OpenDriveLab/MTGS                             #
 # Copyright (c) OpenDriveLab. All rights reserved.                              #
 #-------------------------------------------------------------------------------#
+from nuplan_scripts.utils.console import say
 import os
 import sys
 import shutil
@@ -57,7 +58,7 @@ def _run_colmap(args, colmap_path, **kwargs):
     if "--output_path" in args:
         out = args[args.index("--output_path") + 1]
     listing = sorted(os.listdir(out)) if out and os.path.isdir(out) else None
-    print(f"[colmap] {args[1] if len(args) > 1 else '?'} rc={r.returncode} "
+    say(f"[colmap] {args[1] if len(args) > 1 else '?'} rc={r.returncode} "
           f"output={os.path.basename(out) if out else '-'} files={listing}", flush=True)
     return r
 
@@ -137,7 +138,7 @@ def _write_pose_priors(colmap_path):
                            (image_id, centres[name].astype(np.float64).tobytes(), cov))
                 n += 1
         db.commit(); db.close()
-    print(f"[sfm] pose priors written for {n}/{len(centres)} images", flush=True)
+    say(f"[sfm] pose priors written for {n}/{len(centres)} images", flush=True)
 
 
 def _colmap_scale(colmap_path):
@@ -149,7 +150,7 @@ def _colmap_scale(colmap_path):
         f = os.path.join(colmap_path, "sparse_model", "scale_factor.txt")
         v = open(f).read().strip() if os.path.exists(f) else None
     if not v:
-        print("[sfm] WARNING: no MTGS_COLMAP_SCALE / sparse_model/scale_factor.txt; metre thresholds used as raw units", flush=True)
+        say("[sfm] WARNING: no MTGS_COLMAP_SCALE / sparse_model/scale_factor.txt; metre thresholds used as raw units", flush=True)
         return 1.0
     return float(v)
 
@@ -176,7 +177,7 @@ def _prune_db_to_pair_list(db_path, pairs_txt):
                 a, b = b, a
             allowed.add(a * 2147483647 + b)
     if not allowed:   # a mismatch between the pair list and the database must never wipe the cache (2026-11-05: inverted name map deleted 367k matches)
-        print(f"[sfm] WARNING: no pair of image_pairs.txt resolves against the imported database; cache left untouched", flush=True)
+        say(f"[sfm] WARNING: no pair of image_pairs.txt resolves against the imported database; cache left untouched", flush=True)
         db.close(); return
     db.execute("create temp table keep (pair_id integer primary key)")
     db.executemany("insert into keep values (?)", ((x,) for x in allowed))
@@ -185,7 +186,7 @@ def _prune_db_to_pair_list(db_path, pairs_txt):
     db.execute("delete from matches where pair_id not in (select pair_id from keep)")
     db.execute("delete from two_view_geometries where pair_id not in (select pair_id from keep)")
     db.commit(); db.close()
-    print(f"[sfm] imported database pruned to the pair list: {len(allowed)} pairs kept, {n_m} matches / {n_g} two-view geometries outside it deleted", flush=True)
+    say(f"[sfm] imported database pruned to the pair list: {len(allowed)} pairs kept, {n_m} matches / {n_g} two-view geometries outside it deleted", flush=True)
 
 
 def _drop_far_from_prior(colmap_path, model_dir, max_err_m, colmap_exe, scale=1.0):
@@ -204,7 +205,7 @@ def _drop_far_from_prior(colmap_path, model_dir, max_err_m, colmap_exe, scale=1.
     err = {i: np.linalg.norm(c - pri[i]) for i, c in centres.items() if i in pri}
     bad = [i for i, e in err.items() if e > max_err]
     e_m = np.array(list(err.values())) / scale if err else np.zeros(1)
-    print(f"[sfm] {len(bad)} of {len(centres)} images > {max_err_m} m from their prior "
+    say(f"[sfm] {len(bad)} of {len(centres)} images > {max_err_m} m from their prior "
           f"(median {np.median(e_m):.3f} m, p90 {np.percentile(e_m, 90):.3f} m)", flush=True)
     if not bad:
         return
@@ -256,10 +257,10 @@ def run_bundle_adjustment(
     imp = os.environ.get("MTGS_SFM_IMPORT")
     if os.environ.get("MTGS_JOINT_SFM") == "1" and imp:
         if not os.path.exists(os.path.join(imp, "images.bin")):
-            print(f"[sfm] MTGS_SFM_IMPORT={imp} has no images.bin"); sys.exit(1)
+            say(f"[sfm] MTGS_SFM_IMPORT={imp} has no images.bin"); sys.exit(1)
         dst = os.path.join(colmap_path, output_model, "0")
         shutil.rmtree(dst, ignore_errors=True); shutil.copytree(imp, dst)
-        print(f"[sfm] imported model {imp} -> {dst}", flush=True)
+        say(f"[sfm] imported model {imp} -> {dst}", flush=True)
         sys.exit(0)
 
     # MTGS_SFM_DB_IMPORT=<database.db>: resume from a snapshot of this block's COLMAP database (civo node
@@ -269,10 +270,10 @@ def run_bundle_adjustment(
     dbimp = os.environ.get("MTGS_SFM_DB_IMPORT")
     if os.environ.get("MTGS_JOINT_SFM") == "1" and dbimp and os.path.exists(dbimp):
         shutil.copy2(dbimp, f"{colmap_path}/database.db")
-        print(f"[sfm] imported database {dbimp} ({os.path.getsize(dbimp)/1e9:.2f} GB): extraction skipped, matching resumes", flush=True)
+        say(f"[sfm] imported database {dbimp} ({os.path.getsize(dbimp)/1e9:.2f} GB): extraction skipped, matching resumes", flush=True)
         _prune_db_to_pair_list(f"{colmap_path}/database.db", f"{colmap_path}/image_pairs.txt")
     else:
-        print("extracting features...")
+        say("extracting features...")
         colmap_feature_extractor_args = [
             colmap_exe, "feature_extractor",
             "--database_path", f"{colmap_path}/database.db",
@@ -289,17 +290,17 @@ def run_bundle_adjustment(
             if os.environ.get("MTGS_JOINT_SFM") == "1" and os.path.exists(rig_cfg):
                 # rigs + frames from the calibration (ba_multi_traversal._write_rig_config); the
                 # mapper then refines cam_from_rig (Mapper.ba_refine_sensor_from_rig, default on)
-                print("[sfm rig] rig_configurator", flush=True)
+                say("[sfm rig] rig_configurator", flush=True)
                 _run_colmap([colmap_exe, "rig_configurator", "--database_path", f"{colmap_path}/database.db",
                              "--rig_config_path", rig_cfg], colmap_path, check=True)
             else:
                 _normalize_rigs(f"{colmap_path}/database.db")
         except subprocess.CalledProcessError as e:
-            print(f"Error executing colmap feature_extractor: {e}")
+            say(f"Error executing colmap feature_extractor: {e}")
             sys.exit(1)
 
 
-    print("feature matching...")
+    say("feature matching...")
     colmap_matches_importer_args = [
         colmap_exe, "matches_importer",
         "--database_path", f"{colmap_path}/database.db",
@@ -310,7 +311,7 @@ def run_bundle_adjustment(
     try:
         _run_colmap(colmap_matches_importer_args, colmap_path, check=True)
     except subprocess.CalledProcessError as e:
-        print(f"Error executing colmap matches_importer: {e}")
+        say(f"Error executing colmap matches_importer: {e}")
         sys.exit(1)
 
     if os.path.exists(os.path.join(colmap_path, output_model)):
@@ -372,7 +373,7 @@ def run_bundle_adjustment(
         elif _ba_mode == "distonly":
             colmap_bundle_adjuster_args[colmap_bundle_adjuster_args.index("--BundleAdjustment.refine_focal_length") + 1] = "0"
             colmap_bundle_adjuster_args[colmap_bundle_adjuster_args.index("--BundleAdjustment.refine_extra_params") + 1] = "1"
-    print(f"[ba] COLMAP_BA_MODE={_ba_mode}: {' '.join(colmap_bundle_adjuster_args[1:])}", flush=True)
+    say(f"[ba] COLMAP_BA_MODE={_ba_mode}: {' '.join(colmap_bundle_adjuster_args[1:])}", flush=True)
     # MTGS_JOINT_SFM=1: pure structure-from-motion -- the mapper reconstructs from the matches
     # alone (no pose priors), intrinsics fixed to the calibration; the largest model becomes
     # <output_model>/0 and align_model() then puts it into the metric world frame with one
@@ -407,7 +408,7 @@ def run_bundle_adjustment(
             # at 0.07 m median / 0.14 m p90 from the priors, 0.81 px reprojection (33 outliers > 1.5 m).
             scale = _colmap_scale(colmap_path)
             std_m = float(os.environ.get("COLMAP_PRIOR_STD", "0.1")); std = f"{std_m * scale:.6g}"
-            print(f"[sfm] prior std {std_m} m = {std} colmap units (scale {scale:.5g})", flush=True)
+            say(f"[sfm] prior std {std_m} m = {std} colmap units (scale {scale:.5g})", flush=True)
             _write_pose_priors(colmap_path)
             mapper_args = [colmap_exe, "pose_prior_mapper", "--database_path", f"{colmap_path}/database.db",
                            "--image_path", f"{colmap_path}/images", "--output_path", raw,
@@ -427,22 +428,22 @@ def run_bundle_adjustment(
                            "--Mapper.ba_refine_principal_point", "0",
                            "--Mapper.ba_refine_extra_params", "0" if fix else "1",
                            "--Mapper.multiple_models", "1", "--Mapper.min_model_size", "50"]
-        print(f"[sfm] {mode} mapper: {' '.join(mapper_args[1:])}", flush=True)
+        say(f"[sfm] {mode} mapper: {' '.join(mapper_args[1:])}", flush=True)
         try:
             _run_colmap(mapper_args, colmap_path, check=True)
         except subprocess.CalledProcessError as e:
-            print(f"Error executing colmap {mode} mapper: {e}")
+            say(f"Error executing colmap {mode} mapper: {e}")
             sys.exit(1)
         models = [d for d in sorted(os.listdir(raw), key=lambda x: int(x) if x.isdigit() else 1e9)
                   if os.path.exists(os.path.join(raw, d, "images.bin"))]
         if not models:
-            print("[sfm] mapper produced no model"); sys.exit(1)
+            say("[sfm] mapper produced no model"); sys.exit(1)
         sizes = {}
         for d in models:
             with open(os.path.join(raw, d, "images.bin"), "rb") as f:
                 sizes[d] = int.from_bytes(f.read(8), "little")      # images.bin starts with the image count
         best = max(sizes, key=sizes.get)
-        print(f"[sfm] models (images): {sizes}; using {best}", flush=True)
+        say(f"[sfm] models (images): {sizes}; using {best}", flush=True)
         shutil.rmtree(os.path.join(colmap_path, output_model, "0"), ignore_errors=True)
         shutil.copytree(os.path.join(raw, best), os.path.join(colmap_path, output_model, "0"))
         if mode == "pose_prior" and float(os.environ.get("MTGS_SFM_PRIOR_MAX_ERR", "0")) > 0:
@@ -459,7 +460,7 @@ def run_bundle_adjustment(
             "--output_path", f"{colmap_path}/{output_model}/t",
             ], colmap_path, check=True)
     except subprocess.CalledProcessError as e:
-        print(f"Error executing colmap_point_triangulator_args: {e}")
+        say(f"Error executing colmap_point_triangulator_args: {e}")
         sys.exit(1)
 
     try:
@@ -468,7 +469,7 @@ def run_bundle_adjustment(
             "--output_path", f"{colmap_path}/{output_model}/b",
         ], colmap_path, check=True)
     except subprocess.CalledProcessError as e:
-        print(f"Error executing colmap_bundle_adjuster_args: {e}")
+        say(f"Error executing colmap_bundle_adjuster_args: {e}")
         sys.exit(1)
 
     try:
@@ -479,7 +480,7 @@ def run_bundle_adjustment(
             "--output_path", f"{colmap_path}/{output_model}/t2",
             ], colmap_path, check=True)
     except subprocess.CalledProcessError as e:
-        print(f"Error executing colmap_point_triangulator_args: {e}")
+        say(f"Error executing colmap_point_triangulator_args: {e}")
         sys.exit(1)
 
     try:
@@ -488,7 +489,7 @@ def run_bundle_adjustment(
             "--output_path", f"{colmap_path}/{output_model}/0",
         ], colmap_path, check=True)
     except subprocess.CalledProcessError as e:
-        print(f"Error executing colmap_bundle_adjuster_args: {e}")
+        say(f"Error executing colmap_bundle_adjuster_args: {e}")
         sys.exit(1)
 
 

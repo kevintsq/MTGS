@@ -3,6 +3,7 @@
 # Source code: https://github.com/OpenDriveLab/MTGS                             #
 # Copyright (c) OpenDriveLab. All rights reserved.                              #
 #-------------------------------------------------------------------------------#
+from nuplan_scripts.utils.console import CONSOLE, say
 import os
 import sys
 import argparse
@@ -20,8 +21,8 @@ def find_portable_ckpt_path(nerfstudio_config: Path) -> Path:
     ckpt_dir = nerfstudio_config.parent / "nerfstudio_models"
     if not os.path.exists(ckpt_dir):
         CONSOLE.rule("Error", style="red")
-        CONSOLE.print(f"No checkpoint directory found at {ckpt_dir}, ", justify="center")
-        CONSOLE.print(
+        say(f"No checkpoint directory found at {ckpt_dir}, ", justify="center")
+        say(
             "Please make sure the checkpoint exists, they should be generated periodically during training",
             justify="center",
         )
@@ -40,7 +41,7 @@ if __name__ == '__main__':
     config = load_config(args.config)
     video_scene = VideoScene(config)
 
-    CONSOLE.log("Exporting background reconstruction model.", style='bold magenta')
+    say("Exporting background reconstruction model.", style='bold magenta')
     recon_subdir = os.environ.get('MTGS_RECON_SUBDIR', 'background_reconstruction')   # as render_reconstruction
     reconstruction_dir = Path(os.path.join(config.data_root, recon_subdir, config.road_block_name))
     nerfstudio_config = reconstruction_dir / 'config.yml'
@@ -66,14 +67,14 @@ if __name__ == '__main__':
         extract_portable_ckpt_from_file(portable_ckpt_path.with_name(portable_ckpt_path.name[len("portable_"):]),
                                         ns_config, video_scene, dst_ckpt_path)
 
-    CONSOLE.log("Exporting config.", style='bold magenta')
+    say("Exporting config.", style='bold magenta')
     save_config_path = os.path.join(video_scene.data_root, 'configs', os.path.basename(args.config))
     os.makedirs(os.path.dirname(save_config_path), exist_ok=True)
     if os.path.exists(save_config_path):
         os.remove(save_config_path)
     shutil.copy2(args.config, save_config_path)
 
-    CONSOLE.log("Exporting video scene dict.", style='bold magenta')
+    say("Exporting video scene dict.", style='bold magenta')
     save_pickle_path = Path(args.output_dir) / f"{config.road_block_name}/video_scene_dict.pkl"
     if os.path.exists(save_pickle_path):
         os.remove(save_pickle_path)

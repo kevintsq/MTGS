@@ -3,6 +3,7 @@
 # Source code: https://github.com/OpenDriveLab/MTGS                             #
 # Copyright (c) OpenDriveLab. All rights reserved.                              #
 #-------------------------------------------------------------------------------#
+from nuplan_scripts.utils.console import say
 import math
 from dataclasses import dataclass, field
 from typing import Type
@@ -10,7 +11,6 @@ from typing_extensions import Literal
 
 import torch
 
-from nerfstudio.utils.rich_utils import CONSOLE
 from .utils import num_sh_bases
 from .multi_color_gaussian_splatting import MultiColorGaussianSplattingModel, MultiColorGaussianSplattingModelConfig
 
@@ -52,7 +52,7 @@ class SkyboxGaussianSplattingModel(MultiColorGaussianSplattingModel):
         # uniformly sample points on a sphere
         if skybox_radius < max_distance * 10:
             skybox_radius = max(skybox_radius, max_distance * 2)
-            CONSOLE.log(
+            say(
                 f"[WARNING] Skybox radius is smaller than 10x the scene extent.\n"
                 f"\tSkybox radius: {skybox_radius}\n"
                 f"\tScene extent: {max_distance}"

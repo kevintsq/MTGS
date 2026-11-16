@@ -4,6 +4,7 @@
 # Copyright (c) OpenDriveLab. All rights reserved.                              #
 #-------------------------------------------------------------------------------#
 from __future__ import annotations
+from nuplan_scripts.utils.console import say
 
 import os
 from copy import deepcopy
@@ -15,7 +16,7 @@ import torch
 from jaxtyping import Bool, Float, Int32, UInt8
 from nerfstudio.cameras.cameras import Cameras
 from nerfstudio.data.datasets.base_dataset import InputDataset
-from nerfstudio.utils.rich_utils import CONSOLE
+
 from PIL import Image
 
 from mtgs.dataset.nuplan_dataparser import NuPlanDataparserOutputs
@@ -65,8 +66,8 @@ def _decode_jpeg_cv2(path, check_paths):
             _CV2_JPEG = ok
         except Exception:
             _CV2_JPEG = False
-        print(f"[image cache] JPEG decode for sample reloads: {'cv2 (identical to PIL on the check images)' if _CV2_JPEG else 'PIL (cv2 differs here)'}",
-              flush=True)   # print, not CONSOLE.log: rich draws from python's global random (see utils/dataloader._init_capped)
+        say(f"[image cache] JPEG decode for sample reloads: {'cv2 (identical to PIL on the check images)' if _CV2_JPEG else 'PIL (cv2 differs here)'}",
+              flush=True)
     if not _CV2_JPEG:
         return None
     b = cv2.imread(str(path), cv2.IMREAD_COLOR)
@@ -103,7 +104,7 @@ class CustomInputDataset(InputDataset):
                  undistort_images: Literal["optimal", "keep_focal_length", False] = "optimal",
                  eval_dataset: bool = False,
                  ):
-        CONSOLE.log(f"Using CustomInputDataset, eval: {eval_dataset}")
+        say(f"Using CustomInputDataset, eval: {eval_dataset}")
         self.crop_size = crop_size
         self.fake_data = fake_data
         self.load_mask = load_mask

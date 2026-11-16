@@ -3,13 +3,13 @@
 # Source code: https://github.com/OpenDriveLab/MTGS                             #
 # Copyright (c) OpenDriveLab. All rights reserved.                              #
 #-------------------------------------------------------------------------------#
+from nuplan_scripts.utils.console import say
 from pathlib import Path
 from collections import OrderedDict
 
 import numpy as np
 import torch
 
-from nerfstudio.utils.rich_utils import CONSOLE
 from nerfstudio.pipelines.base_pipeline import VanillaPipeline
 from mtgs.scene_model.mtgs_scene_graph import MTGSSceneModel, merge_control_cfg
 from mtgs.utils.ckpt_io import load_ckpt
@@ -19,7 +19,7 @@ def extract_portable_ckpt(pipeline: VanillaPipeline, output_path: Path) -> torch
     model.eval()
     gaussians = getattr(model, "gaussian_models", None)
     if gaussians is None:
-        CONSOLE.log("[WARNING] No Gaussian models found in the model.", "red")
+        say("[WARNING] No Gaussian models found in the model.", "red")
         return None
 
     video_scene = pipeline.datamanager.dataparser.video_scene
@@ -73,7 +73,7 @@ def extract_portable_ckpt_from_file(ckpt_path: Path, ns_config, video_scene, out
             model_name, subkey = key[len("_model.gaussian_models."):].split(".", maxsplit=1)
             per_model.setdefault(model_name, OrderedDict())[subkey] = value
     if not per_model:
-        CONSOLE.log("[WARNING] No Gaussian models found in the checkpoint.", "red")
+        say("[WARNING] No Gaussian models found in the checkpoint.", "red")
         return None
 
     model_cfg = ns_config.pipeline.model

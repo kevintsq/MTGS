@@ -3,6 +3,7 @@
 # Source code: https://github.com/OpenDriveLab/MTGS                             #
 # Copyright (c) OpenDriveLab. All rights reserved.                              #
 #-------------------------------------------------------------------------------#
+from nuplan_scripts.utils.console import say
 import copy
 from dataclasses import dataclass, field
 from functools import cached_property
@@ -20,7 +21,7 @@ from torch import nn
 try:
     from gsplat.rendering import rasterization
 except ImportError:
-    print("Please install gsplat>=1.3.0")
+    say("Please install gsplat>=1.3.0")
 
 from nerfstudio.cameras.cameras import Cameras
 from nerfstudio.data.scene_box import OrientedBox
@@ -28,7 +29,7 @@ from nerfstudio.engine.callbacks import TrainingCallback, TrainingCallbackAttrib
 import mtgs.scene_model.gaussian_model.vanilla_gaussian_splatting as _vgs   # experiment switches (COVER_*, VIS_LR)
 
 from nerfstudio.models.base_model import Model, ModelConfig
-from nerfstudio.utils.rich_utils import CONSOLE
+
 from nerfstudio.utils import colormaps
 from nerfstudio.field_components.embedding import Embedding
 from nerfstudio.cameras.camera_optimizers import CameraOptimizer, CameraOptimizerConfig
@@ -247,7 +248,7 @@ class MTGSSceneModel(Model):
                     d_cam, _ = cKDTree(cam_centres).query(init_xyz.detach().cpu().numpy(), k=1)
                     keep = torch.from_numpy(d_cam >= min_cam_dist)
                     if (~keep).sum() > 0:
-                        CONSOLE.log(f"init points: dropped {int((~keep).sum())} of {init_xyz.shape[0]} within {min_cam_dist} m of a training camera")
+                        say(f"init points: dropped {int((~keep).sum())} of {init_xyz.shape[0]} within {min_cam_dist} m of a training camera")
                         init_xyz = init_xyz[keep]; init_rgb = init_rgb[keep]
                 background_model.populate_modules(
                     points_3d = dict(
@@ -517,7 +518,7 @@ class MTGSSceneModel(Model):
 
             if "rgbs" in gs and _os.environ.get("MTGS_DEBUG_NAN") == "1":   # (key was misspelt "rbgs": the check never ran)
                 if torch.isnan(gs['rgbs']).any() or torch.isinf(gs['rgbs']).any():
-                    print(f"NaN or inf in rgbs for model {model_name}", flush=True)
+                    say(f"NaN or inf in rgbs for model {model_name}", flush=True)
 
             gs_dict["model_id"].append(
                 torch.full((gs["means"].shape[0],), model_id, device=self.device)
@@ -1346,7 +1347,7 @@ class MTGSSceneModel(Model):
             orig(grad_scaler, param_groups)
             self._vis_lr_extra(optimizers)
         optimizers.optimizer_scaler_step_some = stepped
-        print(f"[vis-lr] installed: beta {_vgs.VIS_LR_BETA} max {_vgs.VIS_LR_MAX} start {_vgs.COVER_START} params {self.VIS_LR_PARAMS}", flush=True)
+        say(f"[vis-lr] installed: beta {_vgs.VIS_LR_BETA} max {_vgs.VIS_LR_MAX} start {_vgs.COVER_START} params {self.VIS_LR_PARAMS}", flush=True)
 
     @torch.no_grad()
     def _vis_lr_extra(self, optimizers):
@@ -1374,7 +1375,7 @@ class MTGSSceneModel(Model):
             p.data.add_(delta * mult.view(-1, *([1] * (p.dim() - 1))))
         if self.step % _vgs.COVER_LOG_EVERY == 0:   # log: one sync per 10k steps
             act = mult > 0
-            print(f"[vis-lr] step {self.step}: {int(act.sum())} of {int(contrib.sum())} contributing gaussians scaled, "
+            say(f"[vis-lr] step {self.step}: {int(act.sum())} of {int(contrib.sum())} contributing gaussians scaled, "
                   f"mean scale of the scaled {float((mult[act] + 1).mean()) if bool(act.any()) else 1.0:.2f}", flush=True)
 
     def release_cached_memory(self, step):
@@ -1540,14 +1541,14 @@ class MTGSSceneModel(Model):
                 model_name = key.replace("gaussian_models.", "")
                 model_name, subkey = model_name.split(".", maxsplit=1)
                 if model_name not in self.gaussian_models.keys():
-                    print("Skipping loading of submodel", model_name)
+                    say("Skipping loading of submodel", model_name)
                     continue
                 sub_model_state_dict[model_name][subkey] = value
 
         for model_name, model in self.gaussian_models.items():
             instance_trans = sub_model_state_dict[model_name].get("instance_trans", None)
             if (instance_trans is not None) and (instance_trans.dim() > 1) and (model.num_frames != instance_trans.shape[0]):
-                CONSOLE.print("[WARNING] Mismatch in number of frames for", model_name, ". Loading as static object, placed at the position in the first frame.")
+                say("[WARNING] Mismatch in number of frames for", model_name, ". Loading as static object, placed at the position in the first frame.")
                 in_frame_mask = instance_trans[:, 2] < 10.
                 sub_model_state_dict[model_name]['instance_quats'] = sub_model_state_dict[model_name]['instance_quats'][in_frame_mask][0]
                 sub_model_state_dict[model_name]['instance_trans'] = instance_trans[in_frame_mask][0]
@@ -1556,7 +1557,7 @@ class MTGSSceneModel(Model):
         other_state_dict = {key: value for key, value in dict.items() if not key.startswith("gaussian_models.")}
         if 'camera_optimizer.pose_adjustment' in other_state_dict:
             if len(other_state_dict['camera_optimizer.pose_adjustment']) != self.num_train_data:
-                CONSOLE.print("[WARNING] Mismatch in number of frames for camera optimizer and appearance model. Ignoring.")
+                say("[WARNING] Mismatch in number of frames for camera optimizer and appearance model. Ignoring.")
                 other_state_dict.pop('camera_optimizer.pose_adjustment')
                 other_state_dict.pop('appearance_model.exposure_factor')
         if 'strict' in kwargs:

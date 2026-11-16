@@ -3,6 +3,7 @@
 # Source code: https://github.com/OpenDriveLab/MTGS                             #
 # Copyright (c) OpenDriveLab. All rights reserved.                              #
 #-------------------------------------------------------------------------------#
+from nuplan_scripts.utils.console import say
 import os
 import argparse
 import jsonlines
@@ -421,7 +422,7 @@ if __name__ == '__main__':
     video_infos = sort_video_infos(config, video_infos)
 
     if args.prefilter and len(config.selected_videos) != 0:
-        CONSOLE.print(f'Prefilter with selected video idx {config.selected_videos}')
+        say(f'Prefilter with selected video idx {config.selected_videos}')
         # NOTE: this may not always consistent with filter_trajectory.py, when specify start_frame and end_frame.
         # because sometime the lidar_pc will be skipped, when images or lidar are not available.
         new_video_infos = []

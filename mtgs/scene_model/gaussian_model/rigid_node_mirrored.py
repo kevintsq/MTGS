@@ -3,6 +3,7 @@
 # Source code: https://github.com/OpenDriveLab/MTGS                             #
 # Copyright (c) OpenDriveLab. All rights reserved.                              #
 #-------------------------------------------------------------------------------#
+from nuplan_scripts.utils.console import say
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple, Type, Union, Any
 
@@ -12,7 +13,7 @@ from torch.nn import Parameter, Module
 try:
     from gsplat.cuda._wrapper import spherical_harmonics
 except ImportError:
-    print("Please install gsplat>=1.0.0")
+    say("Please install gsplat>=1.0.0")
 
 from .utils import quat_mult, quat_to_rotmat
 

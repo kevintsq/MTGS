@@ -3,6 +3,7 @@
 # Source code: https://github.com/OpenDriveLab/MTGS                             #
 # Copyright (c) OpenDriveLab. All rights reserved.                              #
 #-------------------------------------------------------------------------------#
+from nuplan_scripts.utils.console import say
 from dataclasses import dataclass, field
 from typing import Optional, Type, Literal
 
@@ -11,7 +12,7 @@ import torch
 try:
     from gsplat.cuda._wrapper import spherical_harmonics
 except ImportError:
-    print("Please install gsplat>=1.0.0")
+    say("Please install gsplat>=1.0.0")
 
 from .vanilla_gaussian_splatting import VanillaGaussianSplattingModel, VanillaGaussianSplattingModelConfig
 
@@ -50,7 +51,7 @@ class MultiColorGaussianSplattingModel(VanillaGaussianSplattingModel):
         # colour = the DC adapter only), so the colour memory no longer grows with the number of passes (N x T x 15 x 3 floats).
         if __import__("os").environ.get("MTGS_SHARED_REST") == "1" and self.config.multi_feature_rest:
             self.config.multi_feature_rest = False
-            print(f"[shared-rest] {getattr(self, 'model_name', '?')}: multi_feature_rest off", flush=True)
+            say(f"[shared-rest] {getattr(self, 'model_name', '?')}: multi_feature_rest off", flush=True)
         super().populate_modules(points_3d, **kwargs)
         if num_traversals is None:
             return

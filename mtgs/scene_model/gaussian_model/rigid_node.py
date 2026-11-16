@@ -3,6 +3,7 @@
 # Source code: https://github.com/OpenDriveLab/MTGS                             #
 # Copyright (c) OpenDriveLab. All rights reserved.                              #
 #-------------------------------------------------------------------------------#
+from nuplan_scripts.utils.console import say
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple, Type, Union, Any, Literal
 import warnings
@@ -16,9 +17,7 @@ from torch.nn import Parameter
 try:
     from gsplat.cuda._wrapper import spherical_harmonics
 except ImportError:
-    print("Please install gsplat>=1.0.0")
-
-from nerfstudio.utils.rich_utils import CONSOLE
+    say("Please install gsplat>=1.0.0")
 
 from .utils import quat_mult, matrix_to_quaternion, quat_to_rotmat, interpolate_quats, IDFT
 from .vanilla_gaussian_splatting import VanillaGaussianSplattingModel, VanillaGaussianSplattingModelConfig
@@ -107,7 +106,7 @@ class RigidSubModel(VanillaGaussianSplattingModel):
             self.instance_trans = Parameter(instance_trans)  # (num_frame, 3)
 
         if (self.config.fourier_in_space == 'spatial') and (self.config.fourier_features_scale != 1):
-            print("[WARNING] For spatial Fourier features, set the scale to 1. Automatically correcting...")
+            say("[WARNING] For spatial Fourier features, set the scale to 1. Automatically correcting...")
             self.config.fourier_features_scale = 1
 
     @property
@@ -371,7 +370,7 @@ class RigidSubModel(VanillaGaussianSplattingModel):
             return
         if self.step < self.ctrl_config.stop_split_at:
             if self.xys_grad_norm is None or self.vis_counts is None or self.max_2Dsize is None:
-                CONSOLE.log(f"skip refinement after for rigid object {self.model_name}")
+                say(f"skip refinement after for rigid object {self.model_name}")
                 return
 
         super().refinement_after(optimizers, step)

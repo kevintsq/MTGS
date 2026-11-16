@@ -23,6 +23,7 @@ umeyama scale) but the depth stays on the GPU for the upsample, the lidar scale 
 (sweeps cached per video on the GPU) and the cm quantisation; writer threads paste,
 sky-mask and encode the PNGs.
 """
+from nuplan_scripts.utils.console import say
 import os
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
@@ -150,7 +151,7 @@ def run_da3_multiview(video_scene, video_scene_dict, undistort_mode, max_range, 
     model_id = os.environ.get('MTGS_DA3_MODEL', 'depth-anything/DA3NESTED-GIANT-LARGE-1.1')
     Wn = int(os.environ.get('MTGS_DA3_WINDOW', 9)); St = int(os.environ.get('MTGS_DA3_STRIDE', 4))
     model = DepthAnything3.from_pretrained(model_id).to(device='cuda')
-    print(f'[dense_depth_da3] {model_id}, window {Wn}, stride {St}')
+    say(f'[dense_depth_da3] {model_id}, window {Wn}, stride {St}')
 
     # (video, cam, lens) -> [(timestamp, frame_info, cam_info)]. The lens is part of the key: a camera the BA did
     # not register has no colmap_param and is undistorted with the calibration, so its crop has another size than
@@ -233,7 +234,7 @@ def run_da3_multiview(video_scene, video_scene_dict, undistort_mode, max_range, 
                         depth = depth * rw
                     elif abs(np.log(rw)) > np.log(1.0 + scale_tol):
                         depth = depth * rw
-                        print(f'[dense_depth_da3] {key[1]} window {s0}: lidar/DA3 scale {rw:.2f} -> rescaled', flush=True)
+                        say(f'[dense_depth_da3] {key[1]} window {s0}: lidar/DA3 scale {rw:.2f} -> rescaled', flush=True)
                 elif not metric:
                     depth = torch.zeros_like(depth)         # no pose scale and no lidar: invalid, not a guessed scale
                 c = s0 + (len(idx) - 1) / 2.0
@@ -254,7 +255,7 @@ def run_da3_multiview(video_scene, video_scene_dict, undistort_mode, max_range, 
     loaders.shutdown(wait=True); writer.shutdown(wait=True)
     if ratios:
         r = np.array(ratios)
-        print(f'[dense_depth_da3] lidar scale check: {len(r)} windows, median ratio {np.median(r):.3f}, '
+        say(f'[dense_depth_da3] lidar scale check: {len(r)} windows, median ratio {np.median(r):.3f}, '
               f'p5 {np.percentile(r, 5):.2f}, p95 {np.percentile(r, 95):.2f}, rescaled {n_scaled_windows} '
               f'(|log ratio| > log {1.0 + scale_tol:.2f})', flush=True)
     del model; torch.cuda.empty_cache()

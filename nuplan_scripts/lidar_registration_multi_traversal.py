@@ -912,6 +912,24 @@ def _pass_accumulation(video, scans_by_token, poses):
     return np.concatenate(pts) if pts else None
 
 
+def _refine_on_own_lidar(video, result_poses_dict_aligned, scans_by_token):
+    """Two rounds of per-frame map ICP of a pass onto the accumulation of its OWN scans at its current poses: the pass
+    gets lidar-consistent frame poses while its absolute frame (GPS / INS) stays. For passes no other pass can anchor
+    (see the GPS-pass consolidation). Returns (poses, report)."""
+    import open3d as o3d
+    vox = float(os.environ.get('MTGS_REG_MAP_ICP_VOXEL', 0.3))
+    pr = {i['token']: result_poses_dict_aligned[i['token']] for i in video['frame_infos'] if i['token'] in result_poses_dict_aligned}
+    rep = "no scans"
+    for _ in range(2):
+        pts = _pass_accumulation(video, scans_by_token, pr)
+        if pts is None or len(pts) < 5000:
+            break
+        ref = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(pts)).voxel_down_sample(vox)
+        ref.estimate_normals(o3d.geometry.KDTreeSearchParamHybrid(radius=vox * 4, max_nn=30))
+        pr, rep = _map_icp_frames(video, scans_by_token, pr, ref, vox)
+    return pr, rep
+
+
 def _inconsistent_passes(vt, video_scene_dict, poses, scans_by_token, clouds):
     """Passes that overlap pass `vt` but are NOT already registered with it. Sampled scans of vt are ICP'd one by one
     onto the other pass's accumulation; the median correction (translation, and roll/pitch/yaw about the scan's own
@@ -1320,17 +1338,8 @@ if __name__ == '__main__':
                 # bump of the camera against the model (st_e756), and a single GPS pass never even reached the old
                 # 'len(_live) > 1' branch (no map to consolidate onto -> left as is). It is refined on its own lidar: two
                 # rounds of per-frame map ICP onto the accumulation of its own scans; the INS keeps the absolute frame.
-                import open3d as o3d
-                _v = video_scene_dict[_root]; _vox = float(os.environ.get('MTGS_REG_MAP_ICP_VOXEL', 0.3))
-                _pr = {i['token']: result_poses_dict_aligned[i['token']] for i in _v['frame_infos'] if i['token'] in result_poses_dict_aligned}
-                _rep = "no scans"
-                for _ in range(2):
-                    _pts = _pass_accumulation(_v, _scans_by_token, _pr)
-                    if _pts is None or len(_pts) < 5000:
-                        break
-                    _ref = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(_pts)).voxel_down_sample(_vox)
-                    _ref.estimate_normals(o3d.geometry.KDTreeSearchParamHybrid(radius=_vox * 4, max_nn=30))
-                    _pr, _rep = _map_icp_frames(_v, _scans_by_token, _pr, _ref, _vox)
+                _v = video_scene_dict[_root]
+                _pr, _rep = _refine_on_own_lidar(_v, result_poses_dict_aligned, _scans_by_token)
                 _d = [float(np.linalg.norm(_pr[t][:3, 3] - result_poses_dict_aligned[t][:3, 3])) for t in _pr]
                 result_poses_dict_aligned.update(_pr)
                 say(f"No ICP-registered pass to anchor to: video {_root.split('-')[-1]} (GPS poses) is the reference, refined "
@@ -1354,7 +1363,14 @@ if __name__ == '__main__':
                                 f"(moved median {np.median(_d) if _d else 0:.2f} m, max {max(_d) if _d else 0:.2f} m): {rep}", style="yellow")
                     result_poses_dict_aligned.update(fixed); gps_videos.discard(vt); _trusted.add(vt)
                 else:
-                    say(f"GPS pass {vt.split('-')[-1]} stays on GPS poses (map ICP: {rep})", style="bold red")
+                    # no overlap with the trusted passes (nb_20 pass 22: fitness 0, a 17 m "fit"): it cannot be anchored,
+                    # but it must not stay on raw INS either -- refine it on its own lidar, the INS keeps its frame
+                    _pr, _rep = _refine_on_own_lidar(video_scene_dict[vt], result_poses_dict_aligned, _scans_by_token)
+                    _d = [float(np.linalg.norm(_pr[t][:3, 3] - result_poses_dict_aligned[t][:3, 3])) for t in _pr]
+                    result_poses_dict_aligned.update(_pr)
+                    say(f"GPS pass {vt.split('-')[-1]} cannot be placed on the trusted passes (map ICP: {rep}); refined on its "
+                        f"own lidar instead (moved median {np.median(_d) if _d else 0:.2f} m, max {max(_d) if _d else 0:.2f} m; {_rep})",
+                        style="bold yellow")
 
         # MTGS_REG_MAP_ICP_ALL=1: inter-pass consistency sweep. The passes only agree
         # as well as the odometry chain and the x/y Kabsch let them (fq_loc_0182,

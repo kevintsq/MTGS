@@ -447,13 +447,15 @@ def check_selected_frames(frame_stats, max_missing_frac):
 
 
 def check_no_duplicate_frames(video_infos):
-    """No frame of a log may be trained twice (user rule 2026-11-16): a lidar_pc token or a (log, timestamp) in two of
-    the videos (e.g. a selected_videos entry listed twice, overlapping start/end_frame cuts of one pass) stops prep1."""
+    """No frame of a drive may be trained twice (user rule 2026-11-16): a lidar_pc token or a (drive, timestamp) in two
+    of the videos (e.g. a selected_videos entry listed twice, overlapping start/end_frame cuts of one pass; the NAVSIM
+    splits of one drive are disjoint in time) stops prep1."""
+    from nuplan_scripts.utils.log_names import drive_key
     seen, dup = {}, []
     for i, v in enumerate(video_infos):           # by position: the same pass listed twice is a duplicate too
         vt = f"#{i} ({v.get('video_token') or v.get('video_idx')})"
         for pc in v['lidar_pcs']:
-            for key in (('tok', pc.token), ('ts', v['log_name'], int(pc.timestamp))):
+            for key in (('tok', pc.token), ('ts', drive_key(v['log_name']), int(pc.timestamp))):   # splits of a drive too
                 if key in seen and seen[key] != vt:
                     dup.append((v['log_name'], int(pc.timestamp), seen[key], vt))
                 seen.setdefault(key, vt)

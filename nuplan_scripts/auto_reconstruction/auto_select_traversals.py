@@ -69,19 +69,21 @@ def select(stats, test_logs, k, require_logs=()):
     # apart), so its second pass costs images, not a day. MTGS_MAX_PASSES (default 9 = 6 logs x 1.5) bounds the passes,
     # i.e. the training images, so the coverage fill cannot keep adding passes of logs it already holds. Flag off: k
     # counts passes exactly as before.
+    # "Log" here is the DRIVE (user 2026-11-16): the NAVSIM splits of one recorded drive count as one (drive_key).
+    from nuplan_scripts.utils.log_names import drive_key
     per_log = os.environ.get('MTGS_APPEARANCE_PER_LOG', '0') == '1'
     max_passes = int(os.environ.get('MTGS_MAX_PASSES', 9)) if per_log else k
     def _n_logs(ss):
-        return len({s_["log"] for s_ in ss})
+        return len({drive_key(s_["log"]) for s_ in ss})
     def _can_add(chosen_, s_):
         if not per_log:
             return len(chosen_) < k
-        return len(chosen_) < max_passes and (s_["log"] in {c["log"] for c in chosen_} or _n_logs(chosen_) < k)
+        return len(chosen_) < max_passes and (drive_key(s_["log"]) in {drive_key(c["log"]) for c in chosen_} or _n_logs(chosen_) < k)
     def _full(chosen_):
         if not per_log:
             return len(chosen_) >= k
         return len(chosen_) >= max_passes or (_n_logs(chosen_) >= k and not any(
-            s_["log"] in {c["log"] for c in chosen_} and s_["idx"] not in {c["idx"] for c in chosen_} for s_ in stats))
+            drive_key(s_["log"]) in {drive_key(c["log"]) for c in chosen_} and s_["idx"] not in {c["idx"] for c in chosen_} for s_ in stats))
     # Bad-weather logs poison a reconstruction (wet-road spray bakes into the
     # background; a clear scene renders rainy). Exclusion is a hard filter,
     # overriding even require_logs -- prefer clear multi-traversal over a
@@ -164,7 +166,7 @@ def select(stats, test_logs, k, require_logs=()):
     if over:
         rows = "\n  ".join(f"{s_['log']} pass {s_['idx']}: {s_['n']} frames, "
                            f"ts {s_['ts']}-{s_.get('ts_end', s_['ts'])}" for s_ in req)
-        what = (f"{_n_logs(req)} required logs / {len(req)} passes for {k} logs / {max_passes} passes "
+        what = (f"{_n_logs(req)} required drives / {len(req)} passes for {k} drives / {max_passes} passes "
                 f"(MTGS_APPEARANCE_PER_LOG=1)" if per_log else
                 f"{len(req)} required passes for {k} slots (a log crossing the block twice counts twice)")
         if os.environ.get('MTGS_REQUIRE_OVERFLOW', '') == 'drop_shortest':
@@ -282,8 +284,8 @@ def select(stats, test_logs, k, require_logs=()):
         rest.remove(best)
         chosen.append(best)
     if per_log:
-        say(f"[auto_select] MTGS_APPEARANCE_PER_LOG: {len(chosen)} passes from {_n_logs(chosen)} logs "
-            f"(caps {k} logs / {max_passes} passes)", flush=True)
+        say(f"[auto_select] MTGS_APPEARANCE_PER_LOG: {len(chosen)} passes from {_n_logs(chosen)} drives "
+            f"(caps {k} drives / {max_passes} passes)", flush=True)
     return sorted(s["idx"] for s in chosen)
 
 

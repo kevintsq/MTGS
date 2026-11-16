@@ -75,19 +75,20 @@ if __name__ == '__main__':
         ns_config.optimizers['camera_opt']['optimizer'].lr = float(os.environ['MTGS_CAM_OPT_LR'])
     ns_config.pipeline.datamanager.dataparser.train_scene_travels = travels
     ns_config.pipeline.datamanager.dataparser.eval_scene_travels = travels
-    # MTGS_APPEARANCE_PER_LOG=1 (2026-11-16): passes of one log share one appearance row (same day, minutes apart), so
-    # the colour parameters [N, rows, ...] grow with logs, not passes. Saved in config.yml (dataparser.appearance_groups)
+    # MTGS_APPEARANCE_PER_LOG=1 (2026-11-16): passes of one DRIVE (all its NAVSIM splits) share one appearance row (same
+    # day, minutes apart), so the colour parameters [N, rows, ...] grow with drives, not passes. Saved in config.yml (dataparser.appearance_groups)
     # for the converter and the appearance side file.
     if os.environ.get('MTGS_APPEARANCE_PER_LOG', '0') == '1':
         if isinstance(config, FrameCentralConfig):
             raise SystemExit("MTGS_APPEARANCE_PER_LOG=1 needs a multi-traversal road block (RoadBlockConfig)")
         _vs = VideoScene(config)
         _vsd = _vs.load_pickle(_vs.pickle_path)
-        _log = {int(k.rsplit('-', 1)[1]): v['log_name'] for k, v in _vsd.items()}
+        from nuplan_scripts.utils.log_names import drive_key          # same drive = same appearance (NAVSIM splits)
+        _log = {int(k.rsplit('-', 1)[1]): drive_key(v['log_name']) for k, v in _vsd.items()}
         _row = {}
         groups = tuple(_row.setdefault(_log[t], len(_row)) for t in travels)
         ns_config.pipeline.datamanager.dataparser.appearance_groups = groups
-        say(f"[per-log appearance] {len(travels)} passes -> {len(_row)} appearance rows: "
+        say(f"[per-log appearance] {len(travels)} passes -> {len(_row)} appearance rows (one per drive): "
             f"{dict(zip(travels, groups))}")
     ns_config.pipeline.model.color_corrected_metrics = False
     ns_config.pipeline.model.lpips_metric = False

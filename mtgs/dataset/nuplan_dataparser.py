@@ -63,7 +63,7 @@ class NuplanDataParserConfig(DataParserConfig):
     train_scene_travels: tuple[int, ...] = ()
     eval_scene_travels: tuple[int, ...] = ()
     appearance_groups: tuple[int, ...] = ()
-    """Appearance row of each train_scene_travels entry (same order). Passes of one log share a row
+    """Appearance row of each train_scene_travels entry (same order). Passes of one drive share a row
     (MTGS_APPEARANCE_PER_LOG=1, set by background_reconstruction.py); empty = one row per pass."""
     manual_split: bool = False
     """If True, the train and eval frames are interleaved one by one."""

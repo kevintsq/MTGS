@@ -38,12 +38,19 @@ class MultiColorGaussianSplattingModel(VanillaGaussianSplattingModel):
         config: MultiColorGaussianSplattingModelConfig,
         travel_ids: dict = None,
         nearest_train_travel_of_eval: dict = None,
+        travel_rows: dict = None,
         **kwargs,
     ):
         super().__init__(config, **kwargs)
-        self.travel_mapping = {
-            travel_id: i for i, travel_id in enumerate(travel_ids)
-        }
+        # travel id -> appearance row. travel_rows (per-log appearance): passes of one log share a row; default one
+        # row per travel in train order.
+        if travel_rows:
+            self.travel_mapping = {travel_id: int(travel_rows[travel_id]) for travel_id in travel_ids}
+        else:
+            self.travel_mapping = {
+                travel_id: i for i, travel_id in enumerate(travel_ids)
+            }
+        self.num_rows = len(set(self.travel_mapping.values()))
         self.nearest_train_travel_of_eval = nearest_train_travel_of_eval
 
     def populate_modules(self, points_3d=None, num_traversals=None, **kwargs):
@@ -145,11 +152,11 @@ class MultiColorGaussianSplattingModel(VanillaGaussianSplattingModel):
         return return_dict
 
     def load_state_dict(self, dict, **kwargs):
-        if "gauss_params.features_adapters" in dict and dict['gauss_params.features_adapters'].shape[1] != len(self.travel_mapping):
+        if "gauss_params.features_adapters" in dict and dict['gauss_params.features_adapters'].shape[1] != self.num_rows:
             if self.config.eval_mode == "mean":
-                dict['gauss_params.features_adapters'] = dict['gauss_params.features_adapters'].mean(dim=1, keepdim=True).expand(-1, len(self.travel_mapping), -1)
+                dict['gauss_params.features_adapters'] = dict['gauss_params.features_adapters'].mean(dim=1, keepdim=True).expand(-1, self.num_rows, -1)
                 if self.config.multi_feature_rest:
-                    dict['gauss_params.features_rest'] = dict['gauss_params.features_rest'].mean(dim=1, keepdim=True).expand(-1, len(self.travel_mapping), -1, -1)
+                    dict['gauss_params.features_rest'] = dict['gauss_params.features_rest'].mean(dim=1, keepdim=True).expand(-1, self.num_rows, -1, -1)
             else:
                 dict.pop('gauss_params.features_adapters')
                 if self.config.multi_feature_rest:

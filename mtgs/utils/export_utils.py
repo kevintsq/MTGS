@@ -86,7 +86,9 @@ def extract_portable_ckpt_from_file(ckpt_path: Path, ns_config, video_scene, out
     for model_id, (model_name, state_dict) in enumerate(per_model.items()):
         node_type = next(k for k in model_cfg.model_config if model_name == k or model_name.startswith(k + "_"))
         cfg = merge_control_cfg(model_cfg.control, model_cfg.model_config[node_type])
-        submodel = cfg.setup(model_name=model_name, model_id=model_id, travel_ids=travel_ids, nearest_train_travel_of_eval=None)
+        rows = dict(zip(travel_ids, getattr(dp_cfg, "appearance_groups", ()) or ())) or None
+        submodel = cfg.setup(model_name=model_name, model_id=model_id, travel_ids=travel_ids, nearest_train_travel_of_eval=None,
+                             **({"travel_rows": rows} if node_type in ("background", "skybox") else {}))
         if node_type == "rigid_object":   # portable_config of a moving object lists its log timestamps
             submodel.is_static = state_dict["instance_quats"].ndim == 1
             submodel.dataframe_dict = {"raw_timestamps": raw_timestamps[int(model_name[len(node_type) + 1:].split("_")[0])]}

@@ -203,6 +203,8 @@ class MTGSSceneModel(Model):
         self.data_frame_dict = self.datamanager.train_dataparser_outputs.metadata['multi_travel_frame_timestamps']
         self.train_travel_infos = self.datamanager.train_dataparser_outputs.metadata.get("train_travel_ids", ())
         self.train_travel_ids = [travel['idx'] if isinstance(travel, dict) else travel for travel in self.train_travel_infos]
+        # per-log appearance (dataparser appearance_groups): travel id -> shared appearance row; None = one per travel
+        self.travel_rows = self.datamanager.train_dataparser_outputs.metadata.get("appearance_rows", None)
         self.frame_token2frame_idx = self.datamanager.train_dataparser_outputs.metadata['frame_token2frame_idx']
         self.cam_token2cam_idx = self.datamanager.train_dataparser_outputs.metadata['cam_token2cam_idx']
         self.instance_info = self.datamanager.train_dataparser_outputs.metadata.get("instances_info", None)
@@ -233,6 +235,7 @@ class MTGSSceneModel(Model):
                     model_name=model_name, 
                     model_id=cur_model_id,
                     travel_ids=self.train_travel_ids,
+                    travel_rows=self.travel_rows,
                     nearest_train_travel_of_eval=self.datamanager.train_dataparser_outputs.metadata['nearest_train_travel_of_eval'],
                 )
                 init_xyz = self.datamanager.train_dataparser_outputs.metadata["points3D_xyz"]
@@ -272,6 +275,7 @@ class MTGSSceneModel(Model):
                     model_name=model_name,
                     model_id=cur_model_id,
                     travel_ids=self.train_travel_ids,
+                    travel_rows=self.travel_rows,
                     nearest_train_travel_of_eval=self.datamanager.train_dataparser_outputs.metadata['nearest_train_travel_of_eval'],
                 )
                 sky_model.populate_modules(
@@ -394,6 +398,9 @@ class MTGSSceneModel(Model):
 
     @cached_property
     def num_traversals(self):
+        """Appearance rows: one per travel, or one per log with per-log appearance."""
+        if self.travel_rows:
+            return len(set(self.travel_rows.values()))
         return len(self.train_travel_ids)
 
     @cached_property

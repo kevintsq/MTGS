@@ -62,6 +62,9 @@ class NuplanDataParserConfig(DataParserConfig):
 
     train_scene_travels: tuple[int, ...] = ()
     eval_scene_travels: tuple[int, ...] = ()
+    appearance_groups: tuple[int, ...] = ()
+    """Appearance row of each train_scene_travels entry (same order). Passes of one log share a row
+    (MTGS_APPEARANCE_PER_LOG=1, set by background_reconstruction.py); empty = one row per pass."""
     manual_split: bool = False
     """If True, the train and eval frames are interleaved one by one."""
 
@@ -167,6 +170,13 @@ class NuplanDataParser(DataParser):
                     min_distance = distance
                     nearest_traversal[travel_id] = train_travel_id
         metadata['nearest_train_travel_of_eval'] = nearest_traversal
+        # appearance rows (per-log appearance): train travel id -> row; None = one row per pass, in train order
+        metadata['appearance_rows'] = None
+        if self.config.appearance_groups:
+            groups = [int(g) for g in self.config.appearance_groups]
+            if len(groups) != len(metadata['train_travel_ids']):
+                raise ValueError(f"appearance_groups {groups} does not match train_scene_travels {metadata['train_travel_ids']}")
+            metadata['appearance_rows'] = dict(zip(metadata['train_travel_ids'], groups))
 
         travels = self.config.train_scene_travels if split == "train" else self.config.eval_scene_travels
         if travels is None or len(travels) == 0:

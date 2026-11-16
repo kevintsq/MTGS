@@ -6,9 +6,7 @@
 import os
 import yaml
 import pytz
-from rich.console import Console
-
-CONSOLE = Console(width=120)
+from nuplan_scripts.utils.console import CONSOLE   # the one output channel (utils/console.py)
 os.environ['TQDM_NCOLS'] = '120'
 
 # load nuplan config; environment variables override the yaml so per-job

@@ -609,40 +609,53 @@ def _map_icp_frames(video, scans_by_token, poses, ref, voxel, max_dt=1.0, max_dy
     # The rotation is kept as the map-frame rotation vector of D (position independent), the translation as
     # the displacement of the scan origin; MTGS_REG_MAP_ICP_FRAME_ROT_DEG bounds the rotation per frame.
     max_rot_deg = float(os.environ.get('MTGS_REG_MAP_ICP_FRAME_ROT_DEG', 3.0))
-    corr, n_ok = [], 0
-    for t in tokens:
-        P = scans_by_token[t][:, :3]
-        P = P[np.linalg.norm(P[:, :2], axis=1) < 60.0][::2]
-        src = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(P)).voxel_down_sample(voxel)
-        T, fitness, _ = _scan_icp(src, ref, ref_pts, poses[t], (0.8, 0.3), 30)
-        D = T @ np.linalg.inv(poses[t])                     # correction in the map frame (rotation part used)
-        rvec = _R.from_matrix(D[:3, :3]).as_rotvec()
-        dp = T[:3, 3] - poses[t][:3, 3]                     # displacement of the scan origin
-        dt = float(np.linalg.norm(dp)); drot = float(np.degrees(np.linalg.norm(rvec)))
-        dyaw = abs(float(_R.from_matrix(D[:3, :3]).as_euler('zyx', degrees=True)[0]))
-        ok = fitness >= 0.3 and dt <= max_dt and drot <= max_rot_deg and dyaw <= max_dyaw_deg
-        corr.append((rvec, dp) if ok else None); n_ok += ok
-    # smooth: replace each correction by the component-wise median of its window
-    # (rotation vector and origin displacement), so a single bad ICP frame cannot kink the pass
-    out = dict(poses)
-    sm = [None] * len(tokens)                               # smoothed correction per frame, None = no refined frame near it
-    for i, t in enumerate(tokens):
-        nb = [corr[j] for j in range(max(0, i - win // 2), min(len(corr), i + win // 2 + 1)) if corr[j] is not None]
-        if len(nb) < 2:
-            continue
-        sm[i] = (np.median(np.array([x[0] for x in nb]), axis=0), np.median(np.array([x[1] for x in nb]), axis=0))
+
+    def _measure(idx, base):
+        """Scan-to-map correction (map-frame rotation vector, scan-origin displacement) of the frames idx from the
+        poses base, or None where the fit fails a gate."""
+        res = []
+        for i in idx:
+            t = tokens[i]
+            P = scans_by_token[t][:, :3]
+            P = P[np.linalg.norm(P[:, :2], axis=1) < 60.0][::2]
+            src = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(P)).voxel_down_sample(voxel)
+            T, fitness, _ = _scan_icp(src, ref, ref_pts, base[t], (0.8, 0.3), 30)
+            D = T @ np.linalg.inv(base[t])                      # correction in the map frame (rotation part used)
+            rvec = _R.from_matrix(D[:3, :3]).as_rotvec()
+            dp = T[:3, 3] - base[t][:3, 3]                      # displacement of the scan origin
+            dt = float(np.linalg.norm(dp)); drot = float(np.degrees(np.linalg.norm(rvec)))
+            dyaw = abs(float(_R.from_matrix(D[:3, :3]).as_euler('zyx', degrees=True)[0]))
+            ok = fitness >= 0.3 and dt <= max_dt and drot <= max_rot_deg and dyaw <= max_dyaw_deg
+            res.append((rvec, dp) if ok else None)
+        return res
+
+    def _smooth(c):
+        """Component-wise median of each frame's window (rotation vector and origin displacement), so a single bad
+        ICP frame cannot kink the pass; None where fewer than 2 frames of the window were refined."""
+        sm = [None] * len(c)
+        for i in range(len(c)):
+            nb = [c[j] for j in range(max(0, i - win // 2), min(len(c), i + win // 2 + 1)) if c[j] is not None]
+            if len(nb) >= 2:
+                sm[i] = (np.median(np.array([x[0] for x in nb]), axis=0), np.median(np.array([x[1] for x in nb]), axis=0))
+        return sm
+
+    def _apply(c, P):
+        M = np.eye(4); M[:3, :3] = _R.from_rotvec(c[0]).as_matrix() @ P[:3, :3]; M[:3, 3] = P[:3, 3] + c[1]
+        return M
+
+    corr = _measure(range(len(tokens)), poses)
+    n_ok = sum(c is not None for c in corr)
+    sm = _smooth(corr)
     # Frames without a refined frame near them must not keep the input pose: next to refined frames that sit up to
     # max_dt away from it, the pass then holds two frames of reference with a step between them (ru_area0806 pass 357,
-    # 2026-11-16: 47 frames left on the INS shape, 2.2 m / 0.85 m steps to the refined frames on either side, a road
+    # 2026-11-16: 47 frames left on the INS shape, 2.2 m / 0.85 m z steps to the refined frames on either side, a road
     # smeared over 2 m under them, the camera placed into it -> white fog in HUGSIM). They take the correction of the
-    # refined frames before and after them, blended by frame index (one side only: that one), like ego_pose_carry.
+    # refined frames before and after them, blended by frame index (one side only: that one), like ego_pose_carry ...
     ok_idx = [i for i in range(len(tokens)) if sm[i] is not None]
-    n_carried = 0
+    carried = [i for i in range(len(tokens)) if sm[i] is None] if ok_idx else []
     if ok_idx:
         oi = np.asarray(ok_idx)
-        for i in range(len(tokens)):
-            if sm[i] is not None:
-                continue
+        for i in carried:
             k = int(np.searchsorted(oi, i)); a = ok_idx[k - 1] if k > 0 else None; b = ok_idx[k] if k < len(ok_idx) else None
             if a is None or b is None:
                 sm[i] = sm[b if a is None else a]
@@ -650,19 +663,55 @@ def _map_icp_frames(video, scans_by_token, poses, ref, voxel, max_dt=1.0, max_dy
                 w = (i - a) / (b - a)
                 ra, rb = _R.from_rotvec(sm[a][0]), _R.from_rotvec(sm[b][0])
                 sm[i] = ((ra * _R.from_rotvec(w * (ra.inv() * rb).as_rotvec())).as_rotvec(), (1.0 - w) * sm[a][1] + w * sm[b][1])
-            n_carried += 1
+    out = dict(poses)
     for i, t in enumerate(tokens):
-        if sm[i] is None:
-            continue
-        r, tr = sm[i]
-        M = np.eye(4); M[:3, :3] = _R.from_rotvec(r).as_matrix() @ poses[t][:3, :3]; M[:3, 3] = poses[t][:3, 3] + tr
-        out[t] = M
+        if sm[i] is not None:
+            out[t] = _apply(sm[i], poses[t])
+    # ... and that blend is only the starting point: a second scan-to-map round from it refines the frames whose first
+    # fit failed because the input pose was further off than max_dt (MTGS_REG_MAP_ICP_ROUND2=0 disables it).
+    left, n2 = list(carried), 0
+    if carried and os.environ.get('MTGS_REG_MAP_ICP_ROUND2', '1') == '1':
+        full = [None] * len(tokens)
+        for i, c in zip(carried, _measure(carried, out)):
+            full[i] = c
+        sm2 = _smooth(full)
+        for i in carried:
+            if sm2[i] is not None:
+                out[tokens[i]] = _apply(sm2[i], out[tokens[i]]); n2 += 1
+        left = [i for i in carried if sm2[i] is None]
     mags = [float(np.linalg.norm(x[1])) for x in corr if x is not None]
     rots = [float(np.degrees(np.linalg.norm(x[0]))) for x in corr if x is not None]
-    return out, (tilt_rep + f"per-frame map ICP: {n_ok}/{len(tokens)} frames refined, median correction "
-                 f"{np.median(mags) if mags else 0:.2f} m / {np.median(rots) if rots else 0:.2f} deg, "
-                 f"max {max(mags) if mags else 0:.2f} m / {max(rots) if rots else 0:.2f} deg"
-                 + (f", {n_carried} unrefined frames carried from their refined neighbours" if n_carried else ""))
+    rep = (tilt_rep + f"per-frame map ICP: {n_ok}/{len(tokens)} frames refined, median correction "
+           f"{np.median(mags) if mags else 0:.2f} m / {np.median(rots) if rots else 0:.2f} deg, "
+           f"max {max(mags) if mags else 0:.2f} m / {max(rots) if rots else 0:.2f} deg")
+    if carried:
+        rep += f"; {len(carried)} unrefined frames carried from their refined neighbours, {n2} of them refined in a second round"
+    if left:
+        # what is still unrefined holds interpolated poses only: report every run, stop when one is too long to trust
+        runs, s0 = [], left[0]
+        for x, y in zip(left, left[1:] + [None]):
+            if y != x + 1:
+                runs.append((s0, x)); s0 = y
+        def _len_m(r):
+            P = np.array([out[tokens[i]][:3, 3] for i in range(max(0, r[0] - 1), min(len(tokens), r[1] + 2))])
+            return float(np.linalg.norm(np.diff(P, axis=0), axis=1).sum()) if len(P) > 1 else 0.0
+        spans = [(r, _len_m(r)) for r in runs]
+        (r_w, m_w) = max(spans, key=lambda x: x[1])
+        rep += (f"; {len(left)} frames left on interpolated poses in {len(runs)} run(s), longest frames {r_w[0]}-{r_w[1]} "
+                f"({r_w[1] - r_w[0] + 1} frames, {m_w:.0f} m)")
+        # 100 m: the longest runs of good registrations are 5-73 m (pn_area0806 pass 357 after the fix: 73 m between refined
+        # frames, smooth; px_loc_0195: edge runs up to 70 m); a step at a run's ends is the step QA's job
+        lim = float(os.environ.get('MTGS_REG_MAP_ICP_MAX_UNREFINED_M', 100.0))
+        if lim > 0 and m_w > lim:
+            vt = str(video['frame_infos'][0].get('video_token', '?')) if video['frame_infos'] else '?'
+            msg = (f"per-frame map ICP of pass {vt.rsplit('-', 1)[-1]}: frames {r_w[0]}-{r_w[1]} ({r_w[1] - r_w[0] + 1} frames, "
+                   f"{m_w:.0f} m) could not be refined against the map even from their neighbours' correction; their poses "
+                   f"are interpolated only (limit MTGS_REG_MAP_ICP_MAX_UNREFINED_M={lim:g} m). Stopping instead of training "
+                   f"on them. Report so far: {rep}")
+            say(msg, style="bold red")
+            raise SystemExit(msg)
+    return out, rep
+
 
 def _pass_accumulation(video, scans_by_token, poses):
     """World-frame accumulation of a pass (every 2nd frame, r < 60 m, every 3rd point) at `poses`."""

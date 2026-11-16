@@ -203,6 +203,7 @@ def select(stats, test_logs, k, require_logs=()):
     # scenes' logs are not in the block at all, nothing pulled in passes along the served routes (gap3_01,
     # 2026-11-03: 3/5 required logs left, far buildings and a turn unobserved).
     served = os.environ.get('MTGS_SERVED_ROUTES', '')
+    routes = []
     if served and os.path.exists(served):
         import json
         routes = [np.asarray(r, dtype=float)[:, :2] for r in json.load(open(served)).values() if len(r)]
@@ -211,29 +212,55 @@ def select(stats, test_logs, k, require_logs=()):
             say(f"[auto_select] coverage targets include {len(routes)} served scene routes ({served})", flush=True)
     if len(targets) > 400:
         targets = targets[:: len(targets) // 400 + 1]
+    # Look-ahead (2026-11-16, user rule): the road 20-50 m past each served route's end / before its start and the side
+    # streets within 30 m of it are what the cameras see beyond the route; without trained frames there the last
+    # frames render an empty, smeared street (ml_pit01 / 442ce328). Regions along the driven trajectories of the
+    # candidate passes (lookahead.py); a second coverage target with its own quota, after the route itself.
+    # MTGS_LOOKAHEAD=0 switches it off (A/B).
+    ahead = np.zeros((0, 2))
+    if routes and os.environ.get('MTGS_LOOKAHEAD', '1') != '0':
+        from nuplan_scripts.auto_reconstruction.lookahead import regions as _la_regions
+        _trajs = [s_["traj"] for s_ in usable]
+        _reg = [_la_regions(r, _trajs) for r in routes]
+        parts = [x[k] for x in _reg for k in ("ahead", "behind", "side") if len(x[k])]
+        if parts:
+            ahead = np.concatenate(parts)
+            if len(ahead) > 400:
+                ahead = ahead[:: len(ahead) // 400 + 1]
+            say(f"[auto_select] look-ahead targets: {len(ahead)} points (ahead / behind / side of {len(routes)} routes)", flush=True)
+    COV_KA = int(os.environ.get('MTGS_COV_FRAMES_AHEAD', 12))   # ~5 frames of the 2 Hz vsd within COV_R
+    W_AHEAD = float(os.environ.get('MTGS_LOOKAHEAD_WEIGHT', 0.5))
     def frames_near(pts, traj):
         if len(pts) == 0 or len(traj) == 0:
             return np.zeros(len(pts), dtype=int)
         d = np.linalg.norm(pts[:, None, :] - traj[None, :, :], axis=2)
         return (d < COV_R).sum(axis=1)
     cover = np.zeros(len(targets), dtype=int)
+    cover_a = np.zeros(len(ahead), dtype=int)
     for s_ in chosen:
         cover += frames_near(targets, s_["traj"])
+        cover_a += frames_near(ahead, s_["traj"])
     pool = [s_ for s_ in usable if s_["idx"] not in {c["idx"] for c in chosen}]
-    while not _full(chosen) and pool and len(targets) and (cover < COV_K).any():
+    while not _full(chosen) and pool and (len(targets) or len(ahead)) and \
+            ((cover < COV_K).any() or (cover_a < COV_KA).any()):
         def gain(s_):
             g = np.minimum(frames_near(targets, s_["traj"]), np.maximum(COV_K - cover, 0)).sum()
-            return (g, s_["log"] in test_logs, s_["n"])
+            ga = np.minimum(frames_near(ahead, s_["traj"]), np.maximum(COV_KA - cover_a, 0)).sum()
+            return (g + W_AHEAD * ga, s_["log"] in test_logs, s_["n"])
         cand = [s_ for s_ in pool if _can_add(chosen, s_)]
         if not cand:
             break
         best = max(cand, key=gain)
         if gain(best)[0] <= 0:
             break
-        pool.remove(best); chosen.append(best); cover += frames_near(targets, best["traj"])
+        pool.remove(best); chosen.append(best)
+        cover += frames_near(targets, best["traj"]); cover_a += frames_near(ahead, best["traj"])
     if targets.size:
         say(f"[auto_select] route coverage after selection: min {int(cover.min())} / median "
               f"{int(np.median(cover))} frames within {COV_R:.0f} m (target {COV_K})", flush=True)
+    if len(ahead):
+        say(f"[auto_select] look-ahead coverage after selection: {float((cover_a >= COV_KA).mean()):.0%} of "
+            f"{len(ahead)} points with >= {COV_KA} frames within {COV_R:.0f} m (median {int(np.median(cover_a))})", flush=True)
     test = [s_ for s_ in test if s_["idx"] not in {c["idx"] for c in chosen}]
     if per_log:
         for s_ in test:

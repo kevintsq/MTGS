@@ -33,7 +33,8 @@ if __name__ == '__main__':
         "colmap",
         "instance_point_cloud",
         "rgb_point_cloud",
-        "sfm_point_cloud"
+        "sfm_point_cloud",
+        "sfm_match",      # split SfM (sfm_split.py): a match phase's database snapshot / meta.json
     ]
 
     # colmap/: whitelist-checked per model dir (ba_multi_traversal.safe_rmtree_colmap); the other folders are

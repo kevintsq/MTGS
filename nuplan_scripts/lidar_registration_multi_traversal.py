@@ -1148,8 +1148,15 @@ if __name__ == '__main__':
                 _map = _map_icp_inputs(video_scene_dict, result_poses_dict_aligned, set(video_scene_dict) - _trusted, _scans_by_token)
                 if _map is None or len(_map) < 5000:
                     continue
-                _cur = lambda t: result_poses_dict_aligned.get(t)
-                fixed, rep = _map_icp_pass(video_scene_dict[vt], _scans_by_token, [("ins", _cur)], _map, vt)
+                # start from the INS lifted on the heights of the passes trusted NOW: the GPS poses the pass carries were
+                # lifted before the height harmonisation, on a reference that could still hold passes metres apart in
+                # height (px_loc_0195 pass 61: lifted next to passes 23 / 59 while they sat 4 m off the others -> a 4.1 m
+                # step at the edge of what map ICP could refine). The poses it carries stay a second candidate.
+                _ref_now = _aligned_reference(video_scene_dict, result_poses_dict_aligned, set(video_scene_dict) - _trusted)
+                _ins = _gps_poses_on_aligned_height(video_scene_dict[vt], _ref_now).get
+                _cur = {i['token']: result_poses_dict_aligned[i['token']].copy() for i in video_scene_dict[vt]['frame_infos']
+                        if i['token'] in result_poses_dict_aligned}.get
+                fixed, rep = _map_icp_pass(video_scene_dict[vt], _scans_by_token, [("ins", _ins), ("carried", _cur)], _map, vt)
                 if fixed is not None:
                     _d = [np.linalg.norm(fixed[t][:3, 3] - result_poses_dict_aligned[t][:3, 3]) for t in fixed if t in result_poses_dict_aligned]
                     say(f"GPS pass {vt.split('-')[-1]} registered onto the trusted passes by map ICP "

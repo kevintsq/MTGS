@@ -77,14 +77,8 @@ def _run_colmap_raw(args, colmap_path, **kwargs):
            for a in args]
     if len(rel) > 1:
         rel = rel + _gpu_flags(rel[1])
-    if len(rel) > 1 and rel[1] in _ONE_BLAS_THREAD and "env" not in kwargs:
-        # Feature extraction and matching are parallel over N worker threads already; the BLAS/OpenMP
-        # runtime inside each worker (the colmap/colmap image links MKL + libomp, Eigen sees OpenMP) opens
-        # another team of OMP_NUM_THREADS, so with the stage-wide OMP_NUM_THREADS=24 one matches_importer
-        # ran 606 threads (577 runnable) on 24 cores. Measured 2026-11-04 (civo-h200-2, 14 cores, 3000
-        # pairs, CPU matching): OMP=14 235 s, OMP=1 109 s. COLMAP_BLAS_THREADS overrides.
-        n = os.environ.get("COLMAP_BLAS_THREADS", "1")
-        kwargs["env"] = {**os.environ, "OMP_NUM_THREADS": n, "MKL_NUM_THREADS": n, "OPENBLAS_NUM_THREADS": n}
+    if "env" not in kwargs:
+        kwargs["env"] = colmap_blas_env()
     return subprocess.run(rel, cwd=colmap_path, **kwargs)
 
 
@@ -217,8 +211,27 @@ def _drop_far_from_prior(colmap_path, model_dir, max_err_m, colmap_exe, scale=1.
     shutil.rmtree(model_dir); shutil.move(tmp, model_dir)
 
 
-_ONE_BLAS_THREAD = {"feature_extractor", "matches_importer", "exhaustive_matcher", "sequential_matcher",
-                    "spatial_matcher", "vocab_tree_matcher", "transitive_matcher"}
+def colmap_blas_env(env=None):
+    """Environment for every colmap command: ONE BLAS / OpenMP thread.
+
+    COLMAP parallelises over its own workers (extraction / matching threads, Ceres num_threads in mapper and
+    bundle_adjuster); the BLAS runtime inside (MKL + libomp in the colmap/colmap image, OpenBLAS-OpenMP + libgomp
+    in the manco / kaitain / workstation builds) opens a second team of OMP_NUM_THREADS on top, and libgomp's
+    default ACTIVE wait spins that team between the many small CHOLMOD calls of a sparse-Schur BA.
+    Measured:
+      2026-11-04 civo-h200-2, 14 cores, CPU matching 3000 pairs: OMP=14 235 s, OMP=1 109 s.
+      2026-11-16 manco 9965WX, 16 physical cores, devbox colmap 4.3 (OpenBLAS-OpenMP 0.3.26), 30-iteration global BA
+      of a 384-image model (sparse Schur): OMP=16 61 / 52 s, OMP=1 6.8 / 7.0 s, OMP=16 + OMP_WAIT_POLICY=passive
+      7.1 / 7.3 s; incremental mapper (384 images, Mapper.num_threads 16): OMP=16 567 / 940 s, unset (team = 16
+      from the affinity) 664 / 687 s, OMP=1 165 / 193 s, passive 193 / 171 s, all 384/384 registered, 90k points,
+      0.644-0.649 px; 10 iterations of a 6096-image BA (iterative Schur, > 1000 images): 442-449 s in every arm.
+    So the second team only costs time (3.5-9x where CHOLMOD runs, i.e. models <= 1000 images) and never helps.
+    COLMAP_BLAS_THREADS overrides the count (a value > 1 also sets OMP_WAIT_POLICY=passive)."""
+    n = os.environ.get("COLMAP_BLAS_THREADS", "1")
+    e = {**(os.environ if env is None else env), "OMP_NUM_THREADS": n, "MKL_NUM_THREADS": n, "OPENBLAS_NUM_THREADS": n}
+    if n != "1":
+        e["OMP_WAIT_POLICY"] = "passive"
+    return e
 
 
 def _normalize_rigs(database_path):

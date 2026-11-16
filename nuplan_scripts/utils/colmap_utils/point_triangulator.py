@@ -49,6 +49,9 @@ def _run_colmap(args, colmap_path, **kwargs):
            for a in args]
     if len(rel) > 1:
         rel = rel + _gpu_flags(rel[1])
+    if "env" not in kwargs:
+        from nuplan_scripts.utils.colmap_utils.bundle_adjustment import colmap_blas_env
+        kwargs["env"] = colmap_blas_env()
     return subprocess.run(rel, cwd=colmap_path, **kwargs)
 
 

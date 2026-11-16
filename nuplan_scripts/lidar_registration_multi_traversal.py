@@ -343,18 +343,40 @@ def _aligned_reference(video_scene_dict, result_poses_dict_aligned, exclude):
     return xy, dz, (float(np.median(dz)) if len(dz) else 0.0)
 
 
-def _gps_pose_on_aligned_height(info, ref, radius=25.0):
-    """The INS pose lifted by the local (aligned - INS) height offset of the
-    ICP-aligned frames within `radius` m, else by the block median."""
+def _gps_poses_on_aligned_height(video, ref, radius=25.0):
+    """{token: INS pose lifted by the local (aligned - INS) height offset}, for every frame of one pass.
+
+    The offset of a frame is the median over the ICP-aligned frames of the other passes within `radius` m. Frames with
+    no aligned frame that near take the offset interpolated along their own pass between the nearest frames that have
+    one (constant beyond the ends); only a pass with no such frame at all takes the block median. Before 2026-11-16
+    every such frame took the block median: ru_area0806 / pn_area0806 pass 357 (GPS-restored) drives a driveway no
+    other pass comes within 25 m of, so 47 frames started at the block median (-0.78 m) next to frames at their local
+    -3.1 m, a 2.4 m step the per-frame map ICP (1 m gate) could not bridge -> the road trained at several heights
+    under them and the HUGSIM camera placed into it (white fog in scene e12142d7)."""
     ref_xy, ref_dz, ref_med = ref
-    p = np.array(info['ego2global'], dtype=float).copy()
-    off = ref_med
+    fis = sorted(video['frame_infos'], key=lambda i: int(i['timestamp']))
+    if not fis:
+        return {}
+    P = np.array([np.asarray(i['ego2global'], dtype=float)[:3, 3] for i in fis])
+    off = np.full(len(fis), np.nan)
     if len(ref_xy):
-        near = np.linalg.norm(ref_xy - p[:2, 3], axis=1) < radius
-        if near.sum() >= 3:
-            off = float(np.median(ref_dz[near]))
-    p[2, 3] += off
-    return p
+        from scipy.spatial import cKDTree
+        for k, nb in enumerate(cKDTree(ref_xy).query_ball_point(P[:, :2], radius)):
+            if len(nb) >= 3:
+                off[k] = float(np.median(ref_dz[nb]))
+    have = np.where(~np.isnan(off))[0]
+    if len(have) == 0:
+        off[:] = ref_med
+    elif len(have) < len(fis):
+        # along the driven path (+ a tiny index term: a standing ego repeats its position)
+        s_ = np.r_[0.0, np.cumsum(np.linalg.norm(np.diff(P[:, :2], axis=0), axis=1))] + 1e-6 * np.arange(len(fis))
+        off = np.interp(s_, s_[have], off[have])
+    out = {}
+    for k, i in enumerate(fis):
+        p = np.array(i['ego2global'], dtype=float).copy()
+        p[2, 3] += off[k]
+        out[i['token']] = p
+    return out
 
 
 def _z_inconsistent_videos(video_scene_dict, result_poses_dict_aligned, skip, gate, radius=15.0):
@@ -951,8 +973,7 @@ if __name__ == '__main__':
                             f"{e['mean_heading_error']:.1f} deg of rotation change "
                             f"(slide, not refinement) -- keeping the GPS pose.",
                             style="yellow")
-                for info in video_scene_dict[vt]['frame_infos']:
-                    result_poses_dict_aligned[info['token']] = _gps_pose_on_aligned_height(info, ref)
+                result_poses_dict_aligned.update(_gps_poses_on_aligned_height(video_scene_dict[vt], ref))
                 gps_videos.add(vt)
                 touched = True
         if touched:
@@ -1043,7 +1064,7 @@ if __name__ == '__main__':
                 video_scene_dict[vt] = v
                 if _map is not None:
                     # try to put the pass back on the map, not on the INS
-                    _ins = lambda t, _v=v: next((_gps_pose_on_aligned_height(i, ref) for i in _v['frame_infos'] if i['token'] == t), None)
+                    _ins = _gps_poses_on_aligned_height(v, ref).get
                     _icp = lambda t: (_LAST_ALIGN_T @ result_poses_dict[t]) if t in result_poses_dict else None
                     fixed, rep = _map_icp_pass(v, _scans_by_token, [("icp+global", _icp), ("ins", _ins)], _map, vt)
                     if fixed is not None:
@@ -1061,8 +1082,7 @@ if __name__ == '__main__':
                 say(f"Restoring video {vt.split('-')[-1]} on GPS poses "
                             f"({len(v['frame_infos'])} frames): dropped before alignment, "
                             f"but the block would be short without it.", style="yellow")
-                for info in v['frame_infos']:
-                    result_poses_dict_aligned[info['token']] = _gps_pose_on_aligned_height(info, ref)
+                result_poses_dict_aligned.update(_gps_poses_on_aligned_height(v, ref))
                 gps_videos.add(vt)
 
         if config.exclude_bad_registration:
@@ -1083,7 +1103,7 @@ if __name__ == '__main__':
                 e = error_dict_aligned[video_token]
                 if _map is not None:
                     _v = video_scene_dict[video_token]
-                    _ins = lambda t, _v=_v: next((_gps_pose_on_aligned_height(i, ref) for i in _v['frame_infos'] if i['token'] == t), None)
+                    _ins = _gps_poses_on_aligned_height(_v, ref).get
                     _icp = lambda t: result_poses_dict_aligned.get(t)
                     fixed, rep = _map_icp_pass(_v, _scans_by_token, [("aligned icp", _icp), ("ins", _ins)], _map, video_token)
                     if fixed is not None:
@@ -1100,8 +1120,7 @@ if __name__ == '__main__':
                             f"(QA said mean {e['mean_error']:.2f}m / "
                             f"{e['mean_heading_error']:.2f} deg, but the block would "
                             f"otherwise be short).", style="yellow")
-                for info in video_scene_dict[video_token]['frame_infos']:
-                    result_poses_dict_aligned[info['token']] = _gps_pose_on_aligned_height(info, ref)
+                result_poses_dict_aligned.update(_gps_poses_on_aligned_height(video_scene_dict[video_token], ref))
                 gps_videos.add(video_token)
             for video_token in bad_videos:
                 if video_token in rescued:

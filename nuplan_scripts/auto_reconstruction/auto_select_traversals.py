@@ -316,8 +316,29 @@ def main():
     if config.selected_videos and not args.force:
         say(f"[auto_select] {config.road_block_name}: selected_videos already set "
               f"({list(config.selected_videos)}), skipping. Use --force to redo.")
-        if args.manifest_out and not os.path.exists(args.manifest_out):
+        _require = [x for x in args.require_logs.split(",") if x]
+        stats = None
+        if _require:
+            # A kept selection must still hold the logs required NOW (ml_sg01 2026-11-16: the env swapped a log without
+            # lidar for another one, the selection of the first run stayed in the config and the rerun reconstructed
+            # the old set without a word). Required logs the weather / lens exclusion removes are not expected.
             stats = discover_video_stats(config, args.num_workers)
+            _sel_logs = {s["log"] for s in stats if s["idx"] in set(config.selected_videos)}
+            _excl = tuple(x for x in os.environ.get('MTGS_EXCLUDE_LOGS', '').split(',') if x)
+            if _excl and os.environ.get('MTGS_EXCLUDE_EXEMPT_REQUIRED', '0') != '1':
+                _require = [r for r in _require if not r.startswith(_excl)]
+            _lost = sorted(set(_require) - _sel_logs)
+            if _lost:
+                msg = (f"[auto_select] {config.road_block_name}: the kept selected_videos {list(config.selected_videos)} do not "
+                       f"contain the required log(s) {_lost}. The requirement changed after the selection was made: clear "
+                       f"selected_videos in the config or rerun with --force.")
+                if os.environ.get('MTGS_REQUIRE_MISSING', '') == 'warn':
+                    say(msg + " Continuing (MTGS_REQUIRE_MISSING=warn).", style="bold yellow")
+                else:
+                    say(msg, style="bold red")
+                    raise SystemExit(msg)
+        if args.manifest_out and not os.path.exists(args.manifest_out):
+            stats = stats if stats is not None else discover_video_stats(config, args.num_workers)
             logs = sorted({s["log"] for s in stats if s["idx"] in set(config.selected_videos)})
             os.makedirs(os.path.dirname(os.path.abspath(args.manifest_out)), exist_ok=True)
             with open(args.manifest_out, "w") as f:

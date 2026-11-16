@@ -107,9 +107,39 @@ class SplitVideoFromNuPlanDB:
 
             for video_info in video_infos:
                 video_info['lidar_pcs'] = self.expand_trajectory(lidar_pcs_new, video_info['lidar_pcs'])
+            video_infos = self.merge_overlapping(lidar_pcs_new, video_infos, log.logfile)
 
             log_db.session.close()
             return log_db, video_infos
+
+        def merge_overlapping(self, lidar_pcs, video_infos, log_name):
+            """Passes of one log never share a frame (2026-11-16, user: frames of a log are never added twice). The
+            in-block runs are disjoint, but expand_trajectory grows each by expand_buffer metres of path at both ends,
+            so two passes separated by a short excursion would overlap; such passes are merged into one video (the
+            frames between them included), loudly."""
+            if len(video_infos) < 2:
+                return video_infos
+            pos = {id(pc): i for i, pc in enumerate(lidar_pcs)}
+            spans = sorted(((pos[id(v['lidar_pcs'][0])], pos[id(v['lidar_pcs'][-1])], v) for v in video_infos),
+                           key=lambda x: x[0])
+            out = [list(spans[0])]
+            for a, b, v in spans[1:]:
+                if a <= out[-1][1]:
+                    say(f"[split] {log_name}: passes at lidar_pc {out[-1][0]}-{out[-1][1]} and {a}-{b} overlap after the "
+                        f"expand_buffer ({self.expand_buffer} m): merged into one video", style="bold yellow")
+                    out[-1][1] = max(out[-1][1], b)
+                    out[-1][2] = None
+                else:
+                    out.append([a, b, v])
+            merged = []
+            for a, b, v in out:
+                if v is None:
+                    pcs = lidar_pcs[a:b + 1]
+                    v = {'video_token': '', 'log_token': video_infos[0]['log_token'], 'log_name': log_name,
+                         'start_ts': pcs[0].timestamp, 'lidar_pcs': pcs,
+                         'trajectory': np.asarray([[pc.ego_pose.x, pc.ego_pose.y] for pc in pcs])}
+                merged.append(v)
+            return merged
 
         def expand_trajectory(self, lidar_pcs, sub_lidar_pcs):
 
@@ -416,6 +446,24 @@ def check_selected_frames(frame_stats, max_missing_frac):
                          "them:\n  " + "\n  ".join(empty))
 
 
+def check_no_duplicate_frames(video_infos):
+    """No frame of a log may be trained twice (user rule 2026-11-16): a lidar_pc token or a (log, timestamp) in two of
+    the videos (e.g. a selected_videos entry listed twice, overlapping start/end_frame cuts of one pass) stops prep1."""
+    seen, dup = {}, []
+    for i, v in enumerate(video_infos):           # by position: the same pass listed twice is a duplicate too
+        vt = f"#{i} ({v.get('video_token') or v.get('video_idx')})"
+        for pc in v['lidar_pcs']:
+            for key in (('tok', pc.token), ('ts', v['log_name'], int(pc.timestamp))):
+                if key in seen and seen[key] != vt:
+                    dup.append((v['log_name'], int(pc.timestamp), seen[key], vt))
+                seen.setdefault(key, vt)
+    dup = sorted(set(dup))
+    if dup:
+        ex = "\n  ".join(f"{lg} ts {ts}: videos {a} and {b}" for lg, ts, a, b in dup[:10])
+        raise SystemExit(f"[prep1] {len(dup)} frame(s) would be added twice (same lidar_pc / log timestamp in two "
+                         f"videos):\n  {ex}\nFix selected_videos / the frame cuts; a frame of a log is trained once.")
+
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--config', type=str, required=True)
@@ -480,6 +528,8 @@ if __name__ == '__main__':
                 video_info['lidar_pcs'] = video_info['lidar_pcs'][start_frame:end_frame]
                 new_video_infos.append(video_info)
         video_infos = new_video_infos
+
+    check_no_duplicate_frames(video_infos)
 
     video_scene_dict = ProduceVideoSceneDict.run(
         config=config,

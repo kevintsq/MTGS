@@ -754,6 +754,7 @@ def align_model(video_scene: VideoScene, video_scene_dict, colmap_path, thresh=1
                 why = f'track extent {ext:.1f} m too small, orientation yaw kept'
             elif abs(np.degrees(psi_c)) > ymax:
                 why = f'centre yaw {np.degrees(psi_c):+.2f} deg beyond {ymax:g} deg, orientation yaw kept'
+                _fit_sim3.guard_tripped = True
             else:
                 psi, why = psi_c, 'centres'
             if psi:
@@ -782,11 +783,28 @@ def align_model(video_scene: VideoScene, video_scene_dict, colmap_path, thresh=1
         keep_v = sorted(set(vids)); out_v = []
         while len(keep_v) > 1:
             m_ = np.isin(vids, keep_v)
+            _fit_sim3.guard_tripped = False
             scale, R, t = _fit_sim3(colmap_cam_array[m_], raw_cam_array[m_], colmap_cam_R[m_], raw_cam_R_arr[m_])
             res = np.linalg.norm(scale * colmap_cam_array @ R.T + t - raw_cam_array, axis=1)
             med = {v_: float(np.median(res[vids == v_])) for v_ in keep_v}
             worst = max(med, key=med.get)
+            say('[sfm align] rejection step, %d passes: median residual per pass ' % len(keep_v)
+                + ", ".join(f"{v_.rsplit('-', 1)[1]}:{m_:.2f}" for v_, m_ in sorted(med.items())))
             if med[worst] <= lim:
+                break
+            # Set a pass aside only when IT is the outlier: its residual > MTGS_SFM_DISCONNECT_REL (3) x the median of the
+            # others (nb_20 pass 22: 156 m next to 0.2 m). When every pass is off by about the same (pn_area0806,
+            # 2026-11-17: 3.1-4.1 m for all six -- the SfM model places the passes ~1 % tighter than the registration,
+            # own-pass Sim3 scale 40.4 vs joint 40.0), removing the 'worst' only removes constraints: the refits rotated
+            # further (yaw +1.7 -> +2.6 deg), every residual grew (3.2 -> 5.6 m), the yaw guard tripped and the cascade
+            # ended in a one-pass fit under which the other five were 10-13 m off and pass 27 was dropped.
+            others = [m_ for v_, m_ in med.items() if v_ != worst]
+            if others and med[worst] <= float(os.environ.get('MTGS_SFM_DISCONNECT_REL', 3.0)) * float(np.median(others)):
+                say(f"[sfm align] no single pass is the outlier (worst {worst.rsplit('-', 1)[1]} {med[worst]:.2f} m, others "
+                    f"median {np.median(others):.2f} m): joint fit of all {len(keep_v)} passes kept", style="yellow")
+                break
+            if getattr(_fit_sim3, 'guard_tripped', False):
+                say("[sfm align] the yaw guard tripped inside the outlier rejection: rejection stopped", style="bold red")
                 break
             keep_v.remove(worst); out_v.append(worst)
         m_ = np.isin(vids, keep_v)
@@ -964,6 +982,14 @@ def align_model(video_scene: VideoScene, video_scene_dict, colmap_path, thresh=1
                         f['skipped'] = 'sfm_unregistered'; n_skip += 1
             say(f'[sfm align] skipped {n_skip} frames without SfM cameras; dropped passes '
                         f'{[v_.rsplit("-", 1)[1] for v_ in dropped]}')
+            if dropped and os.environ.get('MTGS_SFM_ALLOW_PASS_DROP', '0') != '1':
+                # a selected pass must not vanish from the block (no-silent-fallback rule): pn_area0806 2026-11-17 trained
+                # on 5 of 6 passes after the alignment cascade invalidated pass 27's cameras
+                msg = (f'[sfm align] STOP: pass(es) {[v_.rsplit("-", 1)[1] for v_ in dropped]} have SfM cameras on fewer than '
+                       f'10 % of their frames after the alignment; the block would lose them. Check the Sim3 alignment / the SfM '
+                       f'model (or set MTGS_SFM_ALLOW_PASS_DROP=1 knowingly).')
+                say(msg, style='bold red')
+                raise SystemExit(msg)
         # every frame the SfM solution did not touch (standing ego, no SfM camera, out of region) continues the SfM
         # frames next to it in time instead of keeping the pose of the stage before (see ego_pose_carry)
         from nuplan_scripts.utils.ego_pose_carry import carry_ego_correction

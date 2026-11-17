@@ -1274,17 +1274,16 @@ if __name__ == '__main__':
         first_key = list(video_scene_dict.keys())[0]
         video_scene_dict = {first_key: video_scene_dict[first_key]}
     else:
-        # Bring back pre-alignment casualties on GPS poses if the block needs
-        # them. They skip alignment entirely, so the fit the survivors got is
-        # untouched -- this only adds coverage that would otherwise be lost.
+        # Bring back EVERY pre-alignment casualty. They skip alignment entirely, so the fit the survivors got is
+        # untouched. Until 2026-11-17 only the pinned ones and as many as MTGS_MIN_TRAVERSALS was short of came back;
+        # any other selected pass disappeared without a line in the log (ml_pit01b video 22, 172 frames: dropped as a
+        # raw ICP outlier, never mentioned again). A selected pass is restored by map ICP from its INS poses; if that
+        # fails it goes on GPS poses into the GPS-pass consolidation (map ICP onto the passes trusted by then, else its
+        # own lidar), and the pass QA / unrefined QA gates stop the stage if it still does not fit.
         if pre_dropped:
-            target = int(os.environ.get('MTGS_MIN_TRAVERSALS', 0))
-            short = target - (len(video_scene_dict) - len(bad_videos))
-            picks = sorted(pre_dropped.items(),
-                           key=lambda kv: (not _is_pinned(kv[1]),
-                                           -len(kv[1]['frame_infos'])))
-            n_keep = max(0, short)
-            chosen = picks[:n_keep] + [kv for kv in picks[n_keep:] if _is_pinned(kv[1])]
+            chosen = sorted(pre_dropped.items(),
+                            key=lambda kv: (not _is_pinned(kv[1]),
+                                            -len(kv[1]['frame_infos'])))
             # MTGS_PIN_KEEP_ICP=1: a pinned pass (the scene's own drive) comes back on its
             # ICP poses carried through the global fit, not on GPS. Experiment for the
             # rainy own passes of fl_loc_0252 / fl_loc_0261, which on GPS poses left a
@@ -1312,8 +1311,8 @@ if __name__ == '__main__':
                         result_poses_dict_aligned[info['token']] = _LAST_ALIGN_T @ result_poses_dict[info['token']]
                     continue
                 say(f"Restoring video {vt.split('-')[-1]} on GPS poses "
-                            f"({len(v['frame_infos'])} frames): dropped before alignment, "
-                            f"but the block would be short without it.", style="yellow")
+                            f"({len(v['frame_infos'])} frames): dropped before alignment; "
+                            f"the GPS-pass consolidation registers it.", style="yellow")
                 result_poses_dict_aligned.update(_gps_poses_on_aligned_height(v, ref))
                 gps_videos.add(vt)
 

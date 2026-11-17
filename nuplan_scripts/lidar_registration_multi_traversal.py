@@ -222,6 +222,13 @@ def _register_frame_gravity(self, frame, timestamps, gt_pose=None, traj_id=None)
         self.warmup -= 1
         initial_guess = gt_pose
         sigma = 2
+    elif gt_pose is not None and getattr(self, '_last_gt', None) is not None and os.environ.get('MTGS_KISS_INS_PREDICT', '1') == '1':
+        # motion prediction from the INS (2026-11-17): KissICP predicts with the last frame-to-frame motion (constant
+        # velocity), which at 2 Hz is metres / degrees off whenever the ego brakes, accelerates or turns; the ICP then
+        # locks onto a neighbouring minimum and the chain is lost for the rest of the pass (ml_pit01b: 6 of 9 passes,
+        # 45-500 m, onsets where the speed changes; identical with plain KissICP). The INS relative motion over one
+        # frame is good to centimetres, so the previous registered pose is advanced by it instead.
+        initial_guess = self.last_pose @ (np.linalg.inv(self._last_gt) @ gt_pose)
     else:
         initial_guess = self.last_pose @ self.last_delta
     new_pose = self.registration.align_points_to_map(points=source, voxel_map=self.local_map, initial_guess=initial_guess,
@@ -245,6 +252,7 @@ def _register_frame_gravity(self, frame, timestamps, gt_pose=None, traj_id=None)
     self.last_delta = np.linalg.inv(self.last_pose) @ new_pose
     self.last_pose = new_pose
     self.last_traj_id = traj_id
+    self._last_gt = None if gt_pose is None else np.array(gt_pose, dtype=float)
     return frame, source
 
 

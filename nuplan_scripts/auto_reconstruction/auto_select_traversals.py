@@ -67,33 +67,49 @@ def select(stats, test_logs, k, require_logs=()):
     # MTGS_APPEARANCE_PER_LOG=1 (block-env flag, 2026-11-16, user: "按 log 数算"): k counts distinct LOGS, not passes --
     # a log crossing the block twice gives two passes that share one appearance row in training (same day, minutes
     # apart), so its second pass costs images, not a day. Extra passes of a chosen drive come only from the coverage
-    # greedy (routes / look-ahead); the other fills open new drives. 29-block bench (2026-11-16) without a pass cap:
+    # greedy (routes / look-ahead) and only from logs the greedy itself opened (never another split of the drive, never
+    # a further pass of a required log); the other fills open new drives. 29-block bench (2026-11-16) without a pass cap:
     # passes p50 6 / p90 8 / max 9, frames x1.0 / x1.5 / x1.7 of the 6-pass selection -> MTGS_MAX_PASSES (default 12) is
     # only a safety cap. Flag off: k counts passes exactly as before.
     # "Log" here is the DRIVE (user 2026-11-16): the NAVSIM splits of one recorded drive count as one (drive_key).
     from nuplan_scripts.utils.log_names import drive_key
     per_log = os.environ.get('MTGS_APPEARANCE_PER_LOG', '0') == '1'
     max_passes = int(os.environ.get('MTGS_MAX_PASSES', 12)) if per_log else k
-    def _n_logs(ss):
-        return len({drive_key(s_["log"]) for s_ in ss})
-    def _can_add(chosen_, s_):
-        if not per_log:
-            return len(chosen_) < k
-        return len(chosen_) < max_passes and (drive_key(s_["log"]) in {drive_key(c["log"]) for c in chosen_} or _n_logs(chosen_) < k)
-    def _full(chosen_):
-        if not per_log:
-            return len(chosen_) >= k
-        return len(chosen_) >= max_passes or (_n_logs(chosen_) >= k and not any(
-            drive_key(s_["log"]) in {drive_key(c["log"]) for c in chosen_} and s_["idx"] not in {c["idx"] for c in chosen_} for s_ in stats))
-    # Bad-weather logs poison a reconstruction (wet-road spray bakes into the
-    # background; a clear scene renders rainy). Exclusion is a hard filter,
-    # overriding even require_logs -- prefer clear multi-traversal over a
-    # faithful-but-rainy own log.
     windows = {}
     for item in os.environ.get('MTGS_REQUIRE_WINDOWS', '').split(';'):
         if '=' in item:
             lg, span = item.split('=', 1); t0, t1 = span.split('-')
             windows.setdefault(lg, []).append((int(t0), int(t1)))
+    def _n_logs(ss):
+        return len({drive_key(s_["log"]) for s_ in ss})
+    def _cap_ok(chosen_, s_):
+        # the drive / pass caps only (required passes: every required log of a drive is kept)
+        if not per_log:
+            return len(chosen_) < k
+        return len(chosen_) < max_passes and (drive_key(s_["log"]) in {drive_key(c["log"]) for c in chosen_} or _n_logs(chosen_) < k)
+    def _can_add(chosen_, s_):
+        # A drive already chosen contributes only the logs it was chosen for (2026-11-17, user: the per-drive cap had made
+        # every OTHER NAVSIM split of a chosen drive a free extra pass -- ml_pit01b got 2 unplanned logs of
+        # 2021.08.17.19.18.39_veh-08, 9 passes instead of 7): a further pass of a chosen drive must belong to a log that is
+        # already chosen by the greedy itself (a required log contributes exactly its required passes: its windows, or
+        # its longest pass when it has none); a new log of a chosen drive is never added. Opening a new drive is limited
+        # by the drive cap as before.
+        if not per_log:
+            return len(chosen_) < k
+        if len(chosen_) >= max_passes:
+            return False
+        if drive_key(s_["log"]) in {drive_key(c["log"]) for c in chosen_}:
+            return s_["log"] in {c["log"] for c in chosen_} and s_["log"] not in set(require_logs)
+        return _n_logs(chosen_) < k
+    def _full(chosen_):
+        if not per_log:
+            return len(chosen_) >= k
+        return len(chosen_) >= max_passes or (_n_logs(chosen_) >= k and not any(
+            _can_add(chosen_, s_) and s_["idx"] not in {c["idx"] for c in chosen_} for s_ in stats))
+    # Bad-weather logs poison a reconstruction (wet-road spray bakes into the
+    # background; a clear scene renders rainy). Exclusion is a hard filter,
+    # overriding even require_logs -- prefer clear multi-traversal over a
+    # faithful-but-rainy own log.
     def _required(s):
         if s["log"] not in set(require_logs):
             return False
@@ -180,7 +196,7 @@ def select(stats, test_logs, k, require_logs=()):
     if per_log:
         kept_req = []
         for s_ in req:                       # longest first: the same cut as req[:k], counted in logs and passes
-            if _can_add(kept_req, s_):
+            if _cap_ok(kept_req, s_):
                 kept_req.append(s_)
         req = kept_req
     else:

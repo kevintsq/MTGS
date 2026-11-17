@@ -507,7 +507,7 @@ class NuplanDataParser(DataParser):
         for path in sfm_pcd_file_paths:
             if os.path.exists(path):
                 _sfm = o3d.io.read_point_cloud(str(path))
-                if os.environ.get("MTGS_SFM_BOX_FILTER", "0") == "1":   # experiment 2026-11-15, see _sfm_box_filter
+                if os.environ.get("MTGS_SFM_BOX_FILTER", "1") == "1":   # default on since 2026-11-17 (with MTGS_UCULL), see _sfm_box_filter
                     _sfm = self._sfm_box_filter(_sfm)
                 pcd += _sfm
             else:
@@ -528,7 +528,7 @@ class NuplanDataParser(DataParser):
         return out
 
     def _sfm_box_filter(self, pcd):
-        """EXPERIMENT 2026-11-15 (MTGS_SFM_BOX_FILTER=1): drop the SfM points inside the boxes of STATIC vehicles (parked: >= 4 frames,
+        """MTGS_SFM_BOX_FILTER (added 2026-11-15, default on since 2026-11-17, 0 = off): drop the SfM points inside the boxes of STATIC vehicles (parked: >= 4 frames,
         centre spread < 0.75 m within a pass) of the training passes, above the lowest 0.25 m of the box (the road under it stays),
         box + 0.125 m on every side as stack_point_cloud_utils.split_points (fill_scale 0.25). The COLMAP features are masked by
         Mask2Former classes >= 10 without dilation, so silhouette features of parked cars triangulate (px_loc_0195: 50-500 points

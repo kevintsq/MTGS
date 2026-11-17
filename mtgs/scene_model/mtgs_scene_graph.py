@@ -965,7 +965,9 @@ class MTGSSceneModel(Model):
         combined_mask = self.combine_visible_mask(pred_img, gt_img, batch=batch)
         if _vgs.UCULL_ON and self.training:   # unconstrained-cull counters: lens / ego validity and the dynamic-class mask kept apart
             _m = combined_mask[..., 0]
-            _valid = batch["lens_valid"].to(self.device)[..., 0].bool() if "lens_valid" in batch else torch.ones_like(_m)
+            if "lens_valid" not in batch:   # no silent all-valid fallback: the lens border would count as class-masked
+                raise RuntimeError("MTGS_UCULL is on but the batch has no lens_valid (the dataset did not see the same switch)")
+            _valid = batch["lens_valid"].to(self.device)[..., 0].bool()
             _dyn = (_valid & ~_m).float()[None, None]          # masked by a class mask (vehicle, person, ...) inside the valid area
             _r = _vgs.UCULL_DILATE
             if _r > 0:

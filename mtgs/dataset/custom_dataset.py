@@ -450,8 +450,11 @@ class CustomInputDataset(InputDataset):
                 data["mask"] = np.logical_and(valid_mask, custom_mask)
             else:
                 data["mask"] = valid_mask
-            if os.environ.get("MTGS_UCULL", "0") == "1":   # experiment: the unconstrained-cull counters need the lens / ego validity alone
-                data["lens_valid"] = valid_mask.copy()
+        # the unconstrained-cull counters need the lens / ego validity alone; same switch as the model (default on since 2026-11-17:
+        # this read the old default "0" and the model then counted the lens border as class-masked)
+        from mtgs.scene_model.gaussian_model.vanilla_gaussian_splatting import UCULL_ON
+        if UCULL_ON:
+            data["lens_valid"] = valid_mask.copy()
 
         if self._dataparser_outputs.depth_filenames is not None:
             depth = self._get_depth_from_image(image_idx)

@@ -128,19 +128,22 @@ _COVER_LAST = int(_os.environ.get("MTGS_MAX_ITERS", "0")) - 1
 # ground band (< MTGS_UCULL_GROUND m above the 5th height percentile of the opaque gaussians of its MTGS_UCULL_CELL m cell: the
 # road under an always-parked car is unobservable too and must stay). Anything that ANY pass sees through an empty spot gets free
 # hits and stays. Counters follow the row edits of _rebuild_gaussians (new rows start at 0); they restart on a resume.
-UCULL_ON = _os.environ.get("MTGS_UCULL", "0") == "1"
+# DEFAULT ON since 2026-11-17 (user: "停车修复可以默认"; validated on px_loc_0195 / pw_loc_0182 pure-SfM and ml_pit03u lidar
+# recipe): the densification recipe culls unconstrained gaussians unless MTGS_UCULL=0; the MCMC density mode keeps it off by
+# default (its relocation owns the budget; untested together).
+UCULL_ON = _os.environ.get("MTGS_UCULL", "0" if _os.environ.get("MTGS_DENSITY_MODE", "") == "mcmc" else "1") == "1"
 UCULL_DILATE = int(_os.environ.get("MTGS_UCULL_DILATE", "4"))
 UCULL_MIN_VIS = float(_os.environ.get("MTGS_UCULL_MIN_VIS", "50"))
-UCULL_FRAC = float(_os.environ.get("MTGS_UCULL_FRAC", "0.05"))
+UCULL_FRAC = float(_os.environ.get("MTGS_UCULL_FRAC", "0.15"))
 UCULL_EVERY = int(_os.environ.get("MTGS_UCULL_EVERY", "0"))           # after stop_split_at; 0 = every refinement
-UCULL_GROUND = float(_os.environ.get("MTGS_UCULL_GROUND", "0.25"))
+UCULL_GROUND = float(_os.environ.get("MTGS_UCULL_GROUND", "0.12"))
 UCULL_CELL = float(_os.environ.get("MTGS_UCULL_CELL", "3.0"))
 UCULL_DUMP = _os.environ.get("MTGS_UCULL_DUMP", "")
 # MTGS_UCULL_DECAY < 1: after every judgement both counters are multiplied by it, so the free share is that of the recent past
 # (window ~ refine_every / (1 - decay) steps) instead of the gaussian's whole life: with lifetime counters a gaussian that sat on the
 # road for a while and then drifted into a parked car's volume kept its early free steps (px retrain 2, spot 26: 1,241 opaque body
 # gaussians with a current free share of 0.012 were never culled). 1 = lifetime counters (round-1 behaviour).
-UCULL_DECAY = float(_os.environ.get("MTGS_UCULL_DECAY", "1"))
+UCULL_DECAY = float(_os.environ.get("MTGS_UCULL_DECAY", "0.9"))
 # MTGS_UCULL_OCC=1 (default): a step counts for a gaussian only when its centre is not hidden behind the rendered surface at its
 # pixel (camera depth <= rendered depth * (1 + MTGS_UCULL_OCC_REL) + MTGS_UCULL_OCC_ABS m, or the pixel is mostly empty). The
 # frustum-only count (0) also counted every distant view in which the centre projects onto a wall or another car in front of

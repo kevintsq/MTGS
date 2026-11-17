@@ -824,6 +824,15 @@ def _map_icp_frames(video, scans_by_token, poses, ref, voxel, max_dt=1.0, max_dy
     # The rotation is kept as the map-frame rotation vector of D (position independent), the translation as
     # the displacement of the scan origin; MTGS_REG_MAP_ICP_FRAME_ROT_DEG bounds the rotation per frame.
     max_rot_deg = float(os.environ.get('MTGS_REG_MAP_ICP_FRAME_ROT_DEG', 3.0))
+    # A fit that matches the map closely may move a frame further than max_dt (2026-11-17, ml_bos02 pass 2 = veh-40
+    # 00869_01319): its last 33 frames (185 m, the routes of 37083abd / 9684b440) sat 1.0-2.8 m off the map after the
+    # rigid pass fit; their fits put the walls exactly onto the map (fitness 0.7 at 0.3 m correspondence) but max_dt
+    # rejected every one, the run stayed on interpolated poses and the unrefined-run stop ended the stage. Fitness >=
+    # MTGS_REG_MAP_ICP_HIFIT (0.6) admits an origin shift up to MTGS_REG_MAP_ICP_HIFIT_DT (3 m); rotation gates unchanged,
+    # the window median still needs >= 2 refined frames, and a step left at the end of such a stretch is the step QA's job.
+    hi_fit = float(os.environ.get('MTGS_REG_MAP_ICP_HIFIT', 0.6))
+    hi_dt = float(os.environ.get('MTGS_REG_MAP_ICP_HIFIT_DT', 3.0))
+    n_hifit = [0]
 
     def _measure(idx, base):
         """Scan-to-map correction (map-frame rotation vector, scan-origin displacement) of the frames idx from the
@@ -840,7 +849,10 @@ def _map_icp_frames(video, scans_by_token, poses, ref, voxel, max_dt=1.0, max_dy
             dp = T[:3, 3] - base[t][:3, 3]                      # displacement of the scan origin
             dt = float(np.linalg.norm(dp)); drot = float(np.degrees(np.linalg.norm(rvec)))
             dyaw = abs(float(_R.from_matrix(D[:3, :3]).as_euler('zyx', degrees=True)[0]))
-            ok = fitness >= 0.3 and dt <= max_dt and drot <= max_rot_deg and dyaw <= max_dyaw_deg
+            rot_ok = drot <= max_rot_deg and dyaw <= max_dyaw_deg
+            ok = fitness >= 0.3 and dt <= max_dt and rot_ok
+            if not ok and rot_ok and fitness >= hi_fit and dt <= hi_dt:
+                ok = True; n_hifit[0] += 1
             res.append((rvec, dp) if ok else None)
             if ok:
                 outside.discard(i)
@@ -904,7 +916,8 @@ def _map_icp_frames(video, scans_by_token, poses, ref, voxel, max_dt=1.0, max_dy
     rots = [float(np.degrees(np.linalg.norm(x[0]))) for x in corr if x is not None]
     rep = (tilt_rep + f"per-frame map ICP: {n_ok}/{len(tokens)} frames refined, median correction "
            f"{np.median(mags) if mags else 0:.2f} m / {np.median(rots) if rots else 0:.2f} deg, "
-           f"max {max(mags) if mags else 0:.2f} m / {max(rots) if rots else 0:.2f} deg")
+           f"max {max(mags) if mags else 0:.2f} m / {max(rots) if rots else 0:.2f} deg"
+           + (f" ({n_hifit[0]} fits beyond {max_dt:g} m admitted by fitness >= {hi_fit:g})" if n_hifit[0] else ""))
     if carried:
         rep += f"; {len(carried)} unrefined frames carried from their refined neighbours, {n2} of them refined in a second round"
     out_left = [i for i in left if i in outside]

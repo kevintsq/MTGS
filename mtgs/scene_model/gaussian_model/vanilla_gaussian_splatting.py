@@ -117,6 +117,39 @@ COVER_DUMP = _os.environ.get("MTGS_COVER_DUMP", "")
 COVER_LOG_EVERY = int(_os.environ.get("MTGS_COVER_LOG_EVERY", "10000"))   # multiple of 500
 _COVER_LAST = int(_os.environ.get("MTGS_MAX_ITERS", "0")) - 1
 
+# EXPERIMENT 2026-11-15 (baked parked cars, px_loc_0195): with MTGS_MASK_VEHICLES=1 the car pixels are out of every loss, so the
+# VOLUME of a car that stands in (almost) every pass is seen only through masked pixels and the background is free to grow a blurred
+# car there (94-99 % of the pixels such gaussians cover are masked). MTGS_UCULL=1: the background keeps two per-gaussian counters,
+#   vis  = training steps in which its centre projects into the image (radius > 0),
+#   free = of those, steps in which the centre pixel is UNMASKED and at least MTGS_UCULL_DILATE px from any masked pixel
+#          (the mask rim, where the leak and the silhouette features live, counts as masked).
+# A gaussian with vis >= MTGS_UCULL_MIN_VIS and free <= MTGS_UCULL_FRAC * vis is unconstrained: it is culled at every refinement
+# (also after densification stops, every MTGS_UCULL_EVERY steps) and never split / duplicated, unless its centre lies in the
+# ground band (< MTGS_UCULL_GROUND m above the 5th height percentile of the opaque gaussians of its MTGS_UCULL_CELL m cell: the
+# road under an always-parked car is unobservable too and must stay). Anything that ANY pass sees through an empty spot gets free
+# hits and stays. Counters follow the row edits of _rebuild_gaussians (new rows start at 0); they restart on a resume.
+UCULL_ON = _os.environ.get("MTGS_UCULL", "0") == "1"
+UCULL_DILATE = int(_os.environ.get("MTGS_UCULL_DILATE", "4"))
+UCULL_MIN_VIS = float(_os.environ.get("MTGS_UCULL_MIN_VIS", "50"))
+UCULL_FRAC = float(_os.environ.get("MTGS_UCULL_FRAC", "0.05"))
+UCULL_EVERY = int(_os.environ.get("MTGS_UCULL_EVERY", "0"))           # after stop_split_at; 0 = every refinement
+UCULL_GROUND = float(_os.environ.get("MTGS_UCULL_GROUND", "0.25"))
+UCULL_CELL = float(_os.environ.get("MTGS_UCULL_CELL", "3.0"))
+UCULL_DUMP = _os.environ.get("MTGS_UCULL_DUMP", "")
+# MTGS_UCULL_DECAY < 1: after every judgement both counters are multiplied by it, so the free share is that of the recent past
+# (window ~ refine_every / (1 - decay) steps) instead of the gaussian's whole life: with lifetime counters a gaussian that sat on the
+# road for a while and then drifted into a parked car's volume kept its early free steps (px retrain 2, spot 26: 1,241 opaque body
+# gaussians with a current free share of 0.012 were never culled). 1 = lifetime counters (round-1 behaviour).
+UCULL_DECAY = float(_os.environ.get("MTGS_UCULL_DECAY", "1"))
+# MTGS_UCULL_OCC=1 (default): a step counts for a gaussian only when its centre is not hidden behind the rendered surface at its
+# pixel (camera depth <= rendered depth * (1 + MTGS_UCULL_OCC_REL) + MTGS_UCULL_OCC_ABS m, or the pixel is mostly empty). The
+# frustum-only count (0) also counted every distant view in which the centre projects onto a wall or another car in front of
+# it: an unmasked pixel = "free" (pw_loc_0182, long straight streets: the gaussians of always-parked cars had an online free
+# share of 0.3-0.45, 0.07-0.13 over the views within 40 m, and nothing was culled; px_loc_0195 has few such views).
+UCULL_OCC = _os.environ.get("MTGS_UCULL_OCC", "1") == "1"
+UCULL_OCC_REL = float(_os.environ.get("MTGS_UCULL_OCC_REL", "0.05"))
+UCULL_OCC_ABS = float(_os.environ.get("MTGS_UCULL_OCC_ABS", "0.5"))                    # torch.save of the counters at every cull (diagnostics)
+
 
 def _pixgs_on(model) -> bool:
     """Pixel-GS weighted gradient statistics: mode decay_pixgs, or MCMC with gradient-aware sampling."""
@@ -529,6 +562,12 @@ class VanillaGaussianSplattingModel(torch.nn.Module):
         cat + mask-index sequence held old and new copies of param, exp_avg and exp_avg_sq at once
         (pn_gapC_010 OOMed at 90 GB in remove_from_optim: features_rest [N,T,15,3], N=6.5M).
         Row order is unchanged: kept old rows, then kept split rows, then kept dup rows."""
+        if UCULL_ON and getattr(self, "_uc_vis", None) is not None and self._uc_vis.shape[0] == self.num_points:
+            n_new = sum(c["means"].shape[0] for c in new_chunks)
+            z = self._uc_vis.new_zeros(n_new)
+            self._uc_vis = torch.cat([self._uc_vis, z])[keep]; self._uc_free = torch.cat([self._uc_free, z])[keep]
+        elif UCULL_ON:
+            self._uc_vis = self._uc_free = None
         sizes = [self.num_points] + [c["means"].shape[0] for c in new_chunks]
         offsets = [0]
         for n in sizes:
@@ -636,6 +675,7 @@ class VanillaGaussianSplattingModel(torch.nn.Module):
             new_chunks = []
             extra_cull = None
             n_old = n_before = self.num_points
+            uc = None
             if self.step < self.ctrl_config.stop_split_at:
                 # then we densify
                 if self.config.verbose:
@@ -648,6 +688,9 @@ class VanillaGaussianSplattingModel(torch.nn.Module):
                     counts["avg_grad_norm"] = avg_grad_norm.mean()
 
                 high_grads = (avg_grad_norm > self.ctrl_config.densify_grad_thresh).reshape(-1)
+                uc = self._ucull_mask()
+                if uc is not None:
+                    high_grads &= ~uc                                   # never densify from an unconstrained gaussian
                 if DENSITY_CAP > 0 and self.model_name == "background":
                     budget = max(0, DENSITY_CAP - self.num_points)
                     if self.step < self.ctrl_config.stop_screen_size_at:   # screen-size splits (below) are not gradient-driven: they come out of the budget first
@@ -682,6 +725,14 @@ class VanillaGaussianSplattingModel(torch.nn.Module):
                 rebuild = True
             elif self.step >= self.ctrl_config.stop_split_at and self.ctrl_config.continue_cull_post_densification:
                 rebuild = True
+                if UCULL_ON and self.model_name == "background" and (UCULL_EVERY <= 0 or self.step % UCULL_EVERY < self.ctrl_config.refine_every):
+                    uc = self._ucull_mask()                     # joins the alpha / scale cull of this rebuild below
+            elif (UCULL_ON and self.model_name == "background"
+                  and (UCULL_EVERY <= 0 or self.step % UCULL_EVERY < self.ctrl_config.refine_every)):
+                uc = self._ucull_mask()
+                rebuild = False
+                if uc is not None:
+                    self._rebuild_gaussians(optimizers, [], ~uc)
             else:
                 # if we donot allow culling post refinement, no more gaussians will be pruned.
                 rebuild = False
@@ -694,6 +745,8 @@ class VanillaGaussianSplattingModel(torch.nn.Module):
                 culls = [self.cull_mask(self.gauss_params, self.max_2Dsize, counts)]
                 if extra_cull is not None:
                     culls[0] |= extra_cull
+                if uc is not None:
+                    culls[0] |= uc
                 culls += [self.cull_mask(chunk, None, counts) for chunk in new_chunks]
                 n_before += sum(c["means"].shape[0] for c in new_chunks)
                 self._rebuild_gaussians(optimizers, new_chunks, ~torch.cat(culls))
@@ -740,6 +793,66 @@ class VanillaGaussianSplattingModel(torch.nn.Module):
             self.max_2Dsize = None
 
     # ---- 3DGS-MCMC (experiment): ported from gsplat 1.4.0 strategy/ops.py relocate / sample_add / inject_noise_to_position
+    # ---- unconstrained-gaussian culling (experiment, see UCULL_* above)
+    @torch.no_grad()
+    def _ucull_update(self, xys, radii, free_map, valid_map=None, occ=None):
+        """one training step: xys [N, 2] projected centres (render px), radii [N], free_map [H, W] bool (valid, not class-masked, off the
+        class-mask rim), valid_map [H, W] bool (lens / ego validity: a centre outside it counts neither as visible nor as free)."""
+        n = xys.shape[0]
+        if getattr(self, "_uc_vis", None) is None or self._uc_vis.shape[0] != n:
+            if getattr(self, "_uc_vis", None) is not None:
+                say(f"[ucull {self.model_name}] step {self.step}: {self._uc_vis.shape[0]} -> {n} gaussians, counters restarted")
+            self._uc_vis = torch.zeros(n, device=xys.device, dtype=torch.float32)
+            self._uc_free = torch.zeros(n, device=xys.device, dtype=torch.float32)
+        H, W = free_map.shape
+        x = xys[:, 0].floor().long(); y = xys[:, 1].floor().long()
+        vis = (radii > 0) & (x >= 0) & (x < W) & (y >= 0) & (y < H)
+        yc, xc = y.clamp(0, H - 1), x.clamp(0, W - 1)
+        if valid_map is not None:
+            vis &= valid_map[yc, xc]
+        if occ is not None:   # (centre depths [N], rendered depth [H, W], alpha [H, W]): hidden behind the rendered surface = not visible
+            gdepth, depth_im, alpha_im = occ
+            d = depth_im[yc, xc]
+            vis &= (gdepth <= d * (1.0 + UCULL_OCC_REL) + UCULL_OCC_ABS) | (alpha_im[yc, xc] < 0.5)
+        free = free_map[yc, xc] & vis
+        self._uc_vis += vis; self._uc_free += free
+
+    @torch.no_grad()
+    def _ucull_ground(self):
+        """per gaussian: the 5th height percentile (z) of the opaque gaussians of its UCULL_CELL m xy cell (-inf: no opaque one)."""
+        m = self.means.detach(); xy = m[:, :2]; z = m[:, 2]
+        ij = ((xy - xy.min(0).values) / UCULL_CELL).long(); nj = int(ij[:, 1].max()) + 1
+        key = ij[:, 0] * nj + ij[:, 1]; K = int(key.max()) + 1
+        o = torch.sigmoid(self.opacities.detach().flatten()) > 0.3
+        ko, zo = key[o], z[o]
+        p = torch.argsort(zo); ko, zo = ko[p], zo[p]
+        p = torch.argsort(ko, stable=True); ko, zo = ko[p], zo[p]
+        cnt = torch.bincount(ko, minlength=K); start = torch.cumsum(cnt, 0) - cnt
+        q = start + ((cnt - 1).clamp_min(0).float() * 0.05).long()
+        gz = torch.full((K,), float("-inf"), device=m.device)
+        has = cnt > 0
+        gz[has] = zo[q[has]]
+        return gz[key]
+
+    @torch.no_grad()
+    def _ucull_mask(self):
+        """[N] bool: unconstrained gaussians (see UCULL_*), or None when the experiment is off / no counters yet."""
+        if not UCULL_ON or self.model_name != "background" or getattr(self, "_uc_vis", None) is None \
+                or self._uc_vis.shape[0] != self.num_points:
+            return None
+        v, f = self._uc_vis, self._uc_free
+        cand = (v >= UCULL_MIN_VIS) & (f <= UCULL_FRAC * v)
+        cand &= self.means.detach()[:, 2] > self._ucull_ground() + UCULL_GROUND
+        n = int(cand.sum())
+        say(f"[ucull {self.model_name}] step {self.step}: {n} unconstrained of {self.num_points} "
+            f"(judged {int((v >= UCULL_MIN_VIS).sum())})")
+        if UCULL_DECAY < 1:
+            v.mul_(UCULL_DECAY); f.mul_(UCULL_DECAY)                 # in place: the rebuild below re-indexes these tensors
+        if UCULL_DUMP:
+            torch.save({"step": self.step, "vis": v, "free": f, "cand": cand, "means": self.means.detach(),
+                        "opac": torch.sigmoid(self.opacities.detach().flatten())}, UCULL_DUMP)
+        return cand
+
     # ---- contribution-frequency counters (experiment, see COVER_* above)
     @torch.no_grad()
     def _cover_update(self, grad_norm, radii, step):

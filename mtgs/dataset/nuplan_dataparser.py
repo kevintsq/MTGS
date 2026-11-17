@@ -506,7 +506,10 @@ class NuplanDataParser(DataParser):
             sfm_pcd_file_paths = [joint_pcd]
         for path in sfm_pcd_file_paths:
             if os.path.exists(path):
-                pcd += o3d.io.read_point_cloud(str(path))
+                _sfm = o3d.io.read_point_cloud(str(path))
+                if os.environ.get("MTGS_SFM_BOX_FILTER", "0") == "1":   # experiment 2026-11-15, see _sfm_box_filter
+                    _sfm = self._sfm_box_filter(_sfm)
+                pcd += _sfm
             else:
                 say(f"[WARNING] no SFM pcd found in {path.name}")
 
@@ -523,6 +526,47 @@ class NuplanDataParser(DataParser):
             "points3D_rgb": points3D_rgb,
         }
         return out
+
+    def _sfm_box_filter(self, pcd):
+        """EXPERIMENT 2026-11-15 (MTGS_SFM_BOX_FILTER=1): drop the SfM points inside the boxes of STATIC vehicles (parked: >= 4 frames,
+        centre spread < 0.75 m within a pass) of the training passes, above the lowest 0.25 m of the box (the road under it stays),
+        box + 0.125 m on every side as stack_point_cloud_utils.split_points (fill_scale 0.25). The COLMAP features are masked by
+        Mask2Former classes >= 10 without dilation, so silhouette features of parked cars triangulate (px_loc_0195: 50-500 points
+        inside a parked-car box) and seed a baked car. Moving cars are left alone: an all-frame box filter on the static cloud also
+        removed the road surface along every lane (356k of 2.1M points on px)."""
+        import numpy as np
+        from scipy.spatial import cKDTree
+        P = np.asarray(pcd.points)
+        if len(P) == 0:
+            return pcd
+        boxes = []
+        for vt, v in self.video_scene.video_scene_dict.items():
+            tracks = {}
+            for f in v["frame_infos"]:
+                B = np.asarray(f["gt_boxes"], dtype=np.float64)
+                if B.size == 0:
+                    continue
+                L = np.asarray(f["lidar2global"], dtype=np.float64)
+                for t, b, n in zip(f["track_tokens"], B, f["gt_names"]):
+                    if str(n) != "vehicle":
+                        continue
+                    c = L[:3, :3] @ b[:3] + L[:3, 3]
+                    R = L[:3, :3] @ np.array([[np.cos(b[6]), -np.sin(b[6]), 0], [np.sin(b[6]), np.cos(b[6]), 0], [0, 0, 1.0]])
+                    tracks.setdefault(str(t), []).append((c, R, b[3:6] + 0.25))
+            for a in tracks.values():
+                C = np.array([x[0] for x in a])
+                if len(a) >= 4 and np.linalg.norm(C[:, :2] - np.median(C[:, :2], 0), axis=1).max() < 0.75:
+                    boxes += a
+        tree = cKDTree(P[:, :2]); drop = np.zeros(len(P), bool)
+        for c, R, dims in boxes:
+            idx = tree.query_ball_point(c[:2], float(np.linalg.norm(dims[:2]) / 2 + 0.1))
+            if not idx:
+                continue
+            q = (P[idx] - c) @ R
+            inside = (np.abs(q[:, :2]) <= dims[:2] / 2).all(1) & (q[:, 2] > -dims[2] / 2 + 0.125 + 0.25) & (q[:, 2] <= dims[2] / 2)
+            drop[np.asarray(idx)[inside]] = True
+        say(f"[sfm box filter] {int(drop.sum())} of {len(P)} SfM points inside {len(boxes)} static-vehicle boxes removed")
+        return pcd.select_by_index(np.nonzero(~drop)[0].tolist())
 
     def _generate_instance_infos(self, video_scene: VideoScene):
         video_scene_dict = video_scene.video_scene_dict

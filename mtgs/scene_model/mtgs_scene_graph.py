@@ -769,6 +769,12 @@ class MTGSSceneModel(Model):
             info["means2d"].retain_grad()
         self.xys = info["means2d"]  # [1, N, 2]
         self.radii = info["radii"]  # [1, N]
+        if _vgs.UCULL_ON and _vgs.UCULL_OCC and self.training:   # occlusion test of the unconstrained-cull counters
+            if render_mode != "RGB+ED" or "depths" not in info:
+                raise RuntimeError("MTGS_UCULL_OCC=1 needs the rendered depth (output_depth_during_training) and gsplat's per-gaussian depths")
+            self._uc_gdepth = info["depths"].detach()[0]                    # [N] camera depth of every centre
+            self._uc_depth_im = render[..., -1].detach()[0]                 # [H, W] rendered expected depth
+            self._uc_alpha_im = alpha.detach()[0, ..., 0]                   # [H, W]
         self.last_size = (H, W)
 
         rgb = render[..., :3] + (1 - alpha) * background
@@ -957,6 +963,19 @@ class MTGSSceneModel(Model):
         # Note that here the mask is a combined mask showing all visible objects in the camera.
         # This is a little bit sketchy for the SSIM loss.
         combined_mask = self.combine_visible_mask(pred_img, gt_img, batch=batch)
+        if _vgs.UCULL_ON and self.training:   # unconstrained-cull counters: lens / ego validity and the dynamic-class mask kept apart
+            _m = combined_mask[..., 0]
+            _valid = batch["lens_valid"].to(self.device)[..., 0].bool() if "lens_valid" in batch else torch.ones_like(_m)
+            _dyn = (_valid & ~_m).float()[None, None]          # masked by a class mask (vehicle, person, ...) inside the valid area
+            _r = _vgs.UCULL_DILATE
+            if _r > 0:
+                _dyn = torch.nn.functional.max_pool2d(_dyn, 2 * _r + 1, stride=1, padding=_r)
+            self._uc_valid_map = _valid                        # outside it: neither visible nor free (lens border, own car body)
+            self._uc_free_map = _valid & (_dyn[0, 0] == 0)
+            if not getattr(self, "_uc_said", False):
+                self._uc_said = True
+                say(f"[ucull] masks of the first step: lens / ego valid {float(_valid.float().mean()):.3f}, class-masked inside it "
+                    f"{float((_valid & ~_m).float().mean()):.3f}, free {float(self._uc_free_map.float().mean()):.3f}")
 
         l1_Loss = masked_mean(torch.abs(gt_img - pred_img_appearance), combined_mask)
         loss_dict = {
@@ -1494,6 +1513,10 @@ class MTGSSceneModel(Model):
                 continue
             index = slice(*span)
             model.update_statistics(xys_grad=grad_norm(model.config.control.use_abs_grad)[index], radii=radii[index])
+            if _vgs.UCULL_ON and model_name == "background" and not model.frozen and getattr(self, "_uc_free_map", None) is not None:
+                if self._uc_free_map.shape == tuple(self.last_size):
+                    occ = (self._uc_gdepth[index], self._uc_depth_im, self._uc_alpha_im) if _vgs.UCULL_OCC else None
+                    model._ucull_update(self.xys[0, index].detach(), radii[index], self._uc_free_map, self._uc_valid_map, occ)
             if _vgs.COVER_ON and model_name == "background" and not model.frozen:   # experiment: contribution frequency (rare regions)
                 contrib = model._cover_update(grad_norm(model.config.control.use_abs_grad)[index], radii[index], step)
                 if _vgs.COVER_VIEW and step >= _vgs.COVER_START:

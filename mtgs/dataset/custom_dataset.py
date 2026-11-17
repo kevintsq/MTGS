@@ -80,6 +80,7 @@ class CustomInputDataset(InputDataset):
     RESAMPLE_MAP = {
         'image': Image.Resampling.BILINEAR,
         'mask': Image.Resampling.NEAREST,
+        'lens_valid': Image.Resampling.NEAREST,
         'semantic_map': Image.Resampling.NEAREST,
         'instance_map': Image.Resampling.NEAREST,
         'depth': Image.Resampling.BILINEAR
@@ -449,6 +450,8 @@ class CustomInputDataset(InputDataset):
                 data["mask"] = np.logical_and(valid_mask, custom_mask)
             else:
                 data["mask"] = valid_mask
+            if os.environ.get("MTGS_UCULL", "0") == "1":   # experiment: the unconstrained-cull counters need the lens / ego validity alone
+                data["lens_valid"] = valid_mask.copy()
 
         if self._dataparser_outputs.depth_filenames is not None:
             depth = self._get_depth_from_image(image_idx)

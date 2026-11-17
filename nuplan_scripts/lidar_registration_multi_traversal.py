@@ -4,7 +4,7 @@
 # Copyright (c) OpenDriveLab. All rights reserved.                              #
 #-------------------------------------------------------------------------------#
 from nuplan_scripts.utils.console import say
-from nuplan_scripts.utils.traj_step_qa import check_trajectory_steps, check_unrefined_passes
+from nuplan_scripts.utils.traj_step_qa import check_trajectory_steps, check_unrefined_passes, repair_short_hjumps
 import os
 import sys
 import copy
@@ -422,6 +422,23 @@ def _aligned_reference(video_scene_dict, result_poses_dict_aligned, exclude):
     return xy, dz, (float(np.median(dz)) if len(dz) else 0.0)
 
 
+def _smooth_along_path(off, P, sigma_m=None):
+    """Gaussian smoothing (MTGS_REG_Z_OFFSET_SIGMA_M, 15 m along the pass's own driven path) of a per-frame height offset.
+
+    The height-transfer offsets (_gps_poses_on_aligned_height, _harmonize_z) are medians over the nearby frames of other
+    passes, and every pass carries its own INS / ICP height bias (0.5-0.9 m on ml_sg03), so the median jumps wherever
+    the set of nearby reference frames changes (a junction, a pass ending): 2026-11-17 ml_sg03 got 0.3-0.8 m single-frame
+    steps in 5 passes that way, and the per-frame map ICP then copied a stepped pass into the passes registered onto it
+    (passes 23 and 3 both -0.8 m at the same spot). The offset is the difference of two smooth height tracks (registration
+    and INS), so a step in it is never physical. 0 disables."""
+    sigma = float(os.environ.get('MTGS_REG_Z_OFFSET_SIGMA_M', 15.0)) if sigma_m is None else sigma_m
+    if sigma <= 0 or len(off) < 3:
+        return off
+    s = np.r_[0.0, np.cumsum(np.linalg.norm(np.diff(np.asarray(P)[:, :2], axis=0), axis=1))]
+    W = np.exp(-0.5 * ((s[:, None] - s[None, :]) / sigma) ** 2)
+    return (W @ off) / W.sum(axis=1)
+
+
 def _gps_poses_on_aligned_height(video, ref, radius=25.0):
     """{token: INS pose lifted by the local (aligned - INS) height offset}, for every frame of one pass.
 
@@ -450,6 +467,7 @@ def _gps_poses_on_aligned_height(video, ref, radius=25.0):
         # along the driven path (+ a tiny index term: a standing ego repeats its position)
         s_ = np.r_[0.0, np.cumsum(np.linalg.norm(np.diff(P[:, :2], axis=0), axis=1))] + 1e-6 * np.arange(len(fis))
         off = np.interp(s_, s_[have], off[have])
+    off = _smooth_along_path(off, P)
     out = {}
     for k, i in enumerate(fis):
         p = np.array(i['ego2global'], dtype=float).copy()
@@ -617,6 +635,7 @@ def _harmonize_z(video_scene_dict, result_poses_dict_aligned, radius=15.0, min_n
             for i in range(len(pts)):
                 if np.isnan(off[i]):
                     off[i] = off[idx_ok[np.argmin(abs(idx_ok - i))]]
+            off = _smooth_along_path(off, pts)                  # the window median steps where the reference set changes
             for i, info in enumerate(video_scene_dict[vt]['frame_infos']):
                 result_poses_dict_aligned[info['token']][2, 3] -= off[i]
             pts = pts.copy(); pts[:, 2] -= off
@@ -1488,13 +1507,38 @@ if __name__ == '__main__':
             _tab = _pair_table()
             if any(sh > _pair_stop for sh in _tab.values()):
                 say(f"[pass QA] passes disagree by more than {_pair_stop:g} m: {_fmt(_tab)}", style="bold red")
-                _mv = []
+                # The passes fall into groups that agree inside (connected components of the pairs within _pair_stop, a pair
+                # counting only when every measured direction agrees). The group with the most frames is the reference; every
+                # pass of another group that overlaps it is registered onto a map of the reference group ONLY (2026-11-17,
+                # ml_bos01: {56, 58, 62, 76} vs {3, 59, 63} 2.3 m apart; the old rule moved only pass 3, the one pass that
+                # disagreed with most of its neighbours, and registered it onto a map that still held 59 and 63, its own
+                # group, so it stayed where it was and the stage stopped).
+                _agree = {vt: set() for vt in video_scene_dict}
+                for (a, b), sh in _tab.items():
+                    if sh <= _pair_stop and _tab.get((b, a), sh) <= _pair_stop:
+                        _agree[a].add(b); _agree[b].add(a)
+                _grp, _seen = [], set()
                 for vt in video_scene_dict:
-                    _nb = {u: sh for (a, u), sh in _tab.items() if a == vt}
-                    if _nb and 2 * sum(sh > _pair_stop for sh in _nb.values()) > len(_nb):
-                        _mv.append(vt)
-                _ref = _aligned_reference(video_scene_dict, result_poses_dict_aligned, set(_mv))
-                _map = _map_icp_inputs(video_scene_dict, result_poses_dict_aligned, set(_mv), _scans_by_token) if _mv else None
+                    if vt in _seen:
+                        continue
+                    _c, _st = set(), [vt]
+                    while _st:
+                        x = _st.pop()
+                        if x not in _c:
+                            _c.add(x); _st.extend(_agree[x] - _c)
+                    _seen |= _c; _grp.append(_c)
+                _frames = lambda c: sum(len(video_scene_dict[x]['frame_infos']) for x in c)
+                _rg = max(_grp, key=_frames)
+                _mv = [vt for vt in video_scene_dict if vt not in _rg
+                       and any(sh > _pair_stop for (a, u), sh in _tab.items() if (a == vt and u in _rg) or (u == vt and a in _rg))]
+                if len(_grp) > 1:
+                    say("[pass QA] groups of agreeing passes: " + " | ".join(
+                        "{" + ", ".join(sorted((_id(x) for x in c), key=lambda s: int(s) if s.isdigit() else 0)) + f"}} {_frames(c)} frames"
+                        for c in sorted(_grp, key=_frames, reverse=True)) + f"; registering {[_id(x) for x in _mv]} onto the first",
+                        style="yellow")
+                _out = set(video_scene_dict) - _rg
+                _ref = _aligned_reference(video_scene_dict, result_poses_dict_aligned, _out)
+                _map = _map_icp_inputs(video_scene_dict, result_poses_dict_aligned, _out, _scans_by_token) if _mv else None
                 for vt in _mv:
                     v = video_scene_dict[vt]
                     if _map is None or len(_map) < 5000:
@@ -1503,7 +1547,7 @@ if __name__ == '__main__':
                     fixed, rep = _map_icp_pass(v, _scans_by_token, [("aligned", _cur), ("ins", _gps_poses_on_aligned_height(v, _ref).get)], _map, vt)
                     if fixed is not None:
                         _d = [float(np.linalg.norm(fixed[t][:3, 3] - result_poses_dict_aligned[t][:3, 3])) for t in fixed]
-                        say(f"[pass QA] video {_id(vt)} disagrees with most passes it overlaps: registered onto the others "
+                        say(f"[pass QA] video {_id(vt)} disagrees with the reference group: registered onto it "
                             f"(moved median {np.median(_d):.2f} m, max {max(_d):.2f} m): {rep}", style="yellow")
                         result_poses_dict_aligned.update(fixed)
                     else:
@@ -1566,6 +1610,7 @@ if __name__ == '__main__':
     ], inline=True)
 
     check_unrefined_passes(video_scene, 'regis', video_scene.pickle_path_registered.replace('.pkl', '_unrefined_qa_failed.pkl'))
+    repair_short_hjumps(video_scene, 'regis')
     check_trajectory_steps(video_scene, 'regis', video_scene.pickle_path_registered.replace('.pkl', '_step_qa_failed.pkl'))
     video_scene.dump_pickle(video_scene.pickle_path_registered)
     video_scene.update_pickle_link(video_scene.pickle_path_registered)

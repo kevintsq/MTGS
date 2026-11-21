@@ -535,10 +535,15 @@ def create_colmap_model(video_scene: VideoScene, video_scene_dict, colmap_path):
         say(f'[pairs] capped at {max_per_image} per image -> {len(pairs)} pairs '
                     f'for {len(cam_views)} images')
 
-    f_pairs = open(f'{colmap_path}/image_pairs.txt', 'w')
-    for pair in pairs:
-        f_pairs.write(f'{pair[0]} {pair[1]}\n')
-    f_pairs.close()
+    # Pairs in image order (2026-11-21): matches_importer works through the list in blocks and caches descriptors per
+    # block; iterating the python set (random order) made every block load ~2x block_size images from SQLite --
+    # pq_area0806's GPU match job (19k images, 2.17 M pairs) read + wrote 4.6 TB, kept the GPU at ~37 % and was
+    # cancelled by torch's low-utilisation policy. In cam_views order consecutive images share most neighbours.
+    # The pair SET is unchanged (sfm_split compares sets), only the line order.
+    order = {v['token']: k for k, v in enumerate(cam_views)}
+    with open(f'{colmap_path}/image_pairs.txt', 'w') as f_pairs:
+        for a, b in sorted(pairs, key=lambda p: (order.get(p[0], -1), order.get(p[1], -1), p)):
+            f_pairs.write(f'{a} {b}\n')
 
     # create colmap database after everything is done
     create_colmap_database(colmap_path)

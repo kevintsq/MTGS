@@ -82,6 +82,61 @@ def _run_colmap_raw(args, colmap_path, **kwargs):
     return subprocess.run(rel, cwd=colmap_path, **kwargs)
 
 
+def _sha256_file(path):
+    import hashlib
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for b in iter(lambda: f.read(1 << 24), b""):
+            h.update(b)
+    return h.hexdigest()
+
+
+def _mapper_resume(mapper_args, colmap_path):
+    """MTGS_SFM_RESUME_DIR=<dir on persistent storage> (2026-11-21, torch's 48 h job limit vs ~19k-image mappers):
+    the incremental / pose_prior mapper writes a snapshot of its model every MTGS_SFM_SNAPSHOT_FREQ registered frames
+    (default 2000) to <dir>/snap, and a rerun of the stage on the SAME database (sha256 in <dir>/meta.json; in the
+    split map phase the database is restored from the match snapshot, so it is identical) continues from the newest
+    readable snapshot via --input_path instead of starting over. Another database -> the old snapshots are discarded.
+    Returns (resume_dir, stop) where stop() ends the pruner thread (keeps the newest 3 snapshot dirs), or None."""
+    import json, threading, time
+    rdir = os.environ.get("MTGS_SFM_RESUME_DIR", "")
+    if not rdir:
+        return None
+    from nuplan_scripts.utils.colmap_utils.read_write_model import read_model
+    snap = os.path.join(rdir, "snap"); meta_p = os.path.join(rdir, "meta.json")
+    sha = _sha256_file(os.path.join(colmap_path, "database.db"))
+    meta = json.load(open(meta_p)) if os.path.exists(meta_p) else {}
+    if meta.get("db_sha256") != sha:
+        if os.path.isdir(rdir):
+            say(f"[sfm resume] database changed (meta {str(meta.get('db_sha256'))[:12]} vs {sha[:12]}): old snapshots discarded", flush=True)
+        shutil.rmtree(rdir, ignore_errors=True)
+        os.makedirs(snap, exist_ok=True)
+        json.dump({"db_sha256": sha, "created": time.strftime("%Y-%m-%dT%H:%M:%S")}, open(meta_p, "w"), indent=1)
+    os.makedirs(snap, exist_ok=True)
+    cands = sorted(d for d in os.listdir(snap) if os.path.isdir(os.path.join(snap, d)))
+    for d in reversed(cands):               # newest first; a snapshot cut by the job kill does not read -> the one before
+        p = os.path.join(snap, d)
+        try:
+            cams, imgs, pts = read_model(p, ext=".bin")
+        except Exception as e:              # noqa: BLE001 -- any read failure means an incomplete snapshot
+            say(f"[sfm resume] snapshot {d} unreadable ({type(e).__name__}), trying an older one", flush=True)
+            continue
+        mapper_args += ["--input_path", p]
+        say(f"[sfm resume] continuing from snapshot {d}: {len(imgs)} registered images, {len(pts)} points", flush=True)
+        break
+    mapper_args += ["--Mapper.snapshot_path", snap,
+                    "--Mapper.snapshot_frames_freq", os.environ.get("MTGS_SFM_SNAPSHOT_FREQ", "2000")]
+    done = threading.Event()
+
+    def prune():
+        while not done.wait(60):
+            ds = sorted(d for d in os.listdir(snap) if os.path.isdir(os.path.join(snap, d)))
+            for d in ds[:-3]:
+                shutil.rmtree(os.path.join(snap, d), ignore_errors=True)
+    threading.Thread(target=prune, daemon=True).start()
+    return rdir, done.set
+
+
 def _write_pose_priors(colmap_path):
     """Camera centres of sparse_model/images.txt (the registered poses) -> pose_priors (CARTESIAN) for every
     image the feature extractor registered in database.db."""
@@ -457,12 +512,22 @@ def run_bundle_adjustment(
                            "--Mapper.ba_refine_principal_point", "0",
                            "--Mapper.ba_refine_extra_params", "0" if fix else "1",
                            "--Mapper.multiple_models", "1", "--Mapper.min_model_size", "50"]
+        resume = _mapper_resume(mapper_args, colmap_path) if mode in ("incremental", "pose_prior") else None
         say(f"[sfm] {mode} mapper: {' '.join(mapper_args[1:])}", flush=True)
         try:
             _run_colmap(mapper_args, colmap_path, check=True)
         except subprocess.CalledProcessError as e:
             say(f"Error executing colmap {mode} mapper: {e}")
             sys.exit(1)
+        finally:
+            if resume:
+                resume[1]()
+        if resume and "--input_path" in mapper_args and os.path.exists(os.path.join(raw, "images.bin")):
+            # with --input_path COLMAP writes the continued model straight into the output folder, not into <out>/0
+            for f in os.listdir(raw):
+                if os.path.isfile(os.path.join(raw, f)):
+                    shutil.move(os.path.join(raw, f), os.path.join(raw, "0", f))
+            say("[sfm resume] continued model moved to model 0", flush=True)
         models = [d for d in sorted(os.listdir(raw), key=lambda x: int(x) if x.isdigit() else 1e9)
                   if os.path.exists(os.path.join(raw, d, "images.bin"))]
         if not models:
@@ -475,6 +540,8 @@ def run_bundle_adjustment(
         say(f"[sfm] models (images): {sizes}; using {best}", flush=True)
         shutil.rmtree(os.path.join(colmap_path, output_model, "0"), ignore_errors=True)
         shutil.copytree(os.path.join(raw, best), os.path.join(colmap_path, output_model, "0"))
+        if resume:                      # the model is safe in the work tree: the snapshots are no longer needed
+            shutil.rmtree(resume[0], ignore_errors=True)
         if mode == "pose_prior" and float(os.environ.get("MTGS_SFM_PRIOR_MAX_ERR", "0")) > 0:
             _drop_far_from_prior(colmap_path, os.path.join(colmap_path, output_model, "0"),
                                  float(os.environ["MTGS_SFM_PRIOR_MAX_ERR"]), colmap_exe, scale=_colmap_scale(colmap_path))

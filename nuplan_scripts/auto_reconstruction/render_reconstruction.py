@@ -43,12 +43,22 @@ if __name__ == '__main__':
             return cfg
         # nerfstudio's ComputePSNR.main with that one config callback
         ns_config, pipeline, checkpoint_path, _ = eval_setup(nerfstudio_config, update_config_callback=_skip_init_points)
-        metrics_dict = pipeline.get_average_eval_image_metrics(output_path=None, get_std=True)
-        output_path = Path(reconstruction_dir) / 'eval_result.json'
-        output_path.write_text(json.dumps({
+        result = {
             "experiment_name": ns_config.experiment_name,
             "method_name": ns_config.method_name,
             "checkpoint": str(checkpoint_path),
-            "results": metrics_dict,
-        }, indent=2), "utf8")
+        }
+        if os.environ.get('MTGS_EVAL_FIT_CAM_ROT', '0') == '1':
+            # optional: also the metrics with one constant rotation per (drive, camera) fitted and removed, for PSNR
+            # comparisons between pose recipes (mtgs/tools/eval_cam_rot.py). "results" stays the raw eval.
+            from mtgs.tools.eval_cam_rot import eval_fit_cam_rot
+            fit = eval_fit_cam_rot(pipeline, get_std=True)
+            result["results"] = fit["raw"]
+            result["results_cam_rot_aligned"] = fit["aligned"]
+            result["cam_rot_fit"] = fit["fit"]
+            result["cam_rot_fit_settings"] = fit["settings"]
+        else:
+            result["results"] = pipeline.get_average_eval_image_metrics(output_path=None, get_std=True)
+        output_path = Path(reconstruction_dir) / 'eval_result.json'
+        output_path.write_text(json.dumps(result, indent=2), "utf8")
         say(f"Saved results to: {output_path}")

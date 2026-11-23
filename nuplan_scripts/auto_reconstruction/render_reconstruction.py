@@ -25,13 +25,18 @@ if __name__ == '__main__':
     reconstruction_dir = os.path.join(config.data_root, recon_subdir, config.road_block_name)
     nerfstudio_config = Path(reconstruction_dir) / 'config.yml'
 
-    say("Rendering background reconstruction model.", style='bold magenta')
-    from mtgs.tools.render import RenderInterpolated
-    render = RenderInterpolated(
-        load_config=nerfstudio_config,
-        output_path=Path(reconstruction_dir) / os.environ.get('MTGS_RENDER_DIR', 'render')
-    )
-    render.main()
+    if os.environ.get('MTGS_SKIP_VIDEO') == '1':
+        # eval only: the trajectory videos are the long, mostly-CPU part of this step (ffmpeg encoding; ~80 min for a
+        # 3,800-frame block at a few % GPU load, which a cluster's low-GPU-utilisation rule cancels), the eval is not
+        say("MTGS_SKIP_VIDEO=1: no trajectory videos, eval only.", style='bold magenta')
+    else:
+        say("Rendering background reconstruction model.", style='bold magenta')
+        from mtgs.tools.render import RenderInterpolated
+        render = RenderInterpolated(
+            load_config=nerfstudio_config,
+            output_path=Path(reconstruction_dir) / os.environ.get('MTGS_RENDER_DIR', 'render')
+        )
+        render.main()
 
     if os.environ.get('MTGS_SKIP_EVAL') != '1':
         say("Evaluating background reconstruction model.", style='bold magenta')

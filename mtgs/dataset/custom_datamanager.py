@@ -271,7 +271,8 @@ class CustomFullImageDatamanager(FullImageDatamanager, Generic[TDataset]):
         Returns a Camera instead of raybundle"""
         image_idx = self.train_sampler.get_next_image_idx()
         loader = self.train_dataloaders[self.get_scale_factor_idx(step)]
-        if getattr(loader, "cache_max", 0) and hasattr(self.train_sampler, "peek"):   # capped image cache: decode ahead
+        if (getattr(loader, "cache_max", 0) or getattr(loader, "background", False)) and hasattr(self.train_sampler, "peek"):
+            # capped image cache / background prefetch: decode the sampler's next draws ahead
             loader.hint([image_idx] + self.train_sampler.peek(CACHE_LOOKAHEAD))
 
         data, camera = self.cached_train(

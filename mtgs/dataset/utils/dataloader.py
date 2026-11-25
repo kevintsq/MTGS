@@ -245,6 +245,19 @@ class PrefetchDataLoader:
 
     def hint(self, indices):
         """The indices the sampler will most likely ask for next (sampler.peek): decode them in the background."""
+        if self.background:
+            # background prefetch: move the sampler's next draws to the front (a small priority pool), so training
+            # rarely has to decode on the spot while the in-order prefetch is still running
+            with self.lock:
+                for i in indices:
+                    if i in self.cache or i in self.prio:
+                        continue
+                    fut = self.pending.get(i)
+                    if fut is not None and not fut.cancel():     # a worker already has it
+                        continue
+                    self.prio.add(i)
+                    self.pending[i] = self.prio_pool.submit(self._bg_decode, i)
+            return
         if not self.cache_max:
             return
         with self.lock:
@@ -293,6 +306,8 @@ class PrefetchDataLoader:
             for idx in range(self.n_total):
                 self.pending[idx] = pool.submit(self._bg_decode, idx)
         pool.shutdown(wait=False)               # the workers finish the queue; nothing new is submitted
+        self.prio = set()                       # indices moved to the priority pool by hint()
+        self.prio_pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="mtgs_prefetch_next")
         say(f"[image cache] background prefetch of {self.n_total} samples started "
             f"({self.datamanager.config.num_workers} workers); training does not wait for it", flush=True)
 

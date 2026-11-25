@@ -23,10 +23,10 @@ from nerfstudio.data.datasets.base_dataset import InputDataset
 from nerfstudio.utils.misc import get_orig_class
 
 from .custom_dataset import CustomInputDataset
-from .utils.dataloader import AsyncDataLoader, FixedIndicesPseudoDataloader, OnDemandDataLoader, PinnedUploader, PrefetchDataLoader
+from .utils.dataloader import FixedIndicesPseudoDataloader, ImageCache, PinnedUploader
 from .utils.sampler import CameraSampler, MultiTraversalBalancedSampler
 
-# MTGS_CACHE_MAX_IMAGES (utils/dataloader.PrefetchDataLoader): how many of the sampler's next draws are decoded ahead
+# MTGS_CACHE_MAX_IMAGES (utils/dataloader.ImageCache): how many of the sampler's next draws are decoded ahead
 CACHE_LOOKAHEAD = int(os.environ.get("MTGS_CACHE_LOOKAHEAD", "32"))
 
 @dataclass
@@ -46,13 +46,12 @@ class CustomFullImageDatamanagerConfig(FullImageDatamanagerConfig):
     load_semantic_masks_from: Literal["panoptic", "semantic", False] = False
     load_lidar_depth: bool = False
     load_pseudo_depth: bool = False
-    cache_strategy: Literal["on_demand", "prefetch", "async"] = "async"
-    """The cache strategy to use for data loading.
-    - on_demand: load data on demand. Recommended only for debugging.
-    - prefetch: prefetch data with multiprocessing before training
-    - async: load data asynchronously with multiprocessing
+    cache_strategy: Literal["background", "on_demand"] = "background"
+    """The image cache (utils/dataloader.ImageCache; MTGS_CACHE_MAX_IMAGES caps it in either mode).
+    - background: every sample decoded in the background, training starts at once (default)
+    - on_demand: decoded on first access (inference / test, debugging)
     """
-    eval_cache_strategy: Optional[Literal["on_demand", "prefetch", "async"]] = None
+    eval_cache_strategy: Optional[Literal["background", "on_demand"]] = None
     """The cache strategy to use for evaluation. If None, the same as cache_strategy."""
     num_workers: int = 4
     """The number of workers to use for data loading. If 0, the data will be loaded in the main process."""
@@ -79,12 +78,6 @@ class CustomFullImageDatamanager(FullImageDatamanager, Generic[TDataset]):
     """
 
     config: CustomFullImageDatamanagerConfig
-
-    DATALOADER_MAP = {
-        "on_demand": OnDemandDataLoader,
-        "prefetch": PrefetchDataLoader,
-        "async": AsyncDataLoader,
-    }
 
     def __init__(
         self,
@@ -133,9 +126,9 @@ class CustomFullImageDatamanager(FullImageDatamanager, Generic[TDataset]):
         if test_mode in ["inference", "test"]:
             if not self.same_train_eval:
                 train_cache_strategy = "on_demand"
-                eval_cache_strategy = "prefetch"
+                eval_cache_strategy = "background"
             else:
-                train_cache_strategy = eval_cache_strategy = "prefetch"
+                train_cache_strategy = eval_cache_strategy = "background"
             self.config.load_pseudo_depth = False
 
         if test_mode == "inference":
@@ -154,11 +147,11 @@ class CustomFullImageDatamanager(FullImageDatamanager, Generic[TDataset]):
         self.train_dataset = self.create_train_dataset()
         self.train_dataloaders = []
         for scaling_factor in self.scaling_factors:
-            self.train_dataloaders.append(self.DATALOADER_MAP[train_cache_strategy](self, self.train_dataset, scaling_factor))
+            self.train_dataloaders.append(ImageCache(self, self.train_dataset, scaling_factor, lazy=train_cache_strategy == "on_demand"))
 
         if not self.same_train_eval:
             self.eval_dataset = self.create_eval_dataset()
-            self.eval_dataloader = self.DATALOADER_MAP[eval_cache_strategy](self, self.eval_dataset, self.scaling_factors[-1])
+            self.eval_dataloader = ImageCache(self, self.eval_dataset, self.scaling_factors[-1], lazy=eval_cache_strategy == "on_demand")
         else:
             self.eval_dataset = self.train_dataset
             self.eval_dataloader = self.train_dataloaders[-1]
@@ -271,8 +264,7 @@ class CustomFullImageDatamanager(FullImageDatamanager, Generic[TDataset]):
         Returns a Camera instead of raybundle"""
         image_idx = self.train_sampler.get_next_image_idx()
         loader = self.train_dataloaders[self.get_scale_factor_idx(step)]
-        if (getattr(loader, "cache_max", 0) or getattr(loader, "background", False)) and hasattr(self.train_sampler, "peek"):
-            # capped image cache / background prefetch: decode the sampler's next draws ahead
+        if loader.mode != "lazy" and hasattr(self.train_sampler, "peek"):   # decode the sampler's next draws first
             loader.hint([image_idx] + self.train_sampler.peek(CACHE_LOOKAHEAD))
 
         data, camera = self.cached_train(

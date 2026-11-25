@@ -42,7 +42,7 @@ config = CustomTrainerConfig(
                 eval_2hz=True,
             ),
             camera_res_scale_factor=0.5,
-            cache_strategy="async",
+            cache_strategy="background",
             num_workers=8,
             cache_images="cpu",
             cache_images_type="uint8",

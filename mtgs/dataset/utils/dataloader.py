@@ -7,12 +7,10 @@ from nuplan_scripts.utils.console import say
 from concurrent.futures import ThreadPoolExecutor
 import os
 from collections import OrderedDict
-from functools import lru_cache
+import time
 
 import torch
-from rich.progress import track
 import threading
-import torch.multiprocessing as mp
 
 class PinnedUploader:
     """Moves one cached sample (data dict + Cameras) to the device without a stream sync.
@@ -73,9 +71,9 @@ class FixedIndicesPseudoDataloader:
 
     def __iter__(self):
         loader = getattr(self.datamanager, "eval_dataloader", None)
-        ahead = getattr(loader, "cache_max", 0) and hasattr(loader, "hint")
+        ahead = loader is not None and getattr(loader, "mode", "lazy") != "lazy"
         for idx in range(len(self)):
-            if ahead:   # capped image cache: the evaluation over all images is in order, decode the next ones ahead
+            if ahead:   # the evaluation over all images is in order: decode the next ones first
                 loader.hint(list(range(idx, min(idx + 32, len(self)))))
             data, camera = self.datamanager.cached_eval(idx)
             camera, data = self.datamanager.upload(data, camera)
@@ -84,303 +82,140 @@ class FixedIndicesPseudoDataloader:
     def __len__(self):
         return len(self.datamanager.eval_dataset)
 
-class AsyncDataLoader:
+class ImageCache:
+    """The datamanager's ONE image cache (2026-11-25, user: "最后应该只保留一套最优代码"; it replaces upstream's
+    OnDemandDataLoader / AsyncDataLoader and the blocking prefetch). Every sample comes from datamanager._load_data,
+    so a returned sample is byte-identical in every mode; only WHEN it is decoded changes.
 
-    class PseudoDataset:
-        def __init__(self, length):
-            self.length = length
-        
-        def __len__(self):
-            return self.length
-        
-        def __getitem__(self, idx):
-            return idx
+      background (training default): `num_workers` threads decode every sample in index order and training starts at
+          once (pq_area0806, 19k images, had left an H100 idle ~60 min in the blocking prefetch). hint() (the sampler's
+          next draws, sampler.peek) moves those to a 2-thread priority pool; a draw that is not resident yet is decoded
+          on the spot (its queued decode is cancelled) or, if a worker already holds it, waited for.
+      capped (MTGS_CACHE_MAX_IMAGES=N < number of samples, 2026-11-15): at most N samples stay resident (a 12k-image
+          merged block is ~100 GB of host RAM); hint() decodes the sampler's next draws ahead; eviction is least
+          recently used but never a hinted sample.
+      lazy (cache strategy "on_demand": inference / test, or num_workers=0): decoded on first access and kept.
 
-    def __init__(self, datamanager, dataset, scale_factor: float = 1.0):
-        manager = mp.Manager()
-        self.cached_idx = manager.dict()
-        # Holding every decoded frame costs frames x cameras x resolution of host
-        # RAM, which on a large joint block overshot a whole node's fair share (one
-        # 1075-frame block peaked at 66 GB and was OOM-killed). MTGS_CACHE_MAX_IMAGES
-        # caps how many stay resident; the least recently used are dropped and
-        # reloaded on demand. 0 keeps the original unbounded behaviour.
-        self.cache = OrderedDict()
-        self.cache_max = int(os.environ.get('MTGS_CACHE_MAX_IMAGES', '0'))
-        self.cache_lock = threading.Lock()
-        self.dataset = dataset
+    Threads, not processes: the JPEG decode and undistortion (OpenCV, numpy) release the GIL, and a decoded sample
+    (~10 MB) would otherwise be pickled across processes."""
+
+    def __init__(self, datamanager, dataset, scale_factor: float = 1.0, lazy: bool = False):
         self.datamanager = datamanager
-        self.scale_factor = scale_factor
-
-        def collate_fn(batch):
-            idx = batch[0]
-            if idx in self.cached_idx:
-                return None
-            # If not in cache, load it
-            data = self.datamanager._load_data(self.dataset, idx, scale_factor=self.scale_factor)
-            return data
-
-        self.dataloader = torch.utils.data.DataLoader(
-            self.PseudoDataset(len(dataset)),
-            batch_size=1,
-            shuffle=False,
-            num_workers=self.datamanager.config.num_workers,
-            pin_memory=True,
-            drop_last=False,
-            collate_fn=collate_fn,
-        )
-        say(f'Start async loading images.')
-        self._start_loading()
-
-    def _start_loading(self):
-        def load_data():
-            for idx, batch in enumerate(self.dataloader):
-                with self.cache_lock:
-                    if idx not in self.cache:  # Only cache if not already cached
-                        assert batch is not None
-                        self._remember(idx, batch)
-            say(f'Async loading images finished.', style='bold green')
-
-        self.thread = threading.Thread(target=load_data, daemon=True)
-        self.thread.start()
-
-    def _remember(self, idx, data):
-        """Insert under the lock, evicting the oldest entry when over the cap."""
-        self.cache[idx] = data
-        self.cache.move_to_end(idx)
-        self.cached_idx[idx] = True
-        if self.cache_max > 0:
-            while len(self.cache) > self.cache_max:
-                old, _ = self.cache.popitem(last=False)
-                self.cached_idx.pop(old, None)
-
-    def get_cache(self, idx):
-        with self.cache_lock:
-            if idx in self.cache:
-                self.cache.move_to_end(idx)
-                return self.cache[idx]
-
-        # If not in cache, load it
-        data = self.datamanager._load_data(self.dataset, idx, scale_factor=self.scale_factor)
-        # Cache the newly loaded data
-        with self.cache_lock:
-            if idx not in self.cache:  # Double-check in case background thread cached it
-                self._remember(idx, data)
-        return data
-
-class OnDemandDataLoader:
-    def __init__(self, datamanager, dataset, scale_factor: float = 1.0):
         self.dataset = dataset
-        self.datamanager = datamanager
         self.scale_factor = scale_factor
-
-    @lru_cache(maxsize=None)
-    def get_cache(self, idx):
-        data = self.datamanager._load_data(self.dataset, idx, scale_factor=self.scale_factor)
-        return data
-
-class PrefetchDataLoader:
-
-    class PseudoDataset:
-        def __init__(self, length):
-            self.length = length
-        
-        def __len__(self):
-            return self.length
-        
-        def __getitem__(self, idx):
-            return idx
-
-    def __init__(self, datamanager, dataset, scale_factor: float = 1.0):
-        self.dataset = dataset
-        self.datamanager = datamanager
-        self.scale_factor = scale_factor
-        self.cache = {}
-        # MTGS_CACHE_MAX_IMAGES=N > 0 (2026-11-15): at most N decoded samples stay resident instead of every training
-        # image (12k images of a merged block = ~100 GB of host RAM before the model). Samples come from the same
-        # _load_data, so every returned sample is byte-identical to the unbounded cache; only when they are decoded
-        # changes. The training sampler's next draws are predicted without consuming its random state (peek) and
-        # decoded ahead by a thread pool (hint), so the GPU normally finds the sample resident. Unset / 0 = the
-        # original prefetch of everything.
-        self.cache_max = int(os.environ.get('MTGS_CACHE_MAX_IMAGES', '0') or 0)
-        self.background = False
-        if self.cache_max > 0 and self.cache_max < len(dataset):
-            self._init_capped()
-        else:
-            self.cache_max = 0
-            # 2026-11-25 (user: "应该直接默认改为async"): the full prefetch runs in the BACKGROUND and training starts at
-            # once; a sample the sampler asks for before its turn is decoded on the spot (or waited for when a worker
-            # already holds it). Same samples in the same order, only the decode timing changes; host RAM ends the
-            # same (every image resident). pq_area0806 (19k images) had sat ~60 min on an idle GPU in the blocking
-            # prefetch. Only num_workers=0 (no thread pool) keeps the inline prefetch.
-            if int(self.datamanager.config.num_workers) == 0:
-                self._prefetch()
-            else:
-                self._start_background()
-
-    def _init_capped(self):
-        from concurrent.futures import ThreadPoolExecutor as _Pool
-        self.cache = OrderedDict()
+        self.n_total = len(dataset)
         self.lock = threading.Lock()
-        self.pending = {}                       # idx -> Future of a decode in flight
-        self.upcoming = set()                   # predicted next indices: never evicted
-        self.pool = _Pool(max_workers=max(1, int(self.datamanager.config.num_workers) or 4), thread_name_prefix="mtgs_cache")
-        self.stats = dict(hit=0, wait=0, miss=0, wait_s=0.0, miss_s=0.0)
-        say(f"[image cache] capped at {self.cache_max} of {len(self.dataset)} samples (MTGS_CACHE_MAX_IMAGES): "
-              "decoded ahead of the sampler instead of prefetching everything", flush=True)
+        self.cache = OrderedDict()
+        self.pending = {}                       # idx -> Future of a decode that has not finished
+        self.upcoming = set()                   # capped: the hinted next draws, never evicted
+        self.prio = set()                       # background: indices moved to the priority pool
+        self.stats = dict(hit=0, wait=0, spot=0, wait_s=0.0, spot_s=0.0)
+        self.n_done = 0
+        self.t_start = time.perf_counter()
+        workers = int(datamanager.config.num_workers)
+        cap = int(os.environ.get('MTGS_CACHE_MAX_IMAGES', '0') or 0)
+        self.cache_max = cap if 0 < cap < self.n_total else 0
+        self.background = False
+        if self.cache_max:
+            self.mode = "capped"
+            self.pool = ThreadPoolExecutor(max_workers=max(1, workers or 4), thread_name_prefix="mtgs_cache")
+            say(f"[image cache] capped at {self.cache_max} of {self.n_total} samples (MTGS_CACHE_MAX_IMAGES): "
+                "decoded ahead of the sampler", flush=True)
+        elif lazy or workers == 0:
+            self.mode = "lazy"
+        else:
+            self.mode = "background"
+            self.background = True
+            pool = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="mtgs_prefetch")
+            with self.lock:
+                for idx in range(self.n_total):
+                    self.pending[idx] = pool.submit(self._decode_bg, idx)
+            pool.shutdown(wait=False)           # the workers finish the queue; nothing new is submitted
+            self.pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="mtgs_prefetch_next")
+            say(f"[image cache] background prefetch of {self.n_total} samples started ({workers} workers); "
+                "training does not wait for it", flush=True)
 
+    # ------------------------------------------------------------------ decoding
     def _store(self, idx, data):
         with self.lock:
             self.pending.pop(idx, None)
-            self.cache[idx] = data
-            self.cache.move_to_end(idx)
-            while len(self.cache) > self.cache_max:
-                victim = next((k for k in self.cache if k not in self.upcoming), None)
-                if victim is None or victim == idx:
-                    break
-                del self.cache[victim]
+            first = idx not in self.cache
+            if first:
+                self.cache[idx] = data
+                self.n_done += 1
+            else:
+                data = self.cache[idx]          # someone else stored it first: keep one copy
+            if self.cache_max:
+                self.cache.move_to_end(idx)
+                while len(self.cache) > self.cache_max:
+                    victim = next((k for k in self.cache if k not in self.upcoming), None)
+                    if victim is None or victim == idx:
+                        break
+                    del self.cache[victim]
+            done = self.n_done if (first and self.background) else 0
+        if done and (done == self.n_total or done % max(1, self.n_total // 10) == 0):
+            say(f"[image cache] background prefetch {done}/{self.n_total} ({time.perf_counter() - self.t_start:.0f} s)",
+                flush=True)
+            if done == self.n_total:
+                self._report(final=True)
         return data
 
     def _decode(self, idx):
         return self._store(idx, self.datamanager._load_data(self.dataset, idx, scale_factor=self.scale_factor))
 
+    def _decode_bg(self, idx):
+        data = self.cache.get(idx)
+        return data if data is not None else self._decode(idx)
+
     def hint(self, indices):
-        """The indices the sampler will most likely ask for next (sampler.peek): decode them in the background."""
-        if self.background:
-            # background prefetch: move the sampler's next draws to the front (a small priority pool), so training
-            # rarely has to decode on the spot while the in-order prefetch is still running
-            with self.lock:
+        """The indices the sampler will most likely ask for next (sampler.peek): decode them first."""
+        if self.mode == "lazy":
+            return
+        with self.lock:
+            if self.mode == "capped":
+                self.upcoming = set(indices)
                 for i in indices:
-                    if i in self.cache or i in self.prio:
-                        continue
-                    fut = self.pending.get(i)
-                    if fut is not None and not fut.cancel():     # a worker already has it
-                        continue
-                    self.prio.add(i)
-                    self.pending[i] = self.prio_pool.submit(self._bg_decode, i)
-            return
-        if not self.cache_max:
-            return
-        with self.lock:
-            self.upcoming = set(indices)
-            todo = [i for i in indices if i not in self.cache and i not in self.pending]
-            for i in todo:
-                self.pending[i] = self.pool.submit(self._decode, i)
-    
-    def _prefetch(self):
-        def fetch_data(idx):
-            return self.datamanager._load_data(self.dataset, idx, scale_factor=self.scale_factor)
-        
-        if self.datamanager.config.num_workers == 0:
-            for idx in track(
-                range(len(self.dataset)), 
-                description="Prefetching data", 
-                total=len(self.dataset)
-            ):
-                self.cache[idx] = fetch_data(idx)
-        else:
-            with ThreadPoolExecutor(max_workers=self.datamanager.config.num_workers) as executor:
-                cached_data = list(
-                    track(
-                        executor.map(
-                            fetch_data,
-                            range(len(self.dataset)),
-                        ),
-                        description="Prefetching data",
-                        total=len(self.dataset),
-                    )
-                )
-            for idx, batch in enumerate(cached_data):
-                self.cache[idx] = batch
+                    if i not in self.cache and i not in self.pending:
+                        self.pending[i] = self.pool.submit(self._decode, i)
+                return
+            for i in indices:                   # background: move them to the priority pool
+                if i in self.cache or i in self.prio:
+                    continue
+                fut = self.pending.get(i)
+                if fut is not None and not fut.cancel():     # a worker already has it
+                    continue
+                self.prio.add(i)
+                self.pending[i] = self.pool.submit(self._decode_bg, i)
 
-    def _start_background(self):
-        import time as _t
-        self.background = True
-        self.lock = threading.Lock()
-        self.pending = {}                       # idx -> Future of a background decode that has not finished
-        self.n_total = len(self.dataset)
-        self.n_done = 0
-        self.bg_stats = dict(hit=0, wait=0, spot=0, wait_s=0.0, spot_s=0.0)
-        self.t_start = _t.perf_counter()
-        pool = ThreadPoolExecutor(max_workers=int(self.datamanager.config.num_workers), thread_name_prefix="mtgs_prefetch")
-        with self.lock:
-            for idx in range(self.n_total):
-                self.pending[idx] = pool.submit(self._bg_decode, idx)
-        pool.shutdown(wait=False)               # the workers finish the queue; nothing new is submitted
-        self.prio = set()                       # indices moved to the priority pool by hint()
-        self.prio_pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="mtgs_prefetch_next")
-        say(f"[image cache] background prefetch of {self.n_total} samples started "
-            f"({self.datamanager.config.num_workers} workers); training does not wait for it", flush=True)
-
-    def _bg_store(self, idx, data):
-        import time as _t
-        with self.lock:
-            first = idx not in self.cache
-            if first:
-                self.cache[idx] = data
-                self.n_done += 1
-            self.pending.pop(idx, None)
-            done = self.n_done if first else 0
-        if done and (done == self.n_total or done % max(1, self.n_total // 10) == 0):
-            say(f"[image cache] background prefetch {done}/{self.n_total} ({_t.perf_counter() - self.t_start:.0f} s)",
-                flush=True)
-            if done == self.n_total:
-                st = self.bg_stats
-                say(f"[image cache] background prefetch finished; training draws meanwhile: resident {st['hit']}, "
-                    f"waited for a worker {st['wait']} ({st['wait_s']:.1f} s), decoded on the spot {st['spot']} "
-                    f"({st['spot_s']:.1f} s)", flush=True)
-        return self.cache[idx]
-
-    def _bg_decode(self, idx):
-        data = self.cache.get(idx)
-        if data is not None:                    # decoded on the spot by the training thread first
-            return data
-        return self._bg_store(idx, self.datamanager._load_data(self.dataset, idx, scale_factor=self.scale_factor))
-
-    def _get_background(self, idx):
-        data = self.cache.get(idx)
-        if data is not None:
-            self.bg_stats["hit"] += 1
-            return data
-        import time as _t
-        t0 = _t.perf_counter()
-        with self.lock:
-            data = self.cache.get(idx)
-            fut = self.pending.get(idx)
-        if data is not None:
-            self.bg_stats["hit"] += 1
-            return data
-        if fut is not None and not fut.cancel():    # a worker is decoding it right now: wait for that one
-            data = fut.result()
-            self.bg_stats["wait"] += 1; self.bg_stats["wait_s"] += _t.perf_counter() - t0
-            return data
-        data = self._bg_store(idx, self.datamanager._load_data(self.dataset, idx, scale_factor=self.scale_factor))
-        self.bg_stats["spot"] += 1; self.bg_stats["spot_s"] += _t.perf_counter() - t0
-        return data
-
+    # ------------------------------------------------------------------ access
     def get_cache(self, idx):
-        if self.background:
-            return self._get_background(idx)
-        if not self.cache_max:
-            return self.cache[idx]
         with self.lock:
             data = self.cache.get(idx)
-            if data is not None:
-                self.cache.move_to_end(idx); self.stats["hit"] += 1
-                self._report()
-                return data
-            fut = self.pending.get(idx)
-        import time as _t
-        t0 = _t.perf_counter()
-        if fut is not None:
-            data = fut.result(); self.stats["wait"] += 1; self.stats["wait_s"] += _t.perf_counter() - t0
+            if data is not None and self.cache_max:
+                self.cache.move_to_end(idx)
+            fut = self.pending.get(idx) if data is None else None
+        if data is not None:
+            self.stats["hit"] += 1
         else:
-            data = self._decode(idx); self.stats["miss"] += 1; self.stats["miss_s"] += _t.perf_counter() - t0
-        self._report()
+            t0 = time.perf_counter()
+            # capped: always wait for a decode in flight; background: a queued decode is cancelled and done here
+            if fut is not None and (self.mode == "capped" or not fut.cancel()):
+                data = fut.result()
+                self.stats["wait"] += 1; self.stats["wait_s"] += time.perf_counter() - t0
+            else:
+                data = self._decode(idx)
+                if self.mode != "lazy":
+                    self.stats["spot"] += 1; self.stats["spot_s"] += time.perf_counter() - t0
+        if self.mode == "capped":
+            self._report()
         return data
 
-    def _report(self):
-        """Every 2000 samples: how often the training thread waited (wait = decode in flight, miss = not predicted)."""
-        st = self.stats; n = st["hit"] + st["wait"] + st["miss"]
-        if n % 2000 == 0:
-            say(f"[image cache] {n} samples: resident {st['hit']}, waited {st['wait']} ({st['wait_s']:.1f} s), "
-                  f"decoded on the spot {st['miss']} ({st['miss_s']:.1f} s)", flush=True)   # print: see _init_capped
+    def _report(self, final=False):
+        """capped: every 2000 draws; background: once the prefetch finished. wait = a decode was in flight,
+        spot = decoded by the training thread itself."""
+        st = self.stats
+        n = st["hit"] + st["wait"] + st["spot"]
+        if final or (n and n % 2000 == 0):
+            what = "background prefetch finished; training draws meanwhile" if final else f"{n} draws"
+            say(f"[image cache] {what}: resident {st['hit']}, waited for a worker {st['wait']} ({st['wait_s']:.1f} s), "
+                f"decoded on the spot {st['spot']} ({st['spot_s']:.1f} s)", flush=True)

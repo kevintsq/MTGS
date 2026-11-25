@@ -40,7 +40,7 @@ config = CustomTrainerConfig(
                 scale_factor=0.005
             ),
             camera_res_scale_factor=0.5,
-            cache_strategy="async",
+            cache_strategy="background",
             num_workers=4,
             cache_images="cpu",
             cache_images_type="uint8",

@@ -36,7 +36,7 @@ def adjust_brightness(image, factor):
     return image
 
 
-# Reloads of training samples (MTGS_CACHE_MAX_IMAGES > 0, utils/dataloader.PrefetchDataLoader) make the per-sample load a
+# Reloads of training samples (MTGS_CACHE_MAX_IMAGES > 0, utils/dataloader.ImageCache) make the per-sample load a
 # per-step cost; these paths return BYTE-IDENTICAL arrays and are used only then (the unbounded prefetch is untouched):
 # adjust_brightness through a 256-entry table (the same float64 multiply / clip / truncation per V value; H and S went
 # through an exact uint8 -> float64 -> uint8 round trip), JPEG decode with cv2 when a start-up check finds it equal to PIL

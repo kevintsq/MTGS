@@ -46,7 +46,6 @@ if __name__ == '__main__':
         assert travels, "no traversals left in the video_scene_dict"
 
     ns_config.experiment_name = config.road_block_name
-    ns_config.pipeline.datamanager.cache_strategy = 'prefetch'
     ns_config.pipeline.datamanager.dataparser.road_block_config = args.config
     # COLMAP re-estimates intrinsics + a 4-param OPENCV distortion per *video*, so one
     # physical camera gets a different focal (±1%) and k1/k2 in every traversal, and the

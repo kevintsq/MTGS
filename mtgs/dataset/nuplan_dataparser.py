@@ -507,8 +507,9 @@ class NuplanDataParser(DataParser):
         for path in sfm_pcd_file_paths:
             if os.path.exists(path):
                 _sfm = o3d.io.read_point_cloud(str(path))
-                if os.environ.get("MTGS_SFM_BOX_FILTER", "1") == "1":   # default on since 2026-11-17 (with MTGS_UCULL), see _sfm_box_filter
-                    _sfm = self._sfm_box_filter(_sfm)
+                if os.environ.get("MTGS_SFM_BOX_FILTER", "1") != "1":   # the switch back to the baked-car SfM points was removed 2026-11-25
+                    raise SystemExit(f"MTGS_SFM_BOX_FILTER={os.environ['MTGS_SFM_BOX_FILTER']}: removed 2026-11-25 (it restored a fixed bug); unset it")
+                _sfm = self._sfm_box_filter(_sfm)   # since 2026-11-17 (with MTGS_UCULL), see _sfm_box_filter
                 pcd += _sfm
             else:
                 say(f"[WARNING] no SFM pcd found in {path.name}")
@@ -528,7 +529,7 @@ class NuplanDataParser(DataParser):
         return out
 
     def _sfm_box_filter(self, pcd):
-        """MTGS_SFM_BOX_FILTER (added 2026-11-15, default on since 2026-11-17, 0 = off): drop the SfM points inside the boxes of STATIC vehicles (parked: >= 4 frames,
+        """SfM box filter (added 2026-11-15 as MTGS_SFM_BOX_FILTER, always on since 2026-11-25): drop the SfM points inside the boxes of STATIC vehicles (parked: >= 4 frames,
         centre spread < 0.75 m within a pass) of the training passes, above the lowest 0.25 m of the box (the road under it stays),
         box + 0.125 m on every side as stack_point_cloud_utils.split_points (fill_scale 0.25). The COLMAP features are masked by
         Mask2Former classes >= 10 without dilation, so silhouette features of parked cars triangulate (px_loc_0195: 50-500 points

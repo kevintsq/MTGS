@@ -772,9 +772,9 @@ class MTGSSceneModel(Model):
             info["means2d"].retain_grad()
         self.xys = info["means2d"]  # [1, N, 2]
         self.radii = info["radii"]  # [1, N]
-        if _vgs.UCULL_ON and _vgs.UCULL_OCC and self.training:   # occlusion test of the unconstrained-cull counters
+        if _vgs.UCULL_ON and self.training:   # occlusion test of the unconstrained-cull counters
             if render_mode != "RGB+ED" or "depths" not in info:
-                raise RuntimeError("MTGS_UCULL_OCC=1 needs the rendered depth (output_depth_during_training) and gsplat's per-gaussian depths")
+                raise RuntimeError("MTGS_UCULL needs the rendered depth (output_depth_during_training) and gsplat's per-gaussian depths")
             self._uc_gdepth = info["depths"].detach()[0]                    # [N] camera depth of every centre
             self._uc_depth_im = render[..., -1].detach()[0]                 # [H, W] rendered expected depth
             self._uc_alpha_im = alpha.detach()[0, ..., 0]                   # [H, W]
@@ -1526,7 +1526,7 @@ class MTGSSceneModel(Model):
             model.update_statistics(xys_grad=grad_norm(model.config.control.use_abs_grad)[index], radii=radii[index])
             if _vgs.UCULL_ON and model_name == "background" and not model.frozen and getattr(self, "_uc_free_map", None) is not None:
                 if self._uc_free_map.shape == tuple(self.last_size):
-                    occ = (self._uc_gdepth[index], self._uc_depth_im, self._uc_alpha_im) if _vgs.UCULL_OCC else None
+                    occ = (self._uc_gdepth[index], self._uc_depth_im, self._uc_alpha_im)
                     model._ucull_update(self.xys[0, index].detach(), radii[index], self._uc_free_map, self._uc_valid_map, occ)
             if _vgs.COVER_ON and model_name == "background" and not model.frozen:   # experiment: contribution frequency (rare regions)
                 contrib = model._cover_update(grad_norm(model.config.control.use_abs_grad)[index], radii[index], step)

@@ -41,7 +41,9 @@ def adjust_brightness(image, factor):
 # adjust_brightness through a 256-entry table (the same float64 multiply / clip / truncation per V value; H and S went
 # through an exact uint8 -> float64 -> uint8 round trip), JPEG decode with cv2 when a start-up check finds it equal to PIL
 # on this machine's libraries, the static ego mask and the parsed lidar sweep (shared by the 8 cameras of a frame) kept.
-_FAST_LOAD = int(os.environ.get("MTGS_CACHE_MAX_IMAGES", "0") or 0) > 0 and os.environ.get("MTGS_FAST_LOAD", "1") != "0"   # MTGS_FAST_LOAD=0: A/B
+_FAST_LOAD = int(os.environ.get("MTGS_CACHE_MAX_IMAGES", "0") or 0) > 0
+if os.environ.get("MTGS_FAST_LOAD", "1") != "1":   # the A/B switch to the slow per-sample path was removed 2026-11-25
+    raise SystemExit(f"MTGS_FAST_LOAD={os.environ['MTGS_FAST_LOAD']}: removed 2026-11-25 (A/B only); unset it")
 _CV2_JPEG = None            # None = not checked yet, then True / False
 _EGO_MASKS: Dict = {}
 _LIDAR_POINTS: Dict = {}

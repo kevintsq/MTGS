@@ -16,7 +16,7 @@ The key covers what changes the SOLUTION: per camera of every non-skipped frame 
 intrinsics, distortion, extrinsics and the frame's ego pose (pairs, priors and the Sim3 come from those), the vehicle of
 each pass, the block size (COLMAP frame scale), use_colmap_ba and the SfM_ENV switches. NOT in the key: masks (the mask
 stage regenerates them before ba_stack; the model's own image set is kept in sfm_invalid.json), thread counts, scratch /
-log dirs, the COLMAP version (recorded only), and everything align_model reads (MTGS_SIM3_ROT, MTGS_SIM3_YAW*, MTGS_SFM_ALIGN_THRESH,
+log dirs, the COLMAP version (recorded only), and everything align_model reads (MTGS_SIM3_YAW_MAX_DEG / _MIN_EXT_M, MTGS_SFM_ALIGN_THRESH,
 MTGS_SFM_RIGID_M, MTGS_SFM_DISCONNECT_M, MTGS_SFM_LOCAL_SCALE, MTGS_JOINT_WRITE_EGO): the alignment runs again on reuse.
 
 MTGS_SFM_REUSE: unset = reuse when the key matches; 0 = never reuse (full COLMAP run); 1 = also accept a model kept

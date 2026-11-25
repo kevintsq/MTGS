@@ -160,13 +160,15 @@ def select(stats, test_logs, k, require_logs=()):
     req = sorted([s for s in usable if _required(s)], key=lambda s: -s["n"])
     # A required log WITHOUT a window keeps only its longest pass as required (2026-11-03): with every pass required,
     # gap3_01's three remaining logs (2 passes each) filled all six slots -> three logs' worth of viewpoints, blurry
-    # far buildings. Its other passes still compete for the free slots below. MTGS_REQUIRE_ALL_PASSES=1: old rule.
-    if os.environ.get('MTGS_REQUIRE_ALL_PASSES', '0') != '1':
-        seen, one = set(), []
-        for s_ in req:
-            if s_["log"] in windows or s_["log"] not in seen:
-                one.append(s_); seen.add(s_["log"])
-        req = one
+    # far buildings. Its other passes still compete for the free slots below.
+    for n_, d_ in (('MTGS_REQUIRE_ALL_PASSES', '0'), ('MTGS_LOOKAHEAD', '1')):   # removed 2026-11-25 (old rule / A/B only)
+        if os.environ.get(n_, d_) != d_:
+            raise SystemExit(f"{n_}={os.environ[n_]}: removed 2026-11-25; unset it")
+    seen, one = set(), []
+    for s_ in req:
+        if s_["log"] in windows or s_["log"] not in seen:
+            one.append(s_); seen.add(s_["log"])
+    req = one
     # Every required log must be in the block (2026-11-16, user rule: no silent fallbacks): a required log with no
     # in-block pass (outside the box, not in the window, missing db) or more required passes than slots stopped
     # nobody -- ml_pit02 lost required 2021.09.16.19.27.01_veh-45_01749_03230 to `req[:k]` because another
@@ -235,9 +237,8 @@ def select(stats, test_logs, k, require_logs=()):
     # streets within 30 m of it are what the cameras see beyond the route; without trained frames there the last
     # frames render an empty, smeared street (ml_pit01 / 442ce328). Regions along the driven trajectories of the
     # candidate passes (lookahead.py); a second coverage target with its own quota, after the route itself.
-    # MTGS_LOOKAHEAD=0 switches it off (A/B).
     ahead = np.zeros((0, 2))
-    if routes and os.environ.get('MTGS_LOOKAHEAD', '1') != '0':
+    if routes:
         from nuplan_scripts.auto_reconstruction.lookahead import regions as _la_regions
         _trajs = [s_["traj"] for s_ in usable]
         _reg = [_la_regions(r, _trajs) for r in routes]

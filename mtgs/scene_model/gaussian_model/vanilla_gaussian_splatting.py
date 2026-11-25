@@ -49,14 +49,15 @@ MCMC_NOISE_LR = float(_os.environ.get("MTGS_MCMC_NOISE_LR", "5e5"))
 MCMC_MIN_OPACITY = 0.005
 # 2026-11-14 fixes found by the validation on pn_w2_02 / pw_w2_19 (the converter's occupancy grid ran out of memory, 54 % of the
 # budget was dead at the end, blobs in the sky):
-#   MTGS_MCMC_STOP_FRAC (0.85)        relocation / growth run until this fraction of the schedule (was stop_split_at = 50 %); the
-#                                     refinements after it, and always the last one of the run, only REMOVE dead / invalid
-#                                     gaussians, so a checkpoint holds live ones.  1 = relocate to the end and cull once.
+#   MTGS_MCMC_STOP_FRAC (0.85)        relocation / growth run until this fraction of the schedule, 0 < x <= 1 (was stop_split_at =
+#                                     50 % with no cleanup); the refinements after it, and always the last one of the run, only
+#                                     REMOVE dead / invalid gaussians, so a checkpoint holds live ones.  1 = relocate to the end
+#                                     and cull once.
 #   MTGS_MCMC_NOISE_MAX_SIGMA (1.0)   the position noise is covariance x noise, i.e. it grows with scale^2: a barely alive 20 m
 #                                     gaussian jumped ~200 m per step and random-walked up to 29 km (1,849 km in pw_w2_19).  The
-#                                     displacement of a step is clamped to this many of the gaussian's own largest sigma (0 = off).
+#                                     displacement of a step is clamped to this many of the gaussian's own largest sigma (> 0).
 #   MTGS_MCMC_BOUND_M (1000)          scene bound [m from the origin] = the configured skybox radius: background gaussians beyond it
-#                                     get no noise and count as dead (0 = off).  The gradient recipe ends with 3 / 84 background
+#                                     get no noise and count as dead (> 0).  The gradient recipe ends with 3 / 84 background
 #                                     gaussians beyond 1 km (pn_w2_02 / pw_w2_19), MCMC had 889 / 6,649: a second, semi-transparent
 #                                     sky layer in front of the skybox; the skybox under it learns saturated colours that show as
 #                                     blue blobs where the layer is thin.  (Not derived from the init points: those end at ~290 m
@@ -64,19 +65,29 @@ MCMC_MIN_OPACITY = 0.005
 #                                     pw_w2_19 because of a few strays.)
 #   MTGS_MCMC_SCALE_CULL (far)        far = gaussians larger than the recipe's far scale limit (cull_scale_thresh x
 #                                     far_background_cull_scale_factor = 20 m) count as dead; recipe = the full rule incl. 0.5 m
-#                                     within 100 m (3 % of the live gaussians of an MCMC model break it); off.
+#                                     within 100 m (3 % of the live gaussians of an MCMC model break it).
+#   Dead / invalid gaussians are removed at every refinement after the relocation phase (gsplat keeps them random-walking to
+#   the end; the 'final' / 'off' / 0 values that restored the pre-11-14 behaviour were removed 2026-11-25).
 MCMC_STOP_FRAC = float(_os.environ.get("MTGS_MCMC_STOP_FRAC", "0.85"))
-# Culling after densification (2026-11-16, continue_cull_post_densification, on in the MTGS recipe unless MTGS_CULL_POST=0):
+if not 0.0 < MCMC_STOP_FRAC <= 1.0:
+    raise SystemExit(f"MTGS_MCMC_STOP_FRAC={MCMC_STOP_FRAC}: must be in (0, 1] (0 = the removed pre-2026-11-14 stop at stop_split_at without cleanup)")
+# Culling after densification (2026-11-16, continue_cull_post_densification, on in the MTGS recipe):
 # gaussians the second half of the schedule drives transparent were never removed (13-20 % of a served model's rows ended
 # below 0.005). MTGS_CULL_POST_ALPHA: the opacity threshold of the culls after stop_split_at (0 = the config's
 # cull_alpha_thresh); during densification the config's threshold applies as before.
 CULL_POST_ALPHA = float(_os.environ.get("MTGS_CULL_POST_ALPHA", "0"))
 MCMC_NOISE_MAX_SIGMA = float(_os.environ.get("MTGS_MCMC_NOISE_MAX_SIGMA", "1.0"))
-# MTGS_MCMC_CLEANUP: each = every refinement after the relocation phase removes the dead / invalid gaussians; final = only the last
-# refinement of the run does (dead gaussians keep random-walking until then, as in gsplat).
-MCMC_CLEANUP = _os.environ.get("MTGS_MCMC_CLEANUP", "each")
 MCMC_BOUND_M = float(_os.environ.get("MTGS_MCMC_BOUND_M", "1000"))
 MCMC_SCALE_CULL = _os.environ.get("MTGS_MCMC_SCALE_CULL", "far")
+for _n, _v in (("MTGS_MCMC_NOISE_MAX_SIGMA", MCMC_NOISE_MAX_SIGMA), ("MTGS_MCMC_BOUND_M", MCMC_BOUND_M)):
+    if not _v > 0:
+        raise SystemExit(f"{_n}={_v}: must be > 0 (0 = the removed pre-2026-11-14 behaviour without the limit)")
+if MCMC_SCALE_CULL not in ("far", "recipe"):
+    raise SystemExit(f"MTGS_MCMC_SCALE_CULL={MCMC_SCALE_CULL}: far or recipe ('off' = the removed pre-2026-11-14 behaviour)")
+# switches removed 2026-11-25 (their non-default value restored a fixed bug): the default is accepted, anything else stops
+for _n, _d in (("MTGS_MCMC_CLEANUP", "each"), ("MTGS_UCULL_OCC", "1"), ("MTGS_CULL_POST", "1")):
+    if _os.environ.get(_n, _d) != _d:
+        raise SystemExit(f"{_n}={_os.environ[_n]}: removed 2026-11-25 (it restored a fixed bug); unset it")
 
 
 def _density_on(model) -> bool:
@@ -144,12 +155,11 @@ UCULL_DUMP = _os.environ.get("MTGS_UCULL_DUMP", "")
 # road for a while and then drifted into a parked car's volume kept its early free steps (px retrain 2, spot 26: 1,241 opaque body
 # gaussians with a current free share of 0.012 were never culled). 1 = lifetime counters (round-1 behaviour).
 UCULL_DECAY = float(_os.environ.get("MTGS_UCULL_DECAY", "0.9"))
-# MTGS_UCULL_OCC=1 (default): a step counts for a gaussian only when its centre is not hidden behind the rendered surface at its
+# Occlusion test (always on since 2026-11-25; the frustum-only count was removed): a step counts for a gaussian only when its centre is not hidden behind the rendered surface at its
 # pixel (camera depth <= rendered depth * (1 + MTGS_UCULL_OCC_REL) + MTGS_UCULL_OCC_ABS m, or the pixel is mostly empty). The
-# frustum-only count (0) also counted every distant view in which the centre projects onto a wall or another car in front of
+# frustum-only count also counted every distant view in which the centre projects onto a wall or another car in front of
 # it: an unmasked pixel = "free" (pw_loc_0182, long straight streets: the gaussians of always-parked cars had an online free
 # share of 0.3-0.45, 0.07-0.13 over the views within 40 m, and nothing was culled; px_loc_0195 has few such views).
-UCULL_OCC = _os.environ.get("MTGS_UCULL_OCC", "1") == "1"
 UCULL_OCC_REL = float(_os.environ.get("MTGS_UCULL_OCC_REL", "0.05"))
 UCULL_OCC_ABS = float(_os.environ.get("MTGS_UCULL_OCC_ABS", "0.5"))                    # torch.save of the counters at every cull (diagnostics)
 
@@ -661,10 +671,10 @@ class VanillaGaussianSplattingModel(torch.nn.Module):
             self._mcmc_optimizers = optimizers
             if self.num_points > 0:
                 # the last refinement of the run always cleans up (MTGS_MCMC_STOP_FRAC=1: relocation to the very end, one cull)
-                last = MCMC_STOP_FRAC > 0 and self.step + self.ctrl_config.refine_every >= self._mcmc_total_steps()
+                last = self.step + self.ctrl_config.refine_every >= self._mcmc_total_steps()
                 if self.step < self._mcmc_stop_step() and not last:
                     self._mcmc_refine(optimizers)
-                elif MCMC_STOP_FRAC > 0 and (last or MCMC_CLEANUP == "each"):
+                else:
                     self._mcmc_cleanup(optimizers)
             self.xys_grad_norm = None
             self.vis_counts = None
@@ -926,25 +936,17 @@ class VanillaGaussianSplattingModel(torch.nn.Module):
         return int(_os.environ.get("MTGS_MAX_ITERS", "0")) or 2 * self.ctrl_config.stop_split_at
 
     def _mcmc_stop_step(self):
-        if MCMC_STOP_FRAC <= 0:
-            return self.ctrl_config.stop_split_at
         return int(MCMC_STOP_FRAC * self._mcmc_total_steps())
-
-    def _mcmc_bound(self):
-        """Scene bound [m from the origin] of the background model (None = no bound)."""
-        return MCMC_BOUND_M if MCMC_BOUND_M > 0 else None
 
     @torch.no_grad()
     def _mcmc_invalid(self):
         """Gaussians MCMC must not keep: beyond the scene bound, or larger than the recipe's scale-cull rule."""
         m = self.means.detach()
         bad = torch.zeros(m.shape[0], dtype=torch.bool, device=m.device)
-        bound = self._mcmc_bound()
-        if bound is not None:
-            bad |= ~(m.norm(dim=-1) <= bound)   # also catches non-finite positions
+        bad |= ~(m.norm(dim=-1) <= MCMC_BOUND_M)   # also catches non-finite positions
         if MCMC_SCALE_CULL == "recipe":
             bad |= torch.exp(self.scales.detach()).amax(dim=-1) > self.cull_scale_thresh(m).reshape(-1)
-        elif MCMC_SCALE_CULL == "far":
+        else:   # far
             bad |= torch.exp(self.scales.detach()).amax(dim=-1) > self.ctrl_config.cull_scale_thresh * self.ctrl_config.far_background_cull_scale_factor
         return bad
 
@@ -1055,12 +1057,11 @@ class VanillaGaussianSplattingModel(torch.nn.Module):
         k, x0 = 100.0, 0.995
         noise = torch.randn_like(self.means) * (1.0 / (1.0 + torch.exp(-k * ((1.0 - opac) - x0)))).unsqueeze(-1) * (lr * MCMC_NOISE_LR)
         disp = torch.einsum("bij,bj->bi", covars, noise)
-        if MCMC_NOISE_MAX_SIGMA > 0:   # at most this many own sigmas per step (the raw step grows with scale^2)
-            lim = MCMC_NOISE_MAX_SIGMA * torch.exp(self.scales.detach()).amax(dim=-1, keepdim=True)
-            disp = disp * (lim / disp.norm(dim=-1, keepdim=True).clamp_min(1e-12)).clamp(max=1.0)
-        bound = self._mcmc_bound()
-        if bound is not None:          # nothing beyond the scene bound moves further out
-            disp = torch.where((self.means.detach().norm(dim=-1, keepdim=True) <= bound), disp, torch.zeros_like(disp))
+        # at most MCMC_NOISE_MAX_SIGMA own sigmas per step (the raw step grows with scale^2)
+        lim = MCMC_NOISE_MAX_SIGMA * torch.exp(self.scales.detach()).amax(dim=-1, keepdim=True)
+        disp = disp * (lim / disp.norm(dim=-1, keepdim=True).clamp_min(1e-12)).clamp(max=1.0)
+        # nothing beyond the scene bound moves further out
+        disp = torch.where((self.means.detach().norm(dim=-1, keepdim=True) <= MCMC_BOUND_M), disp, torch.zeros_like(disp))
         self.means.data.add_(disp)
 
     def cull_scale_thresh(self, means):

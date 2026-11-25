@@ -26,100 +26,11 @@ from nuplan_scripts.utils.video_scene_dict_tools import VideoScene
 from nuplan_scripts.utils.constants import NUPLAN_MAP_VERSION, NUPLAN_MAPS_ROOT, CONSOLE
 
 
-def _se2_constrain(pose_icp, pose_ins):
-    from scipy.spatial.transform import Rotation as _R
-    yaw = _R.from_matrix(pose_icp[:3, :3]).as_euler('zyx')[0]
-    _, pitch, roll = _R.from_matrix(pose_ins[:3, :3]).as_euler('zyx')
-    out = np.eye(4)
-    out[:3, :3] = _R.from_euler('zyx', [yaw, pitch, roll]).as_matrix()
-    out[:3, 3] = [pose_icp[0, 3], pose_icp[1, 3], pose_ins[2, 3]]
-    return out
-
-
-def _relative_tilt_offsets(video_scene_dict, result_poses):
-    """Per-traversal constant (pitch, roll, z) offset of ICP against INS, minus the
-    part shared by all traversals.
-
-    INS attitude differs between drives of the same road by up to ~1 deg (vehicle
-    calibration), and that disagreement has to be removed or the joint model blurs.
-    ICP measures it, but on 2 Hz lidar it also drifts along the route, and that drift
-    is common to every traversal registered onto the same map (gapC_008: 0 -> -4.3 deg).
-    A per-traversal constant keeps the first and cannot carry the second: anything
-    shared is averaged out, and nothing varies along the route.
-    """
-    from scipy.spatial.transform import Rotation as _R
-    med = {}
-    for vt, v in video_scene_dict.items():
-        d = []
-        for info in v['frame_infos']:
-            P = result_poses[info['token']]; I = np.asarray(info['ego2global'], float)
-            _, pp, rp = _R.from_matrix(P[:3, :3]).as_euler('zyx')
-            _, pi, ri = _R.from_matrix(I[:3, :3]).as_euler('zyx')
-            d.append((pp - pi, rp - ri, P[2, 3] - I[2, 3]))
-        med[vt] = np.median(np.asarray(d), axis=0)
-    common = np.mean(np.stack(list(med.values())), axis=0)
-    rel = {vt: m - common for vt, m in med.items()}
-    for vt, r in rel.items():
-        say(f"[level] {vt.split('-')[-1]}: pitch {np.degrees(r[0]):+.2f} deg, "
-                    f"roll {np.degrees(r[1]):+.2f} deg, z {r[2]:+.2f} m "
-                    f"(common removed: pitch {np.degrees(common[0]):+.2f} deg, z {common[2]:+.2f} m)")
-    return rel
-
-
-def _apply_relative_tilt(pose_icp, pose_ins, rel):
-    """x, y, yaw from ICP; pitch, roll, z from INS plus this traversal's constant."""
-    from scipy.spatial.transform import Rotation as _R
-    yaw = _R.from_matrix(pose_icp[:3, :3]).as_euler('zyx')[0]
-    _, pitch, roll = _R.from_matrix(pose_ins[:3, :3]).as_euler('zyx')
-    out = np.eye(4)
-    out[:3, :3] = _R.from_euler('zyx', [yaw, pitch + rel[0], roll + rel[1]]).as_matrix()
-    out[:3, 3] = [pose_icp[0, 3], pose_icp[1, 3], pose_ins[2, 3] + rel[2]]
-    return out
-
-
-def _common_drift(video_scene_dict, result_poses, radius=20.0, min_neighbours=12):
-    """Per frame: the (pitch, roll, z) disagreement between ICP and INS that is shared
-    by every traversal at that place.
-
-    INS errors of different drives are independent, so what all traversals agree on
-    at one spot is the registration bending the shared map (gapC_008: ~5 deg over the
-    route), while what one traversal does differently is ICP correcting that drive's
-    INS -- which the constant-offset model showed is real and worth keeping (dropping
-    it cost 1.5-3 dB and squashed fy). Estimate the shared part as the median over
-    all frames, of all traversals, within `radius` metres.
-    """
-    from scipy.spatial import cKDTree
-    from scipy.spatial.transform import Rotation as _R
-    tokens, xy, delta = [], [], []
-    for v in video_scene_dict.values():
-        for info in v['frame_infos']:
-            P = result_poses[info['token']]; I = np.asarray(info['ego2global'], float)
-            _, pp, rp = _R.from_matrix(P[:3, :3]).as_euler('zyx')
-            _, pi, ri = _R.from_matrix(I[:3, :3]).as_euler('zyx')
-            tokens.append(info['token']); xy.append(P[:2, 3])
-            delta.append((pp - pi, rp - ri, P[2, 3] - I[2, 3]))
-    xy = np.asarray(xy); delta = np.asarray(delta)
-    tree = cKDTree(xy)
-    common = {}
-    for k, tok in enumerate(tokens):
-        idx = tree.query_ball_point(xy[k], radius)
-        if len(idx) < min_neighbours:
-            idx = tree.query(xy[k], k=min(min_neighbours, len(tokens)))[1]
-        common[tok] = np.median(delta[np.atleast_1d(idx)], axis=0)
-    c = np.asarray(list(common.values()))
-    say(f"[level2] common drift over the block: pitch {np.degrees(c[:,0].min()):+.2f}..{np.degrees(c[:,0].max()):+.2f} deg, "
-                f"roll {np.degrees(c[:,1].min()):+.2f}..{np.degrees(c[:,1].max()):+.2f} deg, z {c[:,2].min():+.2f}..{c[:,2].max():+.2f} m")
-    return common
-
-
-def _remove_common_drift(pose_icp, common):
-    """ICP pose with the shared pitch/roll/z drift taken out; x, y, yaw untouched."""
-    from scipy.spatial.transform import Rotation as _R
-    yaw, pitch, roll = _R.from_matrix(pose_icp[:3, :3]).as_euler('zyx')
-    out = np.eye(4)
-    out[:3, :3] = _R.from_euler('zyx', [yaw, pitch - common[0], roll - common[1]]).as_matrix()
-    out[:3, 3] = [pose_icp[0, 3], pose_icp[1, 3], pose_icp[2, 3] - common[2]]
-    return out
+# switches removed 2026-11-25 (bug reverts / slower or measured-worse A/B paths): the default value is accepted, anything else stops
+for _n, _d in (('MTGS_KISS_GRAVITY', '1'), ('MTGS_KISS_INS_PREDICT', '1'), ('MTGS_REG_MAP_ICP', '1'), ('MTGS_REG_MAP_ICP_FRAMES', '1'),
+               ('MTGS_REG_MAP_ICP_ROUND2', '1'), ('MTGS_REG_SE2', '0'), ('MTGS_REG_LEVEL', '0')):
+    if os.environ.get(_n, _d) != _d:
+        raise SystemExit(f"{_n}={os.environ[_n]}: removed 2026-11-25; unset it")
 
 
 def calculate_errors(video_scene_dict: dict, result_poses_dict: dict):
@@ -208,7 +119,7 @@ def _register_frame_gravity(self, frame, timestamps, gt_pose=None, traj_id=None)
       MTGS_KISS_GRAVITY_TAU_S (10 s at 2 Hz: ICP's short-term attitude is kept, drift of 0.04-0.07 deg/s is held
       to <= ~0.5 deg). Anchoring to d0 instead of to the INS keeps the log's own constant offset out of the correction
       (levelling each pass to its own INS attitude broke consistent passes apart, pw_loc_0195).
-    MTGS_KISS_GRAVITY=0 restores the plain KissICP behaviour."""
+    Always used since 2026-11-25 (the MTGS_KISS_GRAVITY=0 switch back to plain KissICP was removed)."""
     frame = self.compensator.deskew_scan(frame, timestamps, self.last_delta)
     frame = self.preprocess(frame)
     source, frame_downsample = self.voxelize(frame)
@@ -222,7 +133,7 @@ def _register_frame_gravity(self, frame, timestamps, gt_pose=None, traj_id=None)
         self.warmup -= 1
         initial_guess = gt_pose
         sigma = 2
-    elif gt_pose is not None and getattr(self, '_last_gt', None) is not None and os.environ.get('MTGS_KISS_INS_PREDICT', '1') == '1':
+    elif gt_pose is not None and getattr(self, '_last_gt', None) is not None:
         # motion prediction from the INS (2026-11-17): KissICP predicts with the last frame-to-frame motion (constant
         # velocity), which at 2 Hz is metres / degrees off whenever the ego brakes, accelerates or turns; the ICP then
         # locks onto a neighbouring minimum and the chain is lost for the rest of the pass (ml_pit01b: 6 of 9 passes,
@@ -736,10 +647,9 @@ def _map_icp_pass(video, scans_by_token, init_pose_sets, ref_cloud, label=""):
     # distorted along the drive, the rigid-corrected pass still ghosted). Refine
     # every frame's pose by scan-to-map ICP from the rigid result, small
     # correspondence, bounded correction, then smooth the corrections along the
-    # pass so the trajectory stays continuous. MTGS_REG_MAP_ICP_FRAMES=0 disables.
-    if os.environ.get('MTGS_REG_MAP_ICP_FRAMES', '1') == '1':
-        out, frep = _map_icp_frames(video, scans_by_token, out, ref, voxel)
-        report.append(frep)
+    # pass so the trajectory stays continuous.
+    out, frep = _map_icp_frames(video, scans_by_token, out, ref, voxel)
+    report.append(frep)
     return out, f"took {name} (" + "; ".join(report) + ")"
 
 
@@ -784,7 +694,7 @@ def _map_icp_frames(video, scans_by_token, poses, ref, voxel, max_dt=1.0, max_dy
     """Per-frame scan-to-map refinement of `poses` (token -> 4x4) against the
     open3d map `ref`; returns (refined poses, report).
 
-    tilt (default MTGS_REG_PASS_TILT=1): the INS attitude of a vehicle carries a constant roll/pitch bias (ir_w2_06,
+    tilt (MTGS_REG_PASS_TILT=1; default 0 = off, an unadopted experiment): the INS attitude of a vehicle carries a constant roll/pitch bias (ir_w2_06,
     2026-10-30: veh-40 vs veh-28 scans differ by a 1.4 deg roll about the driving axis, visible as a tilted ground in
     a cross-section). That is a rotation about each frame's OWN axes, not a rigid motion of the pass, so the rigid fit
     cannot remove it and the per-frame step only fixes the frames that overlap the map (82/476 on pass 64). Here a
@@ -920,9 +830,9 @@ def _map_icp_frames(video, scans_by_token, poses, ref, voxel, max_dt=1.0, max_dy
         if sm[i] is not None:
             out[t] = _apply(sm[i], poses[t])
     # ... and that blend is only the starting point: a second scan-to-map round from it refines the frames whose first
-    # fit failed because the input pose was further off than max_dt (MTGS_REG_MAP_ICP_ROUND2=0 disables it).
+    # fit failed because the input pose was further off than max_dt.
     left, n2 = list(carried), 0
-    if carried and os.environ.get('MTGS_REG_MAP_ICP_ROUND2', '1') == '1':
+    if carried:
         full = [None] * len(tokens)
         for i, c in zip(carried, _measure(carried, out)):
             full[i] = c
@@ -1129,9 +1039,8 @@ if __name__ == '__main__':
         visualize=False,
     )
     kiss_icp_pipeline.config.out_dir = video_scene.registration_path
-    if os.environ.get('MTGS_KISS_GRAVITY', '1') == '1':
-        import types
-        kiss_icp_pipeline.odometry.register_frame = types.MethodType(_register_frame_gravity, kiss_icp_pipeline.odometry)
+    import types
+    kiss_icp_pipeline.odometry.register_frame = types.MethodType(_register_frame_gravity, kiss_icp_pipeline.odometry)
     kiss_icp_pipeline.run()
 
     # The registritaion works on the first frames coordinate.
@@ -1140,8 +1049,7 @@ if __name__ == '__main__':
     tokens = kiss_icp_dataset.tokens
     result_poses_dict = {token: pose for token, pose in zip(tokens, result_poses)}
     # raw scans (lidar frame) for the map ICP of passes that fail the gates
-    _scans_by_token = {token: scan for token, scan in zip(tokens, kiss_icp_dataset.scans)} \
-        if os.environ.get('MTGS_REG_MAP_ICP', '1') == '1' else {}
+    _scans_by_token = {token: scan for token, scan in zip(tokens, kiss_icp_dataset.scans)}
 
     if os.environ.get('MTGS_SKIP_ICP') == '1':
         # KISS-ICP is scan-to-map odometry meant for ~10Hz sequences. nuPlan
@@ -1561,33 +1469,12 @@ if __name__ == '__main__':
             say(f"[pass QA] {len(_tab)} overlapping pass pairs, largest disagreement "
                 f"{max(_tab.values()) if _tab else 0:.2f} m (stop above {_pair_stop:g} m)")
 
-        # MTGS_REG_LEVEL: 0 = full ICP, 1 = INS attitude + one constant per traversal
-        # (measured worse: -1.5..-3 dB), 2 = full ICP minus the drift all traversals share
-        level_mode = os.environ.get('MTGS_REG_LEVEL', '0')
-        level = level_mode == '1'
-        rel_tilt = _relative_tilt_offsets(video_scene_dict, result_poses_dict_aligned) if level else None
-        common_drift = _common_drift(video_scene_dict, result_poses_dict_aligned) if level_mode == '2' else None
         for video_token in video_scene_dict:
             frame_infos = video_scene_dict[video_token]['frame_infos']
             for info in frame_infos:
                 token = info['token']
                 pose_icp = result_poses_dict_aligned[token]
                 info['ego2global_original'] = info['ego2global'].copy()
-                # Off by default: pinning roll/pitch to INS leaves the ~1 deg pitch
-                # disagreement between traversals in place, which blurs the joint model
-                # and drives the triangulator's fy down to absorb it (loc_0078: fy/fx
-                # 0.86, -1.6 dB). It was a tilt experiment, never the adopted recipe.
-                if os.environ.get('MTGS_REG_SE2', '0') == '1':
-                    # Scan-to-map on 2 Hz lidar drifts in pitch/roll (gapC_008: 0 -> -4.3 deg
-                    # pitch along every traversal, all six inheriting the same bent map), and
-                    # the QA gate never looked at either. The INS is trustworthy there, so keep
-                    # only what ICP is good at -- x, y, yaw -- and take z, roll, pitch from it.
-                    pose_icp = _se2_constrain(pose_icp, info['ego2global_original'])
-                if level:
-                    pose_icp = _apply_relative_tilt(pose_icp, info['ego2global_original'],
-                                                    rel_tilt[video_token])
-                if common_drift is not None:
-                    pose_icp = _remove_common_drift(pose_icp, common_drift[token])
                 # MTGS_VEH_YAW_FIX="veh-48:1.71,veh-45:-1.34": per-vehicle lidar/camera
                 # extrinsic yaw error (deg, = the constant ICP-INS heading offset those
                 # vehicles show in every log and block, sd 0.1 deg). ICP aligns the lidar

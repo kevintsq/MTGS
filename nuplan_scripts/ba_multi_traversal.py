@@ -549,53 +549,6 @@ def create_colmap_model(video_scene: VideoScene, video_scene_dict, colmap_path):
     create_colmap_database(colmap_path)
     return video_scene_dict
 
-def create_sparse_colmap_model(video_scene: VideoScene, video_scene_dict, colmap_path):
-
-    create_colmap_folder(colmap_path)
-    cam_name_mapper = create_cameras_per_vehicle(video_scene_dict, colmap_path)
-
-    with tqdm(total=VideoScene.count_total_frames(video_scene_dict), desc='Loading image infos', ncols=120) as progress_bar, \
-            open(f"{colmap_path}/sparse_model/images.txt", "w") as f_images:
-        global_image_id = 1
-        for video_token in video_scene_dict:
-            frame_infos = video_scene_dict[video_token]['frame_infos']
-            frame_infos = [info for info in frame_infos if not info.get('skipped', False)]
-
-            # same vehicle has same camera calibration
-            veh_name = video_scene_dict[video_token]['vehicle_name']
-
-            for idx, info in enumerate(frame_infos):
-
-                ego2global = info['ego2global']
-
-                for cam in info['cams']:
-                    cam_info = info['cams'][cam]
-
-                    data_path = os.path.join(NUPLAN_SENSOR_ROOT, cam_info['data_path'])
-
-                    cam2ego = Quaternion(cam_info['sensor2ego_rotation']).transformation_matrix
-                    cam2ego[:3, 3] = cam_info['sensor2ego_translation']
-                    cam2global = np.dot(ego2global, cam2ego)
-
-                    # global2cam
-                    Q = Quaternion(matrix=cam2global[:3, :3].T).q
-                    T = -cam2global[:3, :3].T @ cam2global[:3, 3]
-
-                    cam_name_colmap = f'{veh_name}_{cam}'
-                    cam_id = cam_name_mapper[cam_name_colmap]
-                    image_path = f'{cam_name_colmap}/{os.path.basename(data_path)}'
-
-                    # write to images.txt
-                    line = f'{global_image_id} {Q[0]} {Q[1]} {Q[2]} {Q[3]} {T[0]} {T[1]} {T[2]} {cam_id} {image_path}' + '\n\n'
-                    f_images.write(line)
-                    global_image_id += 1
-
-                progress_bar.update(1)
-    # create colmap database after everything is done
-    create_colmap_database(colmap_path)
-    return video_scene_dict
-
-
 def _rigidity_gate(frame_infos, images_aligned, rigid_m, video_token=''):
     """Mark SfM cameras that left their frame's rigid rig as invalid; returns how many.
 
@@ -735,38 +688,40 @@ def align_model(video_scene: VideoScene, video_scene_dict, colmap_path, thresh=1
 
     def _fit_sim3(A, B, RA, RB):
         # Sim3 with B ~ s R A + t. The ROTATION comes from the camera orientations (chordal mean of RB RA^T), the
-        # scale/translation from the centres given that rotation (MTGS_SIM3_ROT=centres restores the old fit).
+        # scale/translation from the centres given that rotation (the centre-only fit is used only with < 3 cameras).
         # Camera centres of a drive are nearly coplanar, so a centre-only Umeyama fit leaves the rotation about the
         # road axis free: the 1.7-2.7 deg "world tilt" that pj_/ph_/pm_ carried into training (2026-11-01).
         s0, R0, t0 = compute_transformation_matrix_with_scaling(A, B)
-        if os.environ.get('MTGS_SIM3_ROT', 'orient') != 'orient' or RA is None or len(A) < 3:
+        for n_, d_ in (('MTGS_SIM3_ROT', 'orient'), ('MTGS_SIM3_YAW', 'centres')):   # removed 2026-11-25 (they restored fixed bugs)
+            if os.environ.get(n_, d_) != d_:
+                raise SystemExit(f'{n_}={os.environ[n_]}: removed 2026-11-25 (it restored a fixed bug); unset it')
+        if RA is None or len(A) < 3:
             return s0, R0, t0
         M = np.einsum('nij,nkj->ik', RB, RA)
         U, S_, Vt = np.linalg.svd(M)
         R_ = U @ np.diag([1., 1., np.sign(np.linalg.det(U @ Vt))]) @ Vt
         ma, mb = A.mean(0), B.mean(0)
-        # YAW from the centres (MTGS_SIM3_YAW=orient restores the orientation yaw). Each vehicle's camera rig has its
+        # YAW from the centres. Each vehicle's camera rig has its
         # own heading offset to its INS, so the orientation mean rotates a mixed-vehicle block by a weighted mean of
         # those offsets (px_loc_0195, veh-28 + veh-48: +0.54 deg about z, 0.6 m median placement error along the
         # passes). The horizontal track pins the yaw without that bias; roll / pitch stay from the orientations.
         Ar = (A - ma) @ R_.T
         psi, why = 0.0, 'orient'
-        if os.environ.get('MTGS_SIM3_YAW', 'centres') == 'centres':
-            a2, b2 = Ar[:, :2], (B - mb)[:, :2]
-            ext = float(np.sqrt(np.linalg.eigvalsh(np.cov(b2.T))[-1])) if len(b2) > 2 else 0.0
-            psi_c = float(np.arctan2((a2[:, 0] * b2[:, 1] - a2[:, 1] * b2[:, 0]).sum(), (a2 * b2).sum()))
-            ymax = float(os.environ.get('MTGS_SIM3_YAW_MAX_DEG', 3.0))
-            if ext < float(os.environ.get('MTGS_SIM3_YAW_MIN_EXT_M', 5.0)):
-                why = f'track extent {ext:.1f} m too small, orientation yaw kept'
-            elif abs(np.degrees(psi_c)) > ymax:
-                why = f'centre yaw {np.degrees(psi_c):+.2f} deg beyond {ymax:g} deg, orientation yaw kept'
-                _fit_sim3.guard_tripped = True
-            else:
-                psi, why = psi_c, 'centres'
-            if psi:
-                c_, s_z = np.cos(psi), np.sin(psi)
-                R_ = np.array([[c_, -s_z, 0.], [s_z, c_, 0.], [0., 0., 1.]]) @ R_
-                Ar = (A - ma) @ R_.T
+        a2, b2 = Ar[:, :2], (B - mb)[:, :2]
+        ext = float(np.sqrt(np.linalg.eigvalsh(np.cov(b2.T))[-1])) if len(b2) > 2 else 0.0
+        psi_c = float(np.arctan2((a2[:, 0] * b2[:, 1] - a2[:, 1] * b2[:, 0]).sum(), (a2 * b2).sum()))
+        ymax = float(os.environ.get('MTGS_SIM3_YAW_MAX_DEG', 3.0))
+        if ext < float(os.environ.get('MTGS_SIM3_YAW_MIN_EXT_M', 5.0)):
+            why = f'track extent {ext:.1f} m too small, orientation yaw kept'
+        elif abs(np.degrees(psi_c)) > ymax:
+            why = f'centre yaw {np.degrees(psi_c):+.2f} deg beyond {ymax:g} deg, orientation yaw kept'
+            _fit_sim3.guard_tripped = True
+        else:
+            psi, why = psi_c, 'centres'
+        if psi:
+            c_, s_z = np.cos(psi), np.sin(psi)
+            R_ = np.array([[c_, -s_z, 0.], [s_z, c_, 0.], [0., 0., 1.]]) @ R_
+            Ar = (A - ma) @ R_.T
         s_ = float((Ar * (B - mb)).sum() / (Ar ** 2).sum())
         t_ = mb - s_ * R_ @ ma
         dang = np.degrees(np.arccos(np.clip((np.trace(R0.T @ R_) - 1) / 2, -1, 1)))
@@ -1288,12 +1243,10 @@ if __name__ == "__main__":
         video_scene_dict = align_model(video_scene, video_scene_dict, colmap_path, model=model, name_map=name_map)
         video_scene_dict_new.update(video_scene_dict)
 
-    # Exporting a combined sparse model is a debugging aid, but it rebuilds the
-    # whole image/mask tree a second time -- thousands of files over NFS after the
-    # real work is already done and archived. Skip it unless asked for.
+    # (the combined sparse 'all' model export, a debugging aid that rebuilt the whole image / mask tree over NFS, was removed
+    # 2026-11-25 with its switch MTGS_SKIP_SPARSE_ALL=0)
     if os.environ.get('MTGS_SKIP_SPARSE_ALL', '1') != '1':
-        create_sparse_colmap_model(video_scene, video_scene_dict_new,
-                                   os.path.join(video_scene.colmap_path, 'all'))
+        raise SystemExit(f"MTGS_SKIP_SPARSE_ALL={os.environ['MTGS_SKIP_SPARSE_ALL']}: removed 2026-11-25 (slow debug export); unset it")
 
     for _work, _nfs in colmap_publish:
         if os.environ.get('MTGS_KEEP_COLMAP') == '1':

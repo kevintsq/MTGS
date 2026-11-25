@@ -75,7 +75,7 @@ config = CustomTrainerConfig(
                 refine_every=100*iteration_factor,
                 stop_split_at=15000*iteration_factor,
                 reset_alpha_every=30,  # opacity_reset_interval reset_alpha_every * refine_every
-                continue_cull_post_densification=os.environ.get('MTGS_CULL_POST', '1') != '0',   # 2026-11-16: keep culling transparent gaussians after densification
+                continue_cull_post_densification=True,   # 2026-11-16: keep culling transparent gaussians after densification
                 cull_alpha_thresh=0.005,
                 cull_scale_thresh=0.5,
                 densify_size_thresh=0.2,

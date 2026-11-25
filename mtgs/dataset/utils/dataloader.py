@@ -202,11 +202,20 @@ class PrefetchDataLoader:
         # decoded ahead by a thread pool (hint), so the GPU normally finds the sample resident. Unset / 0 = the
         # original prefetch of everything.
         self.cache_max = int(os.environ.get('MTGS_CACHE_MAX_IMAGES', '0') or 0)
+        self.background = False
         if self.cache_max > 0 and self.cache_max < len(dataset):
             self._init_capped()
         else:
             self.cache_max = 0
-            self._prefetch()
+            # 2026-11-25 (user: "应该直接默认改为async"): the full prefetch runs in the BACKGROUND and training starts at
+            # once; a sample the sampler asks for before its turn is decoded on the spot (or waited for when a worker
+            # already holds it). Same samples in the same order, only the decode timing changes; host RAM ends the
+            # same (every image resident). pq_area0806 (19k images) had sat ~60 min on an idle GPU in the blocking
+            # prefetch. Only num_workers=0 (no thread pool) keeps the inline prefetch.
+            if int(self.datamanager.config.num_workers) == 0:
+                self._prefetch()
+            else:
+                self._start_background()
 
     def _init_capped(self):
         from concurrent.futures import ThreadPoolExecutor as _Pool
@@ -270,7 +279,72 @@ class PrefetchDataLoader:
             for idx, batch in enumerate(cached_data):
                 self.cache[idx] = batch
 
+    def _start_background(self):
+        import time as _t
+        self.background = True
+        self.lock = threading.Lock()
+        self.pending = {}                       # idx -> Future of a background decode that has not finished
+        self.n_total = len(self.dataset)
+        self.n_done = 0
+        self.bg_stats = dict(hit=0, wait=0, spot=0, wait_s=0.0, spot_s=0.0)
+        self.t_start = _t.perf_counter()
+        pool = ThreadPoolExecutor(max_workers=int(self.datamanager.config.num_workers), thread_name_prefix="mtgs_prefetch")
+        with self.lock:
+            for idx in range(self.n_total):
+                self.pending[idx] = pool.submit(self._bg_decode, idx)
+        pool.shutdown(wait=False)               # the workers finish the queue; nothing new is submitted
+        say(f"[image cache] background prefetch of {self.n_total} samples started "
+            f"({self.datamanager.config.num_workers} workers); training does not wait for it", flush=True)
+
+    def _bg_store(self, idx, data):
+        import time as _t
+        with self.lock:
+            first = idx not in self.cache
+            if first:
+                self.cache[idx] = data
+                self.n_done += 1
+            self.pending.pop(idx, None)
+            done = self.n_done if first else 0
+        if done and (done == self.n_total or done % max(1, self.n_total // 10) == 0):
+            say(f"[image cache] background prefetch {done}/{self.n_total} ({_t.perf_counter() - self.t_start:.0f} s)",
+                flush=True)
+            if done == self.n_total:
+                st = self.bg_stats
+                say(f"[image cache] background prefetch finished; training draws meanwhile: resident {st['hit']}, "
+                    f"waited for a worker {st['wait']} ({st['wait_s']:.1f} s), decoded on the spot {st['spot']} "
+                    f"({st['spot_s']:.1f} s)", flush=True)
+        return self.cache[idx]
+
+    def _bg_decode(self, idx):
+        data = self.cache.get(idx)
+        if data is not None:                    # decoded on the spot by the training thread first
+            return data
+        return self._bg_store(idx, self.datamanager._load_data(self.dataset, idx, scale_factor=self.scale_factor))
+
+    def _get_background(self, idx):
+        data = self.cache.get(idx)
+        if data is not None:
+            self.bg_stats["hit"] += 1
+            return data
+        import time as _t
+        t0 = _t.perf_counter()
+        with self.lock:
+            data = self.cache.get(idx)
+            fut = self.pending.get(idx)
+        if data is not None:
+            self.bg_stats["hit"] += 1
+            return data
+        if fut is not None and not fut.cancel():    # a worker is decoding it right now: wait for that one
+            data = fut.result()
+            self.bg_stats["wait"] += 1; self.bg_stats["wait_s"] += _t.perf_counter() - t0
+            return data
+        data = self._bg_store(idx, self.datamanager._load_data(self.dataset, idx, scale_factor=self.scale_factor))
+        self.bg_stats["spot"] += 1; self.bg_stats["spot_s"] += _t.perf_counter() - t0
+        return data
+
     def get_cache(self, idx):
+        if self.background:
+            return self._get_background(idx)
         if not self.cache_max:
             return self.cache[idx]
         with self.lock:
